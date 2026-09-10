@@ -1,0 +1,75 @@
+name: Release plugin
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macos-arm64
+            binary: planeai-plugin-github
+          - os: macos-13
+            platform: macos-x64
+            binary: planeai-plugin-github
+          - os: ubuntu-24.04
+            platform: linux-x64
+            binary: planeai-plugin-github
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            binary: planeai-plugin-github
+          - os: windows-2025
+            platform: windows-x64
+            binary: planeai-plugin-github.exe
+          - os: windows-11-arm
+            platform: windows-arm64
+            binary: planeai-plugin-github.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: cargo build --release
+      - name: Stage package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ROOT="dist/planeai-plugin-github"
+          mkdir -p "$ROOT/bin/${{ matrix.platform }}" "$ROOT/ui"
+          cp planeai-plugin.json "$ROOT/"
+          cp ui/entry.js "$ROOT/ui/"
+          cp "target/release/${{ matrix.binary }}" "$ROOT/bin/${{ matrix.platform }}/${{ matrix.binary }}"
+          chmod +x "$ROOT/bin/${{ matrix.platform }}/${{ matrix.binary }}"
+          tar -C dist -czf "planeai-plugin-github-${{ matrix.platform }}.tar.gz" planeai-plugin-github
+      - name: Stage package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = 'dist/planeai-plugin-github'
+          New-Item -ItemType Directory -Force -Path "$root/bin/${{ matrix.platform }}", "$root/ui" | Out-Null
+          Copy-Item planeai-plugin.json "$root/planeai-plugin.json"
+          Copy-Item ui/entry.js "$root/ui/entry.js"
+          Copy-Item "target/release/${{ matrix.binary }}" "$root/bin/${{ matrix.platform }}/${{ matrix.binary }}"
+          Compress-Archive -Path "$root/*" -DestinationPath "planeai-plugin-github-${{ matrix.platform }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: planeai-plugin-github-${{ matrix.platform }}
+          path: planeai-plugin-github-${{ matrix.platform }}.*
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*

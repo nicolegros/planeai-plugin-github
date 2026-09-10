@@ -1,0 +1,13 @@
+[package]
+name = "planeai-plugin-github"
+version = "0.1.0"
+edition = "2021"
+description = "GitHub integration plugin for PlaneAI"
+license = "AGPL-3.0-only"
+
+[[bin]]
+name = "planeai-plugin-github"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "=1.0.151"
