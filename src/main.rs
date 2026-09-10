@@ -49,7 +49,6 @@ impl CommandRunner {
 
 #[derive(Clone)]
 struct DurableStateLocks {
-    state: Arc<Mutex<()>>,
     reconciliation: Arc<Mutex<()>>,
 }
 
@@ -130,7 +129,6 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
         HashMap::new();
     let callback_sequence = Arc::new(AtomicU64::new(1));
     let durable_state_locks = DurableStateLocks {
-        state: Arc::new(Mutex::new(())),
         reconciliation: Arc::new(Mutex::new(())),
     };
     let mut input_open = true;
@@ -531,35 +529,23 @@ fn validate_durable_state(state: &Value) -> Result<(), RequestError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn durable_state_from_settings(settings: &Value) -> Result<Value, RequestError> {
     let settings = settings.as_object().ok_or_else(|| {
         RequestError::Message("plugin settings must be a JSON object".to_string())
     })?;
-    let state = match settings.get(STATE_NAMESPACE) {
-        None => empty_durable_state(),
-        Some(state) => state.clone(),
-    };
+    let state = settings
+        .get(STATE_NAMESPACE)
+        .cloned()
+        .unwrap_or_else(empty_durable_state);
     validate_durable_state(&state)?;
     Ok(state)
 }
 
-fn settings_from_host_response(response: &Value) -> Result<Value, RequestError> {
-    match response.get("settings") {
-        None | Some(Value::Null) => Ok(json!({})),
-        Some(settings) if settings.is_object() => Ok(settings.clone()),
-        _ => Err(RequestError::Message(
-            "host settings response must contain an object".to_string(),
-        )),
-    }
-}
-
-fn settings_with_durable_state(settings: &Value, state: Value) -> Result<Value, RequestError> {
-    validate_durable_state(&state)?;
-    let mut settings = settings.as_object().cloned().ok_or_else(|| {
-        RequestError::Message("plugin settings must be a JSON object".to_string())
-    })?;
-    settings.insert(STATE_NAMESPACE.to_string(), state);
-    Ok(Value::Object(settings))
+fn settings_value_from_host_response(response: &Value) -> Result<Value, RequestError> {
+    response.get("settings").cloned().ok_or_else(|| {
+        RequestError::Message("host settings response did not contain settings".to_string())
+    })
 }
 
 fn host_call_with_cancellation(
@@ -603,58 +589,96 @@ fn host_call_with_cancellation(
     }
 }
 
-fn mutate_durable_state<F>(
+fn durable_state_patch_request(patch: Value) -> Value {
+    let mut namespaces = serde_json::Map::new();
+    namespaces.insert(STATE_NAMESPACE.to_string(), patch);
+    json!({ "patch": Value::Object(namespaces) })
+}
+
+fn ensure_durable_state(
     context: &ExecutionContext,
     allow_cancelled: bool,
-    mutate: F,
-) -> Result<Value, RequestError>
-where
-    F: FnOnce(&mut Value) -> Result<(), RequestError>,
-{
+) -> Result<(), RequestError> {
+    let response = host_call_with_cancellation(
+        context,
+        "github-settings-version",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "version"] }),
+        allow_cancelled,
+    )?;
+    match settings_value_from_host_response(&response)? {
+        Value::Null => {
+            host_call_with_cancellation(
+                context,
+                "github-settings-initialize",
+                "host.settings.patch",
+                durable_state_patch_request(empty_durable_state()),
+                allow_cancelled,
+            )?;
+            Ok(())
+        }
+        Value::Number(version) if version.as_u64() == Some(STATE_VERSION) => Ok(()),
+        _ => Err(RequestError::Message(
+            "unsupported GitHub durable state version".to_string(),
+        )),
+    }
+}
+
+fn patch_durable_state(
+    context: &ExecutionContext,
+    allow_cancelled: bool,
+    patch: Value,
+) -> Result<(), RequestError> {
     if !allow_cancelled {
         context.check_cancelled()?;
     }
-    let _lock = context
-        .durable_state_locks
-        .state
-        .lock()
-        .map_err(|_| RequestError::Message("GitHub state lock was poisoned".to_string()))?;
+    ensure_durable_state(context, allow_cancelled)?;
     let response = host_call_with_cancellation(
         context,
-        "github-settings-get",
-        "host.settings.get",
-        Value::Null,
+        "github-settings-patch",
+        "host.settings.patch",
+        durable_state_patch_request(patch),
         allow_cancelled,
     )?;
-    let settings = settings_from_host_response(&response)?;
-    let mut state = durable_state_from_settings(&settings)?;
-    mutate(&mut state)?;
-    validate_durable_state(&state)?;
-    let replacement = settings_with_durable_state(&settings, state.clone())?;
-    let saved = host_call_with_cancellation(
-        context,
-        "github-settings-replace",
-        "host.settings.replace",
-        json!({ "settings": replacement }),
-        allow_cancelled,
-    )?;
-    let saved_settings = settings_from_host_response(&saved)?;
-    durable_state_from_settings(&saved_settings)
+    if response.get("updated").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(RequestError::Message(
+            "host settings patch response did not confirm the update".to_string(),
+        ))
+    }
 }
 
-fn put_pr_mapping(
-    state: &mut Value,
+fn reconciliation_from_settings_value(value: Value) -> Result<Value, RequestError> {
+    let mut state = empty_durable_state();
+    state["reconciliation"] = value;
+    validate_durable_state(&state)?;
+    Ok(state["reconciliation"].clone())
+}
+
+fn read_reconciliation_state(
+    context: &ExecutionContext,
+    allow_cancelled: bool,
+) -> Result<Value, RequestError> {
+    ensure_durable_state(context, allow_cancelled)?;
+    let response = host_call_with_cancellation(
+        context,
+        "github-settings-reconciliation",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "reconciliation"] }),
+        allow_cancelled,
+    )?;
+    reconciliation_from_settings_value(settings_value_from_host_response(&response)?)
+}
+
+fn pr_mapping(
     session_id: &str,
     url: &str,
     pr_state: &str,
     remote: Option<&str>,
     branch: Option<&str>,
     updated_at: u64,
-) -> Result<(), RequestError> {
-    let pull_requests = state
-        .get_mut("pull_requests")
-        .and_then(Value::as_object_mut)
-        .expect("validated durable state has pull_requests object");
+) -> Value {
     let mut mapping = serde_json::Map::new();
     mapping.insert("session_id".to_string(), json!(session_id));
     mapping.insert("url".to_string(), json!(url));
@@ -666,16 +690,7 @@ fn put_pr_mapping(
         mapping.insert("branch".to_string(), json!(branch));
     }
     mapping.insert("updated_at".to_string(), json!(updated_at));
-    pull_requests.insert(session_id.to_string(), Value::Object(mapping));
-    Ok(())
-}
-
-fn remove_pr_mapping(state: &mut Value, session_id: &str) {
-    state
-        .get_mut("pull_requests")
-        .and_then(Value::as_object_mut)
-        .expect("validated durable state has pull_requests object")
-        .remove(session_id);
+    Value::Object(mapping)
 }
 
 fn persist_pr_mapping(
@@ -686,66 +701,126 @@ fn persist_pr_mapping(
     remote: Option<&str>,
     branch: Option<&str>,
 ) -> Result<(), RequestError> {
-    let updated_at = unix_timestamp_ms();
-    mutate_durable_state(context, false, |state| {
-        put_pr_mapping(state, session_id, url, pr_state, remote, branch, updated_at)
-    })?;
-    Ok(())
+    let mut pull_requests = serde_json::Map::new();
+    pull_requests.insert(
+        session_id.to_string(),
+        pr_mapping(
+            session_id,
+            url,
+            pr_state,
+            remote,
+            branch,
+            unix_timestamp_ms(),
+        ),
+    );
+    patch_durable_state(
+        context,
+        false,
+        json!({ "pull_requests": Value::Object(pull_requests) }),
+    )
 }
 
 fn clear_pr_mapping(context: &ExecutionContext, session_id: &str) -> Result<(), RequestError> {
-    mutate_durable_state(context, false, |state| {
-        remove_pr_mapping(state, session_id);
-        Ok(())
+    let mut pull_requests = serde_json::Map::new();
+    pull_requests.insert(session_id.to_string(), Value::Null);
+    patch_durable_state(
+        context,
+        false,
+        json!({ "pull_requests": Value::Object(pull_requests) }),
+    )
+}
+
+fn begin_reconciliation_patch(
+    reconciliation: &Value,
+    attempt_id: &str,
+    started_at: u64,
+) -> Result<Value, RequestError> {
+    let reconciliation = reconciliation.as_object().ok_or_else(|| {
+        RequestError::Message("GitHub durable state reconciliation must be an object".to_string())
     })?;
-    Ok(())
-}
-
-fn begin_reconciliation_state(state: &mut Value, attempt_id: &str, started_at: u64) {
-    let ledger = state
-        .get_mut("reconciliation")
-        .and_then(Value::as_object_mut)
-        .expect("validated durable state has reconciliation object");
-    if ledger.get("status").and_then(Value::as_str) == Some("running") {
-        let previous_attempt = ledger.get("attempt_id").cloned().unwrap_or(Value::Null);
-        ledger.insert("recovered_attempt_id".to_string(), previous_attempt);
-        ledger.insert("recovered_at".to_string(), json!(started_at));
+    let mut patch = serde_json::Map::new();
+    if reconciliation.get("status").and_then(Value::as_str) == Some("running") {
+        patch.insert(
+            "recovered_attempt_id".to_string(),
+            reconciliation
+                .get("attempt_id")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        patch.insert("recovered_at".to_string(), json!(started_at));
     }
-    ledger.insert("status".to_string(), json!("running"));
-    ledger.insert("attempt_id".to_string(), json!(attempt_id));
-    ledger.insert("started_at".to_string(), json!(started_at));
-    ledger.insert("finished_at".to_string(), Value::Null);
-    ledger.insert("checked".to_string(), json!(0));
-    ledger.insert("error".to_string(), Value::Null);
+    patch.insert("status".to_string(), json!("running"));
+    patch.insert("attempt_id".to_string(), json!(attempt_id));
+    patch.insert("started_at".to_string(), json!(started_at));
+    patch.insert("finished_at".to_string(), Value::Null);
+    patch.insert("checked".to_string(), json!(0));
+    patch.insert("error".to_string(), Value::Null);
+    Ok(Value::Object(patch))
 }
 
-fn finish_reconciliation_state(
-    state: &mut Value,
+fn finish_reconciliation_patch(
+    reconciliation: &Value,
+    attempt_id: &str,
+    status: &str,
+    checked: u64,
+    finished_at: u64,
+    error: Option<&str>,
+) -> Result<Value, RequestError> {
+    let reconciliation = reconciliation.as_object().ok_or_else(|| {
+        RequestError::Message("GitHub durable state reconciliation must be an object".to_string())
+    })?;
+    if reconciliation.get("status").and_then(Value::as_str) != Some("running")
+        || reconciliation.get("attempt_id").and_then(Value::as_str) != Some(attempt_id)
+    {
+        return Err(RequestError::Message(
+            "reconciliation attempt was superseded".to_string(),
+        ));
+    }
+    Ok(json!({
+        "status": status,
+        "finished_at": finished_at,
+        "checked": checked,
+        "error": error.map_or(Value::Null, |error| json!(bounded_error(error))),
+    }))
+}
+
+fn begin_reconciliation(
+    context: &ExecutionContext,
+    attempt_id: &str,
+    started_at: u64,
+) -> Result<(), RequestError> {
+    let reconciliation = read_reconciliation_state(context, false)?;
+    patch_durable_state(
+        context,
+        false,
+        json!({ "reconciliation": begin_reconciliation_patch(&reconciliation, attempt_id, started_at)? }),
+    )
+}
+
+fn finish_reconciliation(
+    context: &ExecutionContext,
+    allow_cancelled: bool,
     attempt_id: &str,
     status: &str,
     checked: u64,
     finished_at: u64,
     error: Option<&str>,
 ) -> Result<(), RequestError> {
-    let ledger = state
-        .get_mut("reconciliation")
-        .and_then(Value::as_object_mut)
-        .expect("validated durable state has reconciliation object");
-    if ledger.get("status").and_then(Value::as_str) != Some("running")
-        || ledger.get("attempt_id").and_then(Value::as_str) != Some(attempt_id)
-    {
-        return Err(RequestError::Message(
-            "reconciliation attempt was superseded".to_string(),
-        ));
-    }
-    ledger.insert("status".to_string(), json!(status));
-    ledger.insert("finished_at".to_string(), json!(finished_at));
-    ledger.insert("checked".to_string(), json!(checked));
-    ledger.insert(
-        "error".to_string(),
-        error.map_or(Value::Null, |error| json!(bounded_error(error))),
-    );
-    Ok(())
+    let reconciliation = read_reconciliation_state(context, allow_cancelled)?;
+    patch_durable_state(
+        context,
+        allow_cancelled,
+        json!({
+            "reconciliation": finish_reconciliation_patch(
+                &reconciliation,
+                attempt_id,
+                status,
+                checked,
+                finished_at,
+                error,
+            )?
+        }),
+    )
 }
 
 fn bounded_error(error: &str) -> String {
@@ -1012,10 +1087,7 @@ fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
         "reconcile-{started_at}-{}",
         context.callback_sequence.fetch_add(1, Ordering::Relaxed)
     );
-    mutate_durable_state(context, false, |state| {
-        begin_reconciliation_state(state, &attempt_id, started_at);
-        Ok(())
-    })?;
+    begin_reconciliation(context, &attempt_id, started_at)?;
 
     let mut checked = 0_u64;
     let work = (|| {
@@ -1047,41 +1119,45 @@ fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
     let finished_at = unix_timestamp_ms();
     match work {
         Ok(()) if !context.cancelled.load(Ordering::SeqCst) => {
-            match mutate_durable_state(context, false, |state| {
-                finish_reconciliation_state(state, &attempt_id, "idle", checked, finished_at, None)
-            }) {
+            match finish_reconciliation(
+                context,
+                false,
+                &attempt_id,
+                "idle",
+                checked,
+                finished_at,
+                None,
+            ) {
                 Ok(_) => Ok(json!({ "checked": checked, "attempt_id": attempt_id })),
                 Err(error) => {
                     let message = match &error {
                         RequestError::Cancelled => "request cancelled".to_string(),
                         RequestError::Message(message) => message.clone(),
                     };
-                    mutate_durable_state(context, true, |state| {
-                        finish_reconciliation_state(
-                            state,
-                            &attempt_id,
-                            "failed",
-                            checked,
-                            finished_at,
-                            Some(&message),
-                        )
-                    })?;
+                    finish_reconciliation(
+                        context,
+                        true,
+                        &attempt_id,
+                        "failed",
+                        checked,
+                        finished_at,
+                        Some(&message),
+                    )?;
                     Err(error)
                 }
             }
         }
         Ok(()) => {
             let error = RequestError::Cancelled;
-            mutate_durable_state(context, true, |state| {
-                finish_reconciliation_state(
-                    state,
-                    &attempt_id,
-                    "failed",
-                    checked,
-                    finished_at,
-                    Some("request cancelled"),
-                )
-            })?;
+            finish_reconciliation(
+                context,
+                true,
+                &attempt_id,
+                "failed",
+                checked,
+                finished_at,
+                Some("request cancelled"),
+            )?;
             Err(error)
         }
         Err(error) => {
@@ -1089,16 +1165,15 @@ fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
                 RequestError::Cancelled => "request cancelled".to_string(),
                 RequestError::Message(message) => message.clone(),
             };
-            let terminal = mutate_durable_state(context, true, |state| {
-                finish_reconciliation_state(
-                    state,
-                    &attempt_id,
-                    "failed",
-                    checked,
-                    finished_at,
-                    Some(&message),
-                )
-            });
+            let terminal = finish_reconciliation(
+                context,
+                true,
+                &attempt_id,
+                "failed",
+                checked,
+                finished_at,
+                Some(&message),
+            );
             terminal?;
             Err(error)
         }
@@ -1411,6 +1486,7 @@ mod tests {
         input_tx
             .send(json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": "request-1" } }).to_string())
             .unwrap();
+
         let response = receive_frame(&output_rx);
         assert_eq!(response["id"], "request-1");
         assert_eq!(response["error"]["code"], CANCELLATION_ERROR_CODE);
@@ -1418,6 +1494,63 @@ mod tests {
         thread.join().unwrap().unwrap();
     }
 
+    #[test]
+    fn persisting_a_pr_mapping_uses_bounded_settings_callbacks() {
+        let (events, events_rx) = mpsc::channel();
+        let context = ExecutionContext {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events,
+            runner: CommandRunner::default(),
+            request_key: "test-request".to_string(),
+            callback_sequence: Arc::new(AtomicU64::new(1)),
+            durable_state_locks: DurableStateLocks {
+                reconciliation: Arc::new(Mutex::new(())),
+            },
+        };
+        let worker = thread::spawn(move || {
+            persist_pr_mapping(
+                &context,
+                "session-1",
+                "https://github.com/example/repository/pull/1",
+                "open",
+                Some("https://github.com/example/repository.git"),
+                Some("topic"),
+            )
+        });
+
+        let ControllerEvent::HostCall {
+            method,
+            params,
+            response,
+            ..
+        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected a host settings version callback");
+        };
+        assert_eq!(method, "host.settings.get");
+        assert_eq!(params, json!({ "path": ["github", "version"] }));
+        response
+            .send(Ok(json!({ "settings": STATE_VERSION })))
+            .unwrap();
+
+        let ControllerEvent::HostCall {
+            method,
+            params,
+            response,
+            ..
+        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected a host settings patch callback");
+        };
+        assert_eq!(method, "host.settings.patch");
+        assert_eq!(
+            params["patch"]["github"]["pull_requests"]["session-1"]["url"],
+            "https://github.com/example/repository/pull/1"
+        );
+        assert!(params.to_string().len() < 2048);
+        response.send(Ok(json!({ "updated": true }))).unwrap();
+        worker.join().unwrap().unwrap();
+    }
     #[test]
     fn durable_state_accepts_missing_settings_and_rejects_invalid_or_incompatible_documents() {
         assert_eq!(
@@ -1443,73 +1576,74 @@ mod tests {
     }
 
     #[test]
-    fn durable_state_replacement_preserves_unrelated_plugin_settings() {
-        let settings = json!({ "display": { "compact": true }, "other_plugin_key": "keep" });
-        let replacement = settings_with_durable_state(&settings, empty_durable_state()).unwrap();
-        assert_eq!(replacement["display"]["compact"], true);
-        assert_eq!(replacement["other_plugin_key"], "keep");
-        assert_eq!(
-            durable_state_from_settings(&replacement).unwrap()["version"],
-            STATE_VERSION
-        );
-    }
-
-    #[test]
-    fn pull_request_mapping_updates_and_removes_without_touching_reconciliation() {
-        let mut state = empty_durable_state();
-        begin_reconciliation_state(&mut state, "existing", 10);
-        put_pr_mapping(
-            &mut state,
+    fn durable_state_patches_are_small_and_leave_unrelated_settings_host_owned() {
+        let mapping = pr_mapping(
             "s1",
             "https://github.com/o/r/pull/1",
             "open",
             Some("https://github.com/o/r.git"),
             Some("topic"),
             20,
-        )
-        .unwrap();
-        assert_eq!(state["pull_requests"]["s1"]["branch"], "topic");
-        assert_eq!(state["reconciliation"]["status"], "running");
-        remove_pr_mapping(&mut state, "s1");
-        assert!(state["pull_requests"].get("s1").is_none());
-        assert_eq!(state["reconciliation"]["attempt_id"], "existing");
+        );
+        let request = durable_state_patch_request(json!({
+            "pull_requests": { "s1": mapping }
+        }));
+        assert_eq!(
+            request["patch"]["github"]["pull_requests"]["s1"]["branch"],
+            "topic"
+        );
+        assert!(request.to_string().len() < 1024);
     }
 
     #[test]
-    fn reconciliation_records_interruption_fences_attempts_and_records_terminal_results() {
-        let mut state = empty_durable_state();
-        begin_reconciliation_state(&mut state, "old-attempt", 100);
-        begin_reconciliation_state(&mut state, "new-attempt", 200);
-        assert_eq!(
-            state["reconciliation"]["recovered_attempt_id"],
-            "old-attempt"
-        );
-        assert_eq!(state["reconciliation"]["recovered_at"], 200);
-        assert!(
-            finish_reconciliation_state(&mut state, "old-attempt", "idle", 1, 300, None).is_err()
-        );
-        finish_reconciliation_state(&mut state, "new-attempt", "idle", 2, 300, None).unwrap();
-        assert_eq!(state["reconciliation"]["status"], "idle");
-        assert_eq!(state["reconciliation"]["checked"], 2);
+    fn pull_request_mapping_patch_removes_only_the_selected_mapping() {
+        let mut removed = serde_json::Map::new();
+        removed.insert("s1".to_string(), Value::Null);
+        let request = durable_state_patch_request(json!({
+            "pull_requests": Value::Object(removed)
+        }));
+        assert!(request["patch"]["github"]["pull_requests"]["s1"].is_null());
+    }
 
-        begin_reconciliation_state(&mut state, "failed-attempt", 400);
+    fn merge_json_object(target: &mut Value, patch: &Value) {
+        let target = target.as_object_mut().unwrap();
+        for (key, value) in patch.as_object().unwrap() {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+
+    #[test]
+    fn reconciliation_patches_recover_interruption_fence_attempts_and_bound_errors() {
+        let state = empty_durable_state();
+        let old = begin_reconciliation_patch(&state["reconciliation"], "old-attempt", 100).unwrap();
+        let mut running = state["reconciliation"].clone();
+        merge_json_object(&mut running, &old);
+        let new = begin_reconciliation_patch(&running, "new-attempt", 200).unwrap();
+        assert_eq!(new["recovered_attempt_id"], "old-attempt");
+        assert_eq!(new["recovered_at"], 200);
+        merge_json_object(&mut running, &new);
+        assert!(
+            finish_reconciliation_patch(&running, "old-attempt", "idle", 1, 300, None).is_err()
+        );
+
+        let idle =
+            finish_reconciliation_patch(&running, "new-attempt", "idle", 2, 300, None).unwrap();
+        assert_eq!(idle["status"], "idle");
+        assert_eq!(idle["checked"], 2);
+
         let long_error = "x".repeat(MAX_RECONCILIATION_ERROR_CHARS + 10);
-        finish_reconciliation_state(
-            &mut state,
-            "failed-attempt",
+        let failed = finish_reconciliation_patch(
+            &running,
+            "new-attempt",
             "failed",
             3,
             500,
             Some(&long_error),
         )
         .unwrap();
-        assert_eq!(state["reconciliation"]["status"], "failed");
+        assert_eq!(failed["status"], "failed");
         assert_eq!(
-            state["reconciliation"]["error"]
-                .as_str()
-                .unwrap()
-                .chars()
-                .count(),
+            failed["error"].as_str().unwrap().chars().count(),
             MAX_RECONCILIATION_ERROR_CHARS
         );
     }
@@ -1523,7 +1657,6 @@ mod tests {
             request_key: "test-request".to_string(),
             callback_sequence: Arc::new(AtomicU64::new(1)),
             durable_state_locks: DurableStateLocks {
-                state: Arc::new(Mutex::new(())),
                 reconciliation: Arc::new(Mutex::new(())),
             },
         }

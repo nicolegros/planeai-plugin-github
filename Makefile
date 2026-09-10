@@ -29,7 +29,7 @@ package:
 	rm -rf $(DIST)
 	mkdir -p $(DIST)/bin/$(PLATFORM) $(DIST)/ui
 	cp planeai-plugin.json $(DIST)/
-	cp ui/entry.js $(DIST)/ui/
+	cp ui/entry.js ui/titlebar.js $(DIST)/ui/
 	cp target/release/$(PLUGIN) $(DIST)/bin/$(PLATFORM)/$(PLUGIN)
 	chmod +x $(DIST)/bin/$(PLATFORM)/$(PLUGIN)
 	@echo "Staged $(DIST) for $(PLATFORM)"

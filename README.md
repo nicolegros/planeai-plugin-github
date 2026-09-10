@@ -25,6 +25,8 @@ make package
 planeai-cli plugin test --package dist/planeai-plugin-github
 ```
 
+For local development, install **`dist/planeai-plugin-github`** in PlaneAI—not the repository root. The host requires the platform binary at `bin/<platform>/planeai-plugin-github`, which `make package` stages into that `dist` directory.
+
 The sidecar speaks newline-delimited JSON-RPC on stdin/stdout. Stdout is protocol-only; diagnostics go to stderr. The UI is one self-contained browser ESM module because PlaneAI loads an entrypoint source file rather than an asset graph.
 
 ## Durable state

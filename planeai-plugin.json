@@ -13,13 +13,23 @@
     "windows-x64": "bin/windows-x64/planeai-plugin-github.exe",
     "windows-arm64": "bin/windows-arm64/planeai-plugin-github.exe"
   },
-  "capabilities": ["settings", "sessions.read", "sessions.repository-context"],
+  "capabilities": [
+    "settings",
+    "sessions.read",
+    "sessions.repository-context"
+  ],
   "ui_contributions": [
     {
       "id": "pull-request",
       "label": "GitHub",
       "placement": "session.panel",
       "entrypoint": "ui/entry.js"
+    },
+    {
+      "id": "pull-request-titlebar",
+      "label": "GitHub",
+      "placement": "titlebar",
+      "entrypoint": "ui/titlebar.js"
     }
   ]
 }
