@@ -27,6 +27,12 @@ planeai-cli plugin test --package dist/planeai-plugin-github
 
 The sidecar speaks newline-delimited JSON-RPC on stdin/stdout. Stdout is protocol-only; diagnostics go to stderr. The UI is one self-contained browser ESM module because PlaneAI loads an entrypoint source file rather than an asset graph.
 
+## Durable state
+
+With the manifest-granted `settings` capability, the sidecar persists only its `github` namespace through `host.settings.get` and `host.settings.replace`; it read-merges-replaces so unrelated plugin settings survive. The namespace is a strict version-1 JSON document containing `pull_requests` keyed by session ID (session ID, PR URL/state, known remote/branch, and update timestamp) and a reconciliation ledger. Missing state starts as an empty v1 document; malformed or unsupported documents are rejected rather than migrated implicitly. `github.status`, `github.create`, `github.link`, and `github.merge` update mappings only after their GitHub operation succeeds; a successful status lookup with no PR clears that session mapping.
+
+`github.reconcile` remains an explicit, on-demand RPC. It writes a unique fenced `running` attempt before checking active sessions, records a previously persisted running attempt as recovered, and then writes `idle` counts/timestamps or bounded `failed` error details (including cancellation). It never schedules or enables background reconciliation.
+
 ## Release artifacts
 
 The release workflow builds package archives for macOS arm64/x64, Linux x64/arm64, and Windows x64/arm64. Each archive contains `planeai-plugin.json`, `ui/entry.js`, and the binary under the manifest-declared `bin/<platform>/` path.

@@ -6,10 +6,10 @@ use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, RecvTimeoutError, Sender},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PLUGIN_ID: &str = "github";
 const PLUGIN_NAME: &str = "GitHub";
@@ -18,6 +18,9 @@ const HOST_API_VERSION: &str = "planeai.plugin-host.v1";
 const CANCELLATION_ERROR_CODE: i64 = -32800;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const STATE_NAMESPACE: &str = "github";
+const STATE_VERSION: u64 = 1;
+const MAX_RECONCILIATION_ERROR_CHARS: usize = 500;
 
 #[derive(Clone)]
 struct CommandRunner {
@@ -45,12 +48,19 @@ impl CommandRunner {
 }
 
 #[derive(Clone)]
+struct DurableStateLocks {
+    state: Arc<Mutex<()>>,
+    reconciliation: Arc<Mutex<()>>,
+}
+
+#[derive(Clone)]
 struct ExecutionContext {
     cancelled: Arc<AtomicBool>,
     events: Sender<ControllerEvent>,
     runner: CommandRunner,
     request_key: String,
     callback_sequence: Arc<AtomicU64>,
+    durable_state_locks: DurableStateLocks,
 }
 
 impl ExecutionContext {
@@ -80,6 +90,8 @@ enum InputEvent {
     Invalid(String),
     Closed,
 }
+
+type CallbackResponses = HashMap<String, (String, Sender<Result<Value, RequestError>>)>;
 
 enum ControllerEvent {
     HostCall {
@@ -117,6 +129,10 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
     let mut callbacks: HashMap<String, (String, Sender<Result<Value, RequestError>>)> =
         HashMap::new();
     let callback_sequence = Arc::new(AtomicU64::new(1));
+    let durable_state_locks = DurableStateLocks {
+        state: Arc::new(Mutex::new(())),
+        reconciliation: Arc::new(Mutex::new(())),
+    };
     let mut input_open = true;
     let mut stopping = false;
 
@@ -139,6 +155,7 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
                 &event_tx,
                 &runner,
                 Arc::clone(&callback_sequence),
+                durable_state_locks.clone(),
                 &mut active_requests,
                 &mut callbacks,
             ),
@@ -158,8 +175,8 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
 }
 
 fn read_input<R: Read>(input: R, sender: Sender<InputEvent>) {
-    let mut lines = BufReader::new(input).lines();
-    while let Some(line) = lines.next() {
+    let lines = BufReader::new(input).lines();
+    for line in lines {
         match line {
             Ok(line) => match serde_json::from_str(&line) {
                 Ok(frame) => {
@@ -187,8 +204,9 @@ fn handle_input_frame(
     event_tx: &Sender<ControllerEvent>,
     runner: &CommandRunner,
     callback_sequence: Arc<AtomicU64>,
+    durable_state_locks: DurableStateLocks,
     active_requests: &mut HashMap<String, Arc<AtomicBool>>,
-    callbacks: &mut HashMap<String, (String, Sender<Result<Value, RequestError>>)>,
+    callbacks: &mut CallbackResponses,
 ) {
     if let Some(id) = frame.get("id").and_then(Value::as_str) {
         if let Some((_request_key, callback)) = callbacks.remove(id) {
@@ -238,6 +256,7 @@ fn handle_input_frame(
             runner,
             request_key: key.clone(),
             callback_sequence,
+            durable_state_locks,
         };
         let shutdown = method == "plugin.shutdown";
         let result = dispatch(&method, params, &context);
@@ -254,7 +273,7 @@ fn handle_controller_event<W: Write>(
     event: ControllerEvent,
     output: &mut W,
     active_requests: &mut HashMap<String, Arc<AtomicBool>>,
-    callbacks: &mut HashMap<String, (String, Sender<Result<Value, RequestError>>)>,
+    callbacks: &mut CallbackResponses,
     stopping: &mut bool,
 ) -> io::Result<()> {
     match event {
@@ -335,6 +354,404 @@ fn handshake(params: &Value) -> Result<Value, String> {
     }))
 }
 
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn empty_durable_state() -> Value {
+    json!({
+        "version": STATE_VERSION,
+        "pull_requests": {},
+        "reconciliation": {
+            "status": "idle",
+            "attempt_id": Value::Null,
+            "started_at": Value::Null,
+            "finished_at": Value::Null,
+            "checked": 0,
+            "recovered_attempt_id": Value::Null,
+            "recovered_at": Value::Null,
+            "error": Value::Null,
+        },
+    })
+}
+
+fn require_only_keys(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Result<(), RequestError> {
+    if object.keys().any(|key| !keys.contains(&key.as_str())) {
+        return Err(RequestError::Message(
+            "GitHub durable state contains unknown fields".to_string(),
+        ));
+    }
+    if keys.iter().any(|key| !object.contains_key(*key)) {
+        return Err(RequestError::Message(
+            "GitHub durable state is missing required fields".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn strict_string(value: Option<&Value>, field: &str) -> Result<String, RequestError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| RequestError::Message(format!("GitHub durable state has invalid {field}")))
+}
+
+fn strict_optional_string(value: Option<&Value>, field: &str) -> Result<(), RequestError> {
+    match value {
+        Some(Value::Null) => Ok(()),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(()),
+        _ => Err(RequestError::Message(format!(
+            "GitHub durable state has invalid {field}"
+        ))),
+    }
+}
+
+fn strict_optional_timestamp(value: Option<&Value>, field: &str) -> Result<(), RequestError> {
+    match value {
+        Some(Value::Null) => Ok(()),
+        Some(Value::Number(number)) if number.as_u64().is_some() => Ok(()),
+        _ => Err(RequestError::Message(format!(
+            "GitHub durable state has invalid {field}"
+        ))),
+    }
+}
+
+fn validate_durable_state(state: &Value) -> Result<(), RequestError> {
+    let object = state.as_object().ok_or_else(|| {
+        RequestError::Message("GitHub durable state must be a JSON object".to_string())
+    })?;
+    require_only_keys(object, &["version", "pull_requests", "reconciliation"])?;
+    if object.get("version").and_then(Value::as_u64) != Some(STATE_VERSION) {
+        return Err(RequestError::Message(
+            "unsupported GitHub durable state version".to_string(),
+        ));
+    }
+    let pull_requests = object
+        .get("pull_requests")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            RequestError::Message(
+                "GitHub durable state pull_requests must be an object".to_string(),
+            )
+        })?;
+    for (session_id, pull_request) in pull_requests {
+        if session_id.trim().is_empty() {
+            return Err(RequestError::Message(
+                "GitHub durable state has an empty session id".to_string(),
+            ));
+        }
+        let pull_request = pull_request.as_object().ok_or_else(|| {
+            RequestError::Message("GitHub durable state pull request must be an object".to_string())
+        })?;
+        if pull_request.keys().any(|key| {
+            ![
+                "session_id",
+                "url",
+                "state",
+                "remote",
+                "branch",
+                "updated_at",
+            ]
+            .contains(&key.as_str())
+        }) {
+            return Err(RequestError::Message(
+                "GitHub durable state pull request contains unknown fields".to_string(),
+            ));
+        }
+        if strict_string(pull_request.get("session_id"), "pull request session_id")? != *session_id
+            || strict_string(pull_request.get("url"), "pull request url").is_err()
+            || strict_string(pull_request.get("state"), "pull request state").is_err()
+            || pull_request
+                .get("updated_at")
+                .and_then(Value::as_u64)
+                .is_none()
+        {
+            return Err(RequestError::Message(
+                "GitHub durable state has an invalid pull request mapping".to_string(),
+            ));
+        }
+        for field in ["remote", "branch"] {
+            if let Some(value) = pull_request.get(field) {
+                if value.as_str().is_none_or(|value| value.trim().is_empty()) {
+                    return Err(RequestError::Message(format!(
+                        "GitHub durable state has invalid pull request {field}"
+                    )));
+                }
+            }
+        }
+    }
+    let reconciliation = object
+        .get("reconciliation")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            RequestError::Message(
+                "GitHub durable state reconciliation must be an object".to_string(),
+            )
+        })?;
+    require_only_keys(
+        reconciliation,
+        &[
+            "status",
+            "attempt_id",
+            "started_at",
+            "finished_at",
+            "checked",
+            "recovered_attempt_id",
+            "recovered_at",
+            "error",
+        ],
+    )?;
+    if !matches!(
+        reconciliation.get("status").and_then(Value::as_str),
+        Some("idle" | "running" | "failed")
+    ) || reconciliation
+        .get("checked")
+        .and_then(Value::as_u64)
+        .is_none()
+    {
+        return Err(RequestError::Message(
+            "GitHub durable state has invalid reconciliation status".to_string(),
+        ));
+    }
+    for field in ["attempt_id", "recovered_attempt_id", "error"] {
+        strict_optional_string(reconciliation.get(field), field)?;
+    }
+    for field in ["started_at", "finished_at", "recovered_at"] {
+        strict_optional_timestamp(reconciliation.get(field), field)?;
+    }
+    Ok(())
+}
+
+fn durable_state_from_settings(settings: &Value) -> Result<Value, RequestError> {
+    let settings = settings.as_object().ok_or_else(|| {
+        RequestError::Message("plugin settings must be a JSON object".to_string())
+    })?;
+    let state = match settings.get(STATE_NAMESPACE) {
+        None => empty_durable_state(),
+        Some(state) => state.clone(),
+    };
+    validate_durable_state(&state)?;
+    Ok(state)
+}
+
+fn settings_from_host_response(response: &Value) -> Result<Value, RequestError> {
+    match response.get("settings") {
+        None | Some(Value::Null) => Ok(json!({})),
+        Some(settings) if settings.is_object() => Ok(settings.clone()),
+        _ => Err(RequestError::Message(
+            "host settings response must contain an object".to_string(),
+        )),
+    }
+}
+
+fn settings_with_durable_state(settings: &Value, state: Value) -> Result<Value, RequestError> {
+    validate_durable_state(&state)?;
+    let mut settings = settings.as_object().cloned().ok_or_else(|| {
+        RequestError::Message("plugin settings must be a JSON object".to_string())
+    })?;
+    settings.insert(STATE_NAMESPACE.to_string(), state);
+    Ok(Value::Object(settings))
+}
+
+fn host_call_with_cancellation(
+    context: &ExecutionContext,
+    id_prefix: &str,
+    method: &str,
+    params: Value,
+    allow_cancelled: bool,
+) -> Result<Value, RequestError> {
+    if !allow_cancelled {
+        context.check_cancelled()?;
+    }
+    let id = format!(
+        "{id_prefix}-{}",
+        context.callback_sequence.fetch_add(1, Ordering::Relaxed)
+    );
+    let (response_tx, response_rx) = mpsc::channel();
+    context
+        .events
+        .send(ControllerEvent::HostCall {
+            id,
+            request_key: context.request_key.clone(),
+            method: method.to_string(),
+            params,
+            response: response_tx,
+        })
+        .map_err(|_| RequestError::Message("request controller stopped".to_string()))?;
+    loop {
+        if !allow_cancelled {
+            context.check_cancelled()?;
+        }
+        match response_rx.recv_timeout(POLL_INTERVAL) {
+            Ok(response) => return response,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(RequestError::Message(
+                    "request controller stopped".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+fn mutate_durable_state<F>(
+    context: &ExecutionContext,
+    allow_cancelled: bool,
+    mutate: F,
+) -> Result<Value, RequestError>
+where
+    F: FnOnce(&mut Value) -> Result<(), RequestError>,
+{
+    if !allow_cancelled {
+        context.check_cancelled()?;
+    }
+    let _lock = context
+        .durable_state_locks
+        .state
+        .lock()
+        .map_err(|_| RequestError::Message("GitHub state lock was poisoned".to_string()))?;
+    let response = host_call_with_cancellation(
+        context,
+        "github-settings-get",
+        "host.settings.get",
+        Value::Null,
+        allow_cancelled,
+    )?;
+    let settings = settings_from_host_response(&response)?;
+    let mut state = durable_state_from_settings(&settings)?;
+    mutate(&mut state)?;
+    validate_durable_state(&state)?;
+    let replacement = settings_with_durable_state(&settings, state.clone())?;
+    let saved = host_call_with_cancellation(
+        context,
+        "github-settings-replace",
+        "host.settings.replace",
+        json!({ "settings": replacement }),
+        allow_cancelled,
+    )?;
+    let saved_settings = settings_from_host_response(&saved)?;
+    durable_state_from_settings(&saved_settings)
+}
+
+fn put_pr_mapping(
+    state: &mut Value,
+    session_id: &str,
+    url: &str,
+    pr_state: &str,
+    remote: Option<&str>,
+    branch: Option<&str>,
+    updated_at: u64,
+) -> Result<(), RequestError> {
+    let pull_requests = state
+        .get_mut("pull_requests")
+        .and_then(Value::as_object_mut)
+        .expect("validated durable state has pull_requests object");
+    let mut mapping = serde_json::Map::new();
+    mapping.insert("session_id".to_string(), json!(session_id));
+    mapping.insert("url".to_string(), json!(url));
+    mapping.insert("state".to_string(), json!(pr_state));
+    if let Some(remote) = remote.filter(|value| !value.trim().is_empty()) {
+        mapping.insert("remote".to_string(), json!(remote));
+    }
+    if let Some(branch) = branch.filter(|value| !value.trim().is_empty()) {
+        mapping.insert("branch".to_string(), json!(branch));
+    }
+    mapping.insert("updated_at".to_string(), json!(updated_at));
+    pull_requests.insert(session_id.to_string(), Value::Object(mapping));
+    Ok(())
+}
+
+fn remove_pr_mapping(state: &mut Value, session_id: &str) {
+    state
+        .get_mut("pull_requests")
+        .and_then(Value::as_object_mut)
+        .expect("validated durable state has pull_requests object")
+        .remove(session_id);
+}
+
+fn persist_pr_mapping(
+    context: &ExecutionContext,
+    session_id: &str,
+    url: &str,
+    pr_state: &str,
+    remote: Option<&str>,
+    branch: Option<&str>,
+) -> Result<(), RequestError> {
+    let updated_at = unix_timestamp_ms();
+    mutate_durable_state(context, false, |state| {
+        put_pr_mapping(state, session_id, url, pr_state, remote, branch, updated_at)
+    })?;
+    Ok(())
+}
+
+fn clear_pr_mapping(context: &ExecutionContext, session_id: &str) -> Result<(), RequestError> {
+    mutate_durable_state(context, false, |state| {
+        remove_pr_mapping(state, session_id);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn begin_reconciliation_state(state: &mut Value, attempt_id: &str, started_at: u64) {
+    let ledger = state
+        .get_mut("reconciliation")
+        .and_then(Value::as_object_mut)
+        .expect("validated durable state has reconciliation object");
+    if ledger.get("status").and_then(Value::as_str) == Some("running") {
+        let previous_attempt = ledger.get("attempt_id").cloned().unwrap_or(Value::Null);
+        ledger.insert("recovered_attempt_id".to_string(), previous_attempt);
+        ledger.insert("recovered_at".to_string(), json!(started_at));
+    }
+    ledger.insert("status".to_string(), json!("running"));
+    ledger.insert("attempt_id".to_string(), json!(attempt_id));
+    ledger.insert("started_at".to_string(), json!(started_at));
+    ledger.insert("finished_at".to_string(), Value::Null);
+    ledger.insert("checked".to_string(), json!(0));
+    ledger.insert("error".to_string(), Value::Null);
+}
+
+fn finish_reconciliation_state(
+    state: &mut Value,
+    attempt_id: &str,
+    status: &str,
+    checked: u64,
+    finished_at: u64,
+    error: Option<&str>,
+) -> Result<(), RequestError> {
+    let ledger = state
+        .get_mut("reconciliation")
+        .and_then(Value::as_object_mut)
+        .expect("validated durable state has reconciliation object");
+    if ledger.get("status").and_then(Value::as_str) != Some("running")
+        || ledger.get("attempt_id").and_then(Value::as_str) != Some(attempt_id)
+    {
+        return Err(RequestError::Message(
+            "reconciliation attempt was superseded".to_string(),
+        ));
+    }
+    ledger.insert("status".to_string(), json!(status));
+    ledger.insert("finished_at".to_string(), json!(finished_at));
+    ledger.insert("checked".to_string(), json!(checked));
+    ledger.insert(
+        "error".to_string(),
+        error.map_or(Value::Null, |error| json!(bounded_error(error))),
+    );
+    Ok(())
+}
+
+fn bounded_error(error: &str) -> String {
+    error.chars().take(MAX_RECONCILIATION_ERROR_CHARS).collect()
+}
+
 fn repository_context(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
     host_call(
@@ -346,6 +763,7 @@ fn repository_context(params: &Value, context: &ExecutionContext) -> Result<Valu
 }
 
 fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
     let repository = repository_context(params, context)?;
     let cwd = context_path(&repository)?;
     let remote = git_output(context, &cwd, ["remote", "get-url", "origin"])?;
@@ -371,9 +789,21 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
             let pr: Value = serde_json::from_str(&raw).map_err(|error| {
                 RequestError::Message(format!("failed to parse gh pr view output: {error}"))
             })?;
-            Ok(json!({ "applicable": true, "remote": remote.trim(), "pr": project_pr_status(&pr) }))
+            let projected = project_pr_status(&pr);
+            let url = strict_string(projected.get("url"), "pull request url")?;
+            let pr_state = strict_string(projected.get("state"), "pull request state")?;
+            persist_pr_mapping(
+                context,
+                session_id,
+                &url,
+                &pr_state,
+                Some(remote.trim()),
+                Some(&branch),
+            )?;
+            Ok(json!({ "applicable": true, "remote": remote.trim(), "pr": projected }))
         }
         Err(RequestError::Message(error)) if is_no_pull_request(&error) => {
+            clear_pr_mapping(context, session_id)?;
             Ok(json!({ "applicable": true, "remote": remote.trim(), "pr": Value::Null }))
         }
         Err(error) => Err(error),
@@ -439,7 +869,17 @@ fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Val
         &context.runner.gh,
         args.iter().map(String::as_str),
     )?;
-    Ok(json!({ "url": url.trim() }))
+    let url = url.trim();
+    let remote = git_output(context, &cwd, ["remote", "get-url", "origin"])?;
+    persist_pr_mapping(
+        context,
+        required_string(params, "session_id")?,
+        url,
+        if draft { "draft" } else { "open" },
+        Some(remote.trim()),
+        Some(&branch),
+    )?;
+    Ok(json!({ "url": url }))
 }
 
 fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
@@ -454,7 +894,20 @@ fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value
     let pr: Value = serde_json::from_str(&raw).map_err(|error| {
         RequestError::Message(format!("failed to parse linked pull request: {error}"))
     })?;
-    Ok(json!({ "pr": project_pr_status(&pr) }))
+    let projected = project_pr_status(&pr);
+    let pr_url = strict_string(projected.get("url"), "pull request url")?;
+    let pr_state = strict_string(projected.get("state"), "pull request state")?;
+    let branch = context_string(&repository, "branch").ok();
+    let remote = git_output(context, &cwd, ["remote", "get-url", "origin"]).ok();
+    persist_pr_mapping(
+        context,
+        required_string(params, "session_id")?,
+        &pr_url,
+        &pr_state,
+        remote.as_deref().map(str::trim),
+        branch.as_deref(),
+    )?;
+    Ok(json!({ "pr": projected }))
 }
 
 fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
@@ -475,10 +928,26 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
             ))
         }
     };
+    let before_merge = gh_output(context, &cwd, ["pr", "view", &branch, "--json", "url"])?;
+    let before_merge: Value = serde_json::from_str(&before_merge).map_err(|error| {
+        RequestError::Message(format!(
+            "failed to parse pull request before merge: {error}"
+        ))
+    })?;
+    let url = strict_string(before_merge.get("url"), "pull request url")?;
+    let remote = git_output(context, &cwd, ["remote", "get-url", "origin"])?;
     gh_output(
         context,
         &cwd,
         ["pr", "merge", &branch, strategy, "--delete-branch"],
+    )?;
+    persist_pr_mapping(
+        context,
+        required_string(params, "session_id")?,
+        &url,
+        "merged",
+        Some(remote.trim()),
+        Some(&branch),
     )?;
     Ok(json!({ "merged": true }))
 }
@@ -532,30 +1001,108 @@ fn failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, Req
 }
 
 fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
-    let sessions = host_call(
-        context,
-        "github-sessions",
-        "host.sessions.list",
-        Value::Null,
-    )?;
+    let _reconciliation = context
+        .durable_state_locks
+        .reconciliation
+        .try_lock()
+        .map_err(|_| RequestError::Message("reconciliation is already running".to_string()))?;
+    context.check_cancelled()?;
+    let started_at = unix_timestamp_ms();
+    let attempt_id = format!(
+        "reconcile-{started_at}-{}",
+        context.callback_sequence.fetch_add(1, Ordering::Relaxed)
+    );
+    mutate_durable_state(context, false, |state| {
+        begin_reconciliation_state(state, &attempt_id, started_at);
+        Ok(())
+    })?;
+
     let mut checked = 0_u64;
-    for session in sessions
-        .get("sessions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        context.check_cancelled()?;
-        if session.get("status").and_then(Value::as_str) != Some("active") {
-            continue;
+    let work = (|| {
+        let sessions = host_call(
+            context,
+            "github-sessions",
+            "host.sessions.list",
+            Value::Null,
+        )?;
+        for session in sessions
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            context.check_cancelled()?;
+            if session.get("status").and_then(Value::as_str) != Some("active") {
+                continue;
+            }
+            let Some(session_id) = session.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            checked += 1;
+            status(&json!({ "session_id": session_id }), context)?;
         }
-        let Some(session_id) = session.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        let _ = status(&json!({ "session_id": session_id }), context);
-        checked += 1;
+        Ok(())
+    })();
+
+    let finished_at = unix_timestamp_ms();
+    match work {
+        Ok(()) if !context.cancelled.load(Ordering::SeqCst) => {
+            match mutate_durable_state(context, false, |state| {
+                finish_reconciliation_state(state, &attempt_id, "idle", checked, finished_at, None)
+            }) {
+                Ok(_) => Ok(json!({ "checked": checked, "attempt_id": attempt_id })),
+                Err(error) => {
+                    let message = match &error {
+                        RequestError::Cancelled => "request cancelled".to_string(),
+                        RequestError::Message(message) => message.clone(),
+                    };
+                    mutate_durable_state(context, true, |state| {
+                        finish_reconciliation_state(
+                            state,
+                            &attempt_id,
+                            "failed",
+                            checked,
+                            finished_at,
+                            Some(&message),
+                        )
+                    })?;
+                    Err(error)
+                }
+            }
+        }
+        Ok(()) => {
+            let error = RequestError::Cancelled;
+            mutate_durable_state(context, true, |state| {
+                finish_reconciliation_state(
+                    state,
+                    &attempt_id,
+                    "failed",
+                    checked,
+                    finished_at,
+                    Some("request cancelled"),
+                )
+            })?;
+            Err(error)
+        }
+        Err(error) => {
+            let message = match &error {
+                RequestError::Cancelled => "request cancelled".to_string(),
+                RequestError::Message(message) => message.clone(),
+            };
+            let terminal = mutate_durable_state(context, true, |state| {
+                finish_reconciliation_state(
+                    state,
+                    &attempt_id,
+                    "failed",
+                    checked,
+                    finished_at,
+                    Some(&message),
+                )
+            });
+            terminal?;
+            Err(error)
+        }
     }
-    Ok(json!({ "checked": checked }))
 }
 
 fn project_pr_status(pr: &Value) -> Value {
@@ -591,34 +1138,7 @@ fn host_call(
     method: &str,
     params: Value,
 ) -> Result<Value, RequestError> {
-    context.check_cancelled()?;
-    let id = format!(
-        "{id_prefix}-{}",
-        context.callback_sequence.fetch_add(1, Ordering::Relaxed)
-    );
-    let (response_tx, response_rx) = mpsc::channel();
-    context
-        .events
-        .send(ControllerEvent::HostCall {
-            id,
-            request_key: context.request_key.clone(),
-            method: method.to_string(),
-            params,
-            response: response_tx,
-        })
-        .map_err(|_| RequestError::Message("request controller stopped".to_string()))?;
-    loop {
-        context.check_cancelled()?;
-        match response_rx.recv_timeout(POLL_INTERVAL) {
-            Ok(response) => return response,
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(RequestError::Message(
-                    "request controller stopped".to_string(),
-                ))
-            }
-        }
-    }
+    host_call_with_cancellation(context, id_prefix, method, params, false)
 }
 
 fn context_path(context: &Value) -> Result<String, RequestError> {
@@ -774,7 +1294,7 @@ fn is_no_pull_request(error: &str) -> bool {
 fn action_run_id(url: &str) -> Option<&str> {
     let marker = "/actions/runs/";
     let rest = url.get(url.find(marker)? + marker.len()..)?;
-    Some(rest.split('/').next()?)
+    rest.split('/').next()
 }
 
 fn success(id: Value, result: Value) -> Value {
@@ -898,6 +1418,102 @@ mod tests {
         thread.join().unwrap().unwrap();
     }
 
+    #[test]
+    fn durable_state_accepts_missing_settings_and_rejects_invalid_or_incompatible_documents() {
+        assert_eq!(
+            durable_state_from_settings(&json!({})).unwrap(),
+            empty_durable_state()
+        );
+        let explicit_v1 = json!({ "github": empty_durable_state() });
+        assert_eq!(
+            durable_state_from_settings(&explicit_v1).unwrap(),
+            empty_durable_state()
+        );
+        for settings in [
+            json!({ "github": Value::Null }),
+            json!({ "github": [] }),
+            json!({ "github": { "version": 2, "pull_requests": {}, "reconciliation": {} } }),
+            json!({ "github": { "version": 1, "pull_requests": { "s1": { "session_id": "other" } }, "reconciliation": {} } }),
+        ] {
+            assert!(
+                durable_state_from_settings(&settings).is_err(),
+                "{settings}"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_state_replacement_preserves_unrelated_plugin_settings() {
+        let settings = json!({ "display": { "compact": true }, "other_plugin_key": "keep" });
+        let replacement = settings_with_durable_state(&settings, empty_durable_state()).unwrap();
+        assert_eq!(replacement["display"]["compact"], true);
+        assert_eq!(replacement["other_plugin_key"], "keep");
+        assert_eq!(
+            durable_state_from_settings(&replacement).unwrap()["version"],
+            STATE_VERSION
+        );
+    }
+
+    #[test]
+    fn pull_request_mapping_updates_and_removes_without_touching_reconciliation() {
+        let mut state = empty_durable_state();
+        begin_reconciliation_state(&mut state, "existing", 10);
+        put_pr_mapping(
+            &mut state,
+            "s1",
+            "https://github.com/o/r/pull/1",
+            "open",
+            Some("https://github.com/o/r.git"),
+            Some("topic"),
+            20,
+        )
+        .unwrap();
+        assert_eq!(state["pull_requests"]["s1"]["branch"], "topic");
+        assert_eq!(state["reconciliation"]["status"], "running");
+        remove_pr_mapping(&mut state, "s1");
+        assert!(state["pull_requests"].get("s1").is_none());
+        assert_eq!(state["reconciliation"]["attempt_id"], "existing");
+    }
+
+    #[test]
+    fn reconciliation_records_interruption_fences_attempts_and_records_terminal_results() {
+        let mut state = empty_durable_state();
+        begin_reconciliation_state(&mut state, "old-attempt", 100);
+        begin_reconciliation_state(&mut state, "new-attempt", 200);
+        assert_eq!(
+            state["reconciliation"]["recovered_attempt_id"],
+            "old-attempt"
+        );
+        assert_eq!(state["reconciliation"]["recovered_at"], 200);
+        assert!(
+            finish_reconciliation_state(&mut state, "old-attempt", "idle", 1, 300, None).is_err()
+        );
+        finish_reconciliation_state(&mut state, "new-attempt", "idle", 2, 300, None).unwrap();
+        assert_eq!(state["reconciliation"]["status"], "idle");
+        assert_eq!(state["reconciliation"]["checked"], 2);
+
+        begin_reconciliation_state(&mut state, "failed-attempt", 400);
+        let long_error = "x".repeat(MAX_RECONCILIATION_ERROR_CHARS + 10);
+        finish_reconciliation_state(
+            &mut state,
+            "failed-attempt",
+            "failed",
+            3,
+            500,
+            Some(&long_error),
+        )
+        .unwrap();
+        assert_eq!(state["reconciliation"]["status"], "failed");
+        assert_eq!(
+            state["reconciliation"]["error"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_RECONCILIATION_ERROR_CHARS
+        );
+    }
+
     fn test_context(runner: CommandRunner) -> ExecutionContext {
         let (events, _events_rx) = mpsc::channel();
         ExecutionContext {
@@ -906,6 +1522,10 @@ mod tests {
             runner,
             request_key: "test-request".to_string(),
             callback_sequence: Arc::new(AtomicU64::new(1)),
+            durable_state_locks: DurableStateLocks {
+                state: Arc::new(Mutex::new(())),
+                reconciliation: Arc::new(Mutex::new(())),
+            },
         }
     }
 
