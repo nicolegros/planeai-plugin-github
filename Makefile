@@ -23,6 +23,7 @@ endif
 
 test:
 	cargo test
+	node --test tests/ui-entry-shortcuts.test.mjs
 
 package:
 	cargo build --release

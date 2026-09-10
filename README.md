@@ -16,6 +16,12 @@ The plugin is intentionally GitHub-specific. PlaneAI core supplies generic plugi
 
 Download and extract the archive for your platform, then select **Preferences → Plugins → Install local package** and choose the extracted directory. Local plugins are trusted native executables; install only packages you trust.
 
+## Panel keyboard shortcuts
+
+`Cmd+Shift+P` on macOS (`Ctrl+Shift+P` elsewhere) opens the GitHub pull-request session panel whenever the plugin is running for the selected session. PlaneAI falls back to its legacy pull-request panel only when this plugin contribution is unavailable.
+
+When the GitHub session panel has focus, use `R` to refresh, `C` to create a pull request, `O` to open the pull request in GitHub, `Shift+R` to mark a draft ready, and `F` to retrieve failed-check logs. `S` cycles the available merge strategies; activate the focused strategy with `Enter` or `Space`. This deliberate two-step merge interaction avoids merging from a bare shortcut.
+
 ## Development
 
 ```bash

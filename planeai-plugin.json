@@ -21,9 +21,10 @@
   "ui_contributions": [
     {
       "id": "pull-request",
-      "label": "GitHub",
+      "label": "Pull Request",
       "placement": "session.panel",
-      "entrypoint": "ui/entry.js"
+      "entrypoint": "ui/entry.js",
+      "shortcut": "Mod+Shift+P"
     },
     {
       "id": "pull-request-titlebar",
