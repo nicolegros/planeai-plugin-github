@@ -24,8 +24,11 @@ When the GitHub session panel has focus, use `R` to refresh, `C` to create a pul
 
 ## Development
 
+The editable browser UI is TypeScript in `ui/entry.ts` and `ui/titlebar.ts`. PlaneAI loads a browser JavaScript Blob, so `make package` compiles those sources into `build/ui/*.js` and stages the emitted JavaScript at the manifest paths `ui/*.js` in the package.
+
 ```bash
-cargo test
+pnpm install --frozen-lockfile
+make test
 make package
 # then test the staged package with a compatible PlaneAI host
 planeai-cli plugin test --package dist/planeai-plugin-github
@@ -33,7 +36,7 @@ planeai-cli plugin test --package dist/planeai-plugin-github
 
 For local development, install **`dist/planeai-plugin-github`** in PlaneAI—not the repository root. The host requires the platform binary at `bin/<platform>/planeai-plugin-github`, which `make package` stages into that `dist` directory.
 
-The sidecar speaks newline-delimited JSON-RPC on stdin/stdout. Stdout is protocol-only; diagnostics go to stderr. The UI is one self-contained browser ESM module because PlaneAI loads an entrypoint source file rather than an asset graph.
+The sidecar speaks newline-delimited JSON-RPC on stdin/stdout. Stdout is protocol-only; diagnostics go to stderr. The package UI remains one self-contained browser ESM JavaScript file because PlaneAI loads an entrypoint source file rather than an asset graph.
 
 ## Durable state
 
@@ -43,4 +46,4 @@ With the manifest-granted `settings` capability, the sidecar persists only its `
 
 ## Release artifacts
 
-The release workflow builds package archives for macOS arm64/x64, Linux x64/arm64, and Windows x64/arm64. Each archive contains `planeai-plugin.json`, `ui/entry.js`, and the binary under the manifest-declared `bin/<platform>/` path.
+The release workflow builds package archives for macOS arm64/x64, Linux x64/arm64, and Windows x64/arm64. Each archive contains `planeai-plugin.json`, generated `ui/entry.js` and `ui/titlebar.js`, and the binary under the manifest-declared `bin/<platform>/` path.

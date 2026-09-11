@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const entry = await readFile(new URL("../ui/entry.js", import.meta.url), "utf8");
+const entry = await readFile(new URL("../../ui/entry.ts", import.meta.url), "utf8");
 
 test("GitHub session panel uses the compact PR layout and capture-phase shortcuts", () => {
   assert.match(entry, /\.header \{ display:flex; align-items:center; gap:var\(--planeai-space-2\); padding:0 0/);

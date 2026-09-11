@@ -1,4 +1,16 @@
-const githubEntrypoint = {
+type GithubPluginContext = {
+  session?: { id?: string; name?: string };
+  host: {
+    call: (method: string, params?: Record<string, unknown>) => Promise<any>;
+    navigation: { openExternal: (url: string) => void };
+  };
+};
+
+type GithubPluginEntrypoint = {
+  mount: (root: HTMLElement, context: GithubPluginContext) => () => void;
+};
+
+const githubEntrypoint: GithubPluginEntrypoint = {
   mount(root, context) {
     const sessionId = context.session?.id;
     let snapshot = null;
@@ -194,7 +206,7 @@ const githubEntrypoint = {
 
     function selectMergeStrategy(strategy) {
       selectedStrategy = strategy;
-      for (const button of content.querySelectorAll("button[data-merge-strategy]")) {
+      for (const button of content.querySelectorAll<HTMLButtonElement>("button[data-merge-strategy]")) {
         button.setAttribute("aria-pressed", String(button.dataset.mergeStrategy === strategy));
       }
       const merge = content.querySelector("button[data-merge-confirm]");
@@ -202,9 +214,9 @@ const githubEntrypoint = {
     }
 
     function cycleMergeStrategy() {
-      const choices = Array.from(content.querySelectorAll("button[data-merge-strategy]")).filter((element) => !element.disabled);
+      const choices = Array.from(content.querySelectorAll<HTMLButtonElement>("button[data-merge-strategy]")).filter((element) => !element.disabled);
       if (!choices.length) return false;
-      const active = choices.indexOf(document.activeElement);
+      const active = choices.findIndex((choice) => choice === document.activeElement);
       const selected = choices.findIndex((element) => element.dataset.mergeStrategy === selectedStrategy);
       const next = choices[(active >= 0 ? active + 1 : selected + 1) % choices.length];
       selectMergeStrategy(next.dataset.mergeStrategy);

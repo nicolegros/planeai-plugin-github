@@ -35,6 +35,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run test:ui
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
       - run: cargo build --release
@@ -45,7 +54,7 @@ jobs:
           ROOT="dist/planeai-plugin-github"
           mkdir -p "$ROOT/bin/${{ matrix.platform }}" "$ROOT/ui"
           cp planeai-plugin.json "$ROOT/"
-          cp ui/entry.js "$ROOT/ui/"
+          cp build/ui/entry.js build/ui/titlebar.js "$ROOT/ui/"
           cp "target/release/${{ matrix.binary }}" "$ROOT/bin/${{ matrix.platform }}/${{ matrix.binary }}"
           chmod +x "$ROOT/bin/${{ matrix.platform }}/${{ matrix.binary }}"
           tar -C dist -czf "planeai-plugin-github-${{ matrix.platform }}.tar.gz" planeai-plugin-github
@@ -56,7 +65,8 @@ jobs:
           $root = 'dist/planeai-plugin-github'
           New-Item -ItemType Directory -Force -Path "$root/bin/${{ matrix.platform }}", "$root/ui" | Out-Null
           Copy-Item planeai-plugin.json "$root/planeai-plugin.json"
-          Copy-Item ui/entry.js "$root/ui/entry.js"
+          Copy-Item build/ui/entry.js "$root/ui/entry.js"
+          Copy-Item build/ui/titlebar.js "$root/ui/titlebar.js"
           Copy-Item "target/release/${{ matrix.binary }}" "$root/bin/${{ matrix.platform }}/${{ matrix.binary }}"
           Compress-Archive -Path "$root/*" -DestinationPath "planeai-plugin-github-${{ matrix.platform }}.zip"
       - uses: actions/upload-artifact@v4

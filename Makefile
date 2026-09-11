@@ -19,21 +19,24 @@ else
   $(error Unsupported local packaging platform; use the release workflow for Windows)
 endif
 
-.PHONY: test package clean
+.PHONY: build-ui test package clean
 
-test:
+build-ui:
+	pnpm exec tsc
+
+test: build-ui
 	cargo test
-	node --test tests/ui-entry-shortcuts.test.mjs
+	node --test build/tests/ui-entry-shortcuts.test.js
 
-package:
+package: build-ui
 	cargo build --release
 	rm -rf $(DIST)
 	mkdir -p $(DIST)/bin/$(PLATFORM) $(DIST)/ui
 	cp planeai-plugin.json $(DIST)/
-	cp ui/entry.js ui/titlebar.js $(DIST)/ui/
+	cp build/ui/entry.js build/ui/titlebar.js $(DIST)/ui/
 	cp target/release/$(PLUGIN) $(DIST)/bin/$(PLATFORM)/$(PLUGIN)
 	chmod +x $(DIST)/bin/$(PLATFORM)/$(PLUGIN)
 	@echo "Staged $(DIST) for $(PLATFORM)"
 
 clean:
-	rm -rf dist
+	rm -rf build dist

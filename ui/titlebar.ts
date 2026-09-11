@@ -1,4 +1,16 @@
-const githubTitlebarEntrypoint = {
+type GithubTitlebarContext = {
+  session?: { id?: string };
+  host: {
+    call: (method: string, params?: Record<string, unknown>) => Promise<any>;
+    navigation: { open: (pluginId: string, contributionId: string) => void };
+  };
+};
+
+type GithubTitlebarEntrypoint = {
+  mount: (root: HTMLElement, context: GithubTitlebarContext) => () => void;
+};
+
+const githubTitlebarEntrypoint: GithubTitlebarEntrypoint = {
   mount(root, context) {
     const sessionId = context.session?.id;
     let disposed = false;
