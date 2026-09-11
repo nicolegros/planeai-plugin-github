@@ -69,6 +69,12 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     root.replaceChildren(page);
 
     const content = page.querySelector("[data-content]");
+    const reportContentHeight = () => {
+      const height = Math.ceil(page.scrollHeight);
+      if (height > 0) window.parent.postMessage({ type: "content-height", height }, "*");
+    };
+    const contentObserver = new MutationObserver(() => requestAnimationFrame(reportContentHeight));
+    contentObserver.observe(content, { childList: true, subtree: true, characterData: true });
     const call = (method, params = {}) => context.host.call(method, { session_id: sessionId, ...params });
     const editableTarget = (target) => target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']");
 
@@ -324,7 +330,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
     window.addEventListener("keydown", handleKeydown, true);
     void load();
-    return () => { disposed = true; window.removeEventListener("keydown", handleKeydown, true); root.replaceChildren(); };
+    return () => { disposed = true; contentObserver.disconnect(); window.removeEventListener("keydown", handleKeydown, true); root.replaceChildren(); };
   },
 };
 

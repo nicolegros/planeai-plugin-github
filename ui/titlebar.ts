@@ -1,7 +1,16 @@
+type GithubPullRequest = {
+  url?: string;
+};
+
+type GithubStatus = {
+  applicable?: boolean;
+  pr?: GithubPullRequest | null;
+};
+
 type GithubTitlebarContext = {
   session?: { id?: string };
   host: {
-    call: (method: string, params?: Record<string, unknown>) => Promise<any>;
+    call: (method: string, params?: Record<string, unknown>) => Promise<GithubStatus>;
     navigation: { open: (pluginId: string, contributionId: string) => void };
   };
 };
@@ -24,14 +33,15 @@ const githubTitlebarEntrypoint: GithubTitlebarEntrypoint = {
       <style>
         html, body, main { height:100%; min-height:0; overflow:hidden; }
         main { display:flex; align-items:stretch; }
-        button { width:100%; min-height:25px; height:25px; border-radius:7px; padding:2px 9px; font:600 11.5px/18px var(--planeai-font-sans); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        button[data-state="ready"] { color:var(--planeai-success); background:color-mix(in srgb, var(--planeai-success) 14%, var(--planeai-surface-raised)); }
-        button[data-state="create"] { color:var(--planeai-text-muted); }
+        button { width:fit-content; max-width:100%; min-height:25px; height:25px; border:1px solid transparent; border-radius:7px; padding:0 9px; font:500 11.5px/18px var(--planeai-font-sans); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--planeai-text-muted); background:transparent; cursor:pointer; }
+        button[data-state="ready"] { color:var(--planeai-success); background:rgba(63,185,80,.18); }
+        button[data-state="create"] { border-color:var(--planeai-border); padding:0 10px; }
+        button[data-state="create"]:hover { background:var(--planeai-surface-raised); }
       </style>`;
     page.append(button);
     root.replaceChildren(page);
 
-    const setButton = (label, state, disabled) => {
+    const setButton = (label: string, state: string, disabled: boolean) => {
       if (disposed) return;
       button.textContent = label;
       button.dataset.state = state;
@@ -48,7 +58,7 @@ const githubTitlebarEntrypoint: GithubTitlebarEntrypoint = {
       setButton("GitHub…", "loading", true);
       try {
         const status = await context.host.call("github.status", { session_id: sessionId });
-        if (!status?.applicable) {
+        if (!status.applicable) {
           setButton("GitHub", "unavailable", true);
           return;
         }
