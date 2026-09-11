@@ -18,7 +18,7 @@ test("injects the release version when Cargo.lock uses CRLF line endings", (t) =
   for (const file of ["package.json", "planeai-plugin.json", "Cargo.toml"]) {
     fs.writeFileSync(path.join(fixture, file), read(file));
   }
-  fs.writeFileSync(path.join(fixture, "Cargo.lock"), read("Cargo.lock").replace(/\n/g, "\r\n"));
+  fs.writeFileSync(path.join(fixture, "Cargo.lock"), read("Cargo.lock").replace(/\r?\n/g, "\r\n"));
 
   execFileSync(process.execPath, [injector, "v1.2.3"], { cwd: fixture });
 
