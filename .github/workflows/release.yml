@@ -2,14 +2,95 @@ name: Release plugin
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
+    branches: [main]
 
 permissions:
   contents: write
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  package:
+  gate:
+    runs-on: ubuntu-24.04
+    if: "!contains(github.event.head_commit.message, 'ci skip') && !contains(github.event.head_commit.message, 'skip ci')"
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pnpm
+        run: npm install -g pnpm@10.28.2
+      - run: pnpm install --frozen-lockfile
+      - run: make test
+      - run: make verify-package
+      - name: Check version
+        id: version
+        run: |
+          echo "--- auto version raw output ---"
+          pnpm exec auto version 2>&1 | tee /tmp/auto-output.txt || true
+          echo "--- end raw output ---"
+          VERSION=$(tail -1 /tmp/auto-output.txt)
+          echo "Parsed VERSION=$VERSION"
+          if [[ "$VERSION" == "patch" || "$VERSION" == "minor" || "$VERSION" == "major" ]]; then
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "No valid version bump detected, skipping release"
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    needs: gate
+    if: needs.gate.outputs.version != ''
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Determine new version
+        id: tag
+        shell: bash
+        run: |
+          BUMP="${{ needs.gate.outputs.version }}"
+          CURRENT=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          CURRENT="${CURRENT#v}"
+          IFS='.' read -r major minor patch <<< "$CURRENT"
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          echo "tag=v${major}.${minor}.${patch}" >> "$GITHUB_OUTPUT"
+      - name: Create tag
+        run: |
+          git tag ${{ steps.tag.outputs.tag }}
+          git push origin ${{ steps.tag.outputs.tag }}
+      - name: Create draft release
+        run: |
+          gh release create ${{ steps.tag.outputs.tag }} \
+            --draft \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: release
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -17,32 +98,31 @@ jobs:
           - os: macos-14
             platform: macos-arm64
             binary: planeai-plugin-github
+            archive: planeai-plugin-github-macos-arm64.tar.gz
           - os: ubuntu-24.04
             platform: linux-x64
             binary: planeai-plugin-github
-          - os: ubuntu-24.04-arm
-            platform: linux-arm64
-            binary: planeai-plugin-github
+            archive: planeai-plugin-github-linux-x64.tar.gz
           - os: windows-2025
             platform: windows-x64
             binary: planeai-plugin-github.exe
-          - os: windows-11-arm
-            platform: windows-arm64
-            binary: planeai-plugin-github.exe
+            archive: planeai-plugin-github-windows-x64.zip
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
         with:
-          version: 10.28.2
-      - uses: actions/setup-node@v4
+          ref: ${{ needs.release.outputs.tag }}
+      - uses: actions/setup-node@v7
         with:
-          node-version: 24
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm run test:ui
+          node-version: 22
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test
+      - name: Install pnpm
+        run: npm install -g pnpm@10.28.2
+      - name: Inject version
+        shell: bash
+        run: node scripts/inject-release-version.mjs ${{ needs.release.outputs.tag }}
+      - run: pnpm install --frozen-lockfile
+      - run: make test
       - run: cargo build --release
       - name: Stage package (Unix)
         if: runner.os != 'Windows'
@@ -54,7 +134,6 @@ jobs:
           cp build/ui/entry.js build/ui/titlebar.js "$ROOT/ui/"
           cp "target/release/${{ matrix.binary }}" "$ROOT/bin/${{ matrix.platform }}/${{ matrix.binary }}"
           chmod +x "$ROOT/bin/${{ matrix.platform }}/${{ matrix.binary }}"
-          tar -C dist -czf "planeai-plugin-github-${{ matrix.platform }}.tar.gz" planeai-plugin-github
       - name: Stage package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -65,18 +144,33 @@ jobs:
           Copy-Item build/ui/entry.js "$root/ui/entry.js"
           Copy-Item build/ui/titlebar.js "$root/ui/titlebar.js"
           Copy-Item "target/release/${{ matrix.binary }}" "$root/bin/${{ matrix.platform }}/${{ matrix.binary }}"
-          Compress-Archive -Path "$root/*" -DestinationPath "planeai-plugin-github-${{ matrix.platform }}.zip"
+      - name: Verify staged package handshake
+        run: node scripts/verify-package-handshake.mjs dist/planeai-plugin-github ${{ matrix.platform }}
+      - name: Archive package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -C dist -czf "${{ matrix.archive }}" planeai-plugin-github
+      - name: Archive package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path 'dist/planeai-plugin-github/*' -DestinationPath '${{ matrix.archive }}'
       - uses: actions/upload-artifact@v4
         with:
           name: planeai-plugin-github-${{ matrix.platform }}
-          path: planeai-plugin-github-${{ matrix.platform }}.*
+          path: ${{ matrix.archive }}
+
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: package
+    needs: [release, build]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with: { path: artifacts }
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*
+      - name: Upload release assets
+        shell: bash
+        run: find artifacts -type f -print0 | xargs -0 gh release upload "${{ needs.release.outputs.tag }}" --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish release
+        run: gh release edit "${{ needs.release.outputs.tag }}" --draft=false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

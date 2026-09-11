@@ -1,6 +1,6 @@
 {
   "name": "planeai-plugin-github",
-  "version": "0.1.1",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,11 @@
     "test:ui": "tsc && node --test build/tests/ui-entry-shortcuts.test.js"
   },
   "devDependencies": {
+    "@auto-it/conventional-commits": "11.3.6",
+    "@auto-it/git-tag": "11.3.6",
+    "@auto-it/upload-assets": "11.3.6",
     "@types/node": "25.9.1",
+    "auto": "11.3.6",
     "typescript": "7.0.2"
   },
   "packageManager": "pnpm@10.28.2"

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pnpm
+        run: npm install -g pnpm@10.28.2
+      - run: pnpm install --frozen-lockfile
+      - run: make test
+      - run: make package
+      - run: node scripts/verify-package-handshake.mjs dist/planeai-plugin-github linux-x64

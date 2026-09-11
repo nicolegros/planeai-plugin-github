@@ -2,16 +2,13 @@
   "schema": "planeai.plugin.v1",
   "id": "github",
   "name": "GitHub",
-  "version": "0.1.1",
+  "version": "0.0.0",
   "host_api_version": "planeai.plugin-host.v1",
   "source_kind": "local",
   "backend_entrypoints": {
     "macos-arm64": "bin/macos-arm64/planeai-plugin-github",
-    "macos-x64": "bin/macos-x64/planeai-plugin-github",
     "linux-x64": "bin/linux-x64/planeai-plugin-github",
-    "linux-arm64": "bin/linux-arm64/planeai-plugin-github",
-    "windows-x64": "bin/windows-x64/planeai-plugin-github.exe",
-    "windows-arm64": "bin/windows-arm64/planeai-plugin-github.exe"
+    "windows-x64": "bin/windows-x64/planeai-plugin-github.exe"
   },
   "capabilities": [
     "settings",

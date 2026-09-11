@@ -7,7 +7,7 @@ ifeq ($(UNAME_S),Darwin)
   ifeq ($(UNAME_M),arm64)
     PLATFORM := macos-arm64
   else
-    PLATFORM := macos-x64
+    $(error macOS x64 is unsupported; use Apple Silicon)
   endif
 else ifeq ($(UNAME_S),Linux)
   ifeq ($(UNAME_M),aarch64)
@@ -19,7 +19,7 @@ else
   $(error Unsupported local packaging platform; use the release workflow for Windows)
 endif
 
-.PHONY: build-ui test package clean
+.PHONY: build-ui test package verify-package clean
 
 build-ui:
 	pnpm exec tsc
@@ -37,6 +37,9 @@ package: build-ui
 	cp target/release/$(PLUGIN) $(DIST)/bin/$(PLATFORM)/$(PLUGIN)
 	chmod +x $(DIST)/bin/$(PLATFORM)/$(PLUGIN)
 	@echo "Staged $(DIST) for $(PLATFORM)"
+
+verify-package: package
+	node scripts/verify-package-handshake.mjs $(DIST) $(PLATFORM)
 
 clean:
 	rm -rf build dist
