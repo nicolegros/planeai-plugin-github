@@ -7,7 +7,7 @@ ifeq ($(UNAME_S),Darwin)
   ifeq ($(UNAME_M),arm64)
     PLATFORM := macos-arm64
   else
-    $(error macOS x64 is unsupported; use Apple Silicon)
+    PLATFORM := unsupported-macos
   endif
 else ifeq ($(UNAME_S),Linux)
   ifeq ($(UNAME_M),aarch64)
@@ -16,7 +16,7 @@ else ifeq ($(UNAME_S),Linux)
     PLATFORM := linux-x64
   endif
 else
-  $(error Unsupported local packaging platform; use the release workflow for Windows)
+  PLATFORM := unsupported
 endif
 
 .PHONY: build-ui test package verify-package clean
@@ -30,6 +30,7 @@ test: build-ui
 	node --test tests/release-version-injection.test.mjs
 
 package: build-ui
+	@case "$(PLATFORM)" in unsupported-macos) echo "macOS x64 is unsupported; use Apple Silicon" >&2; exit 2;; unsupported) echo "Unsupported local packaging platform; use the release workflow for Windows" >&2; exit 2;; esac
 	cargo build --release
 	rm -rf $(DIST)
 	mkdir -p $(DIST)/bin/$(PLATFORM) $(DIST)/ui

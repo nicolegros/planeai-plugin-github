@@ -118,11 +118,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install pnpm
         run: npm install -g pnpm@10.28.2
+      - run: pnpm install --frozen-lockfile
+      - run: make test
       - name: Inject version
         shell: bash
         run: node scripts/inject-release-version.mjs ${{ needs.release.outputs.tag }}
-      - run: pnpm install --frozen-lockfile
-      - run: make test
       - run: cargo build --release
       - name: Stage package (Unix)
         if: runner.os != 'Windows'
