@@ -17,9 +17,6 @@ jobs:
           - os: macos-14
             platform: macos-arm64
             binary: planeai-plugin-github
-          - os: macos-13
-            platform: macos-x64
-            binary: planeai-plugin-github
           - os: ubuntu-24.04
             platform: linux-x64
             binary: planeai-plugin-github
