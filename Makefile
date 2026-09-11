@@ -27,7 +27,7 @@ build-ui:
 test: build-ui
 	cargo test
 	node --test build/tests/ui-entry-shortcuts.test.js
-	node --test tests/release-version-injection.test.mjs
+	node --test tests/*.test.mjs
 
 package: build-ui
 	@case "$(PLATFORM)" in unsupported-macos) echo "macOS x64 is unsupported; use Apple Silicon" >&2; exit 2;; unsupported) echo "Unsupported local packaging platform; use the release workflow for Windows" >&2; exit 2;; esac

@@ -170,7 +170,9 @@ jobs:
         run: find artifacts -type f -print0 | xargs -0 gh release upload "${{ needs.release.outputs.tag }}" --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
       - name: Publish release
         run: gh release edit "${{ needs.release.outputs.tag }}" --draft=false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
