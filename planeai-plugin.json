@@ -2,7 +2,7 @@
   "schema": "planeai.plugin.v1",
   "id": "github",
   "name": "GitHub",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "host_api_version": "planeai.plugin-host.v1",
   "source_kind": "local",
   "backend_entrypoints": {
