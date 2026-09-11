@@ -13,7 +13,8 @@
   "capabilities": [
     "settings",
     "sessions.read",
-    "sessions.repository-context"
+    "sessions.repository-context",
+    "sessions.prompt"
   ],
   "ui_contributions": [
     {

@@ -3,6 +3,7 @@ type GithubPluginContext = {
   host: {
     call: (method: string, params?: Record<string, unknown>) => Promise<any>;
     navigation: { openExternal: (url: string) => void };
+    data: { notify: (message: string, kind?: "success" | "error") => void };
   };
 };
 
@@ -278,7 +279,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
       if (failed) {
         const section = document.createElement("section"); section.className = "section";
-        section.append(button("Send failures to agent", async () => { busy = true; render(); try { const result = await call("github.failureLogs"); render(result.message || "No failure logs returned"); } catch (error) { render(String(error)); } finally { busy = false; } }, { shortcut: "f", className: "failure" }));
+        section.append(button("Send failures to agent", async () => { busy = true; render(); try { await call("github.sendFailureLogs"); context.host.data.notify("CI failures sent to agent", "success"); } catch (error) { busy = false; render(String(error)); return; } busy = false; render(); }, { shortcut: "f", className: "failure" }));
         content.append(section);
       }
       appendFooter([["O", "open"], ["S", "strategy"], ["R", "refresh"]]);

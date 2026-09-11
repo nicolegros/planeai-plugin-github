@@ -26,6 +26,10 @@ test("GitHub session panel uses the compact PR layout and capture-phase shortcut
   assert.match(entry, /const contentObserver = new MutationObserver/);
   assert.match(entry, /contentObserver\.disconnect\(\)/);
   assert.match(entry, /await call\("github\.merge", \{ strategy: selectedStrategy \}\)/);
+  assert.match(entry, /await call\("github\.sendFailureLogs"\)/);
+  assert.match(entry, /context\.host\.data\.notify\("CI failures sent to agent", "success"\)/);
+  assert.doesNotMatch(entry, /call\("github\.failureLogs"\)/);
+  assert.doesNotMatch(entry, /render\(result\.message/);
 });
 
 test("GitHub titlebar keeps the compact ready/create control", () => {

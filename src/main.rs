@@ -334,6 +334,7 @@ fn dispatch(
         "github.merge" => merge_pull_request(&params, context),
         "github.markReady" => mark_ready(&params, context),
         "github.failureLogs" => failure_logs(&params, context),
+        "github.sendFailureLogs" => send_failure_logs(&params, context),
         "github.reconcile" => reconcile(context),
         _ => Err(RequestError::Message("method not found".to_string())),
     }
@@ -1035,7 +1036,7 @@ fn mark_ready(params: &Value, context: &ExecutionContext) -> Result<Value, Reque
     Ok(json!({ "ready": true }))
 }
 
-fn failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<String, RequestError> {
     let repository = repository_context(params, context)?;
     let cwd = context_path(&repository)?;
     let branch = context_string(&repository, "branch")?;
@@ -1070,9 +1071,31 @@ fn failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, Req
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(
-        json!({ "message": format!("CI failed on branch `{branch}`. Here are the failure logs:\n\n{tail}") }),
-    )
+    Ok(format!(
+        "CI failed on branch `{branch}`. Here are the failure logs:\n\n{tail}"
+    ))
+}
+
+fn failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    Ok(json!({ "message": failure_log_message(params, context)? }))
+}
+
+fn send_failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
+    let text = failure_log_message(params, context)?;
+    let response = host_call_with_cancellation(
+        context,
+        "github-send-failure-logs",
+        "host.sessions.prompt",
+        json!({ "session_id": session_id, "text": text }),
+        false,
+    )?;
+    if response.get("delivered").and_then(Value::as_bool) != Some(true) {
+        return Err(RequestError::Message(
+            "host session prompt response did not confirm delivery".to_string(),
+        ));
+    }
+    Ok(json!({ "sent": true }))
 }
 
 fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
@@ -1646,6 +1669,72 @@ mod tests {
             failed["error"].as_str().unwrap().chars().count(),
             MAX_RECONCILIATION_ERROR_CHARS
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sends_failure_logs_to_the_selected_agent_through_host_callback() {
+        let directory = TestDirectory::new();
+        let gh = directory.script(
+            "gh",
+            r#"#!/bin/sh
+if [ "$1" = "pr" ]; then
+  printf '%s\n' '{"statusCheckRollup":[{"conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/123/job/45"}]}'
+else
+  printf 'checkRun cargo fmt --check\nDiff in src-tauri/src/plugins.rs\n'
+fi
+"#,
+        );
+        let (events, events_rx) = mpsc::channel();
+        let context = ExecutionContext {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events,
+            runner: CommandRunner::new(&gh, &gh),
+            request_key: "test-request".to_string(),
+            callback_sequence: Arc::new(AtomicU64::new(1)),
+            durable_state_locks: DurableStateLocks {
+                reconciliation: Arc::new(Mutex::new(())),
+            },
+        };
+        let worker = thread::spawn(move || {
+            send_failure_logs(&json!({ "session_id": "session-123" }), &context)
+        });
+
+        let ControllerEvent::HostCall {
+            method,
+            params,
+            response,
+            ..
+        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected repository-context callback");
+        };
+        assert_eq!(method, "host.sessions.repositoryContext");
+        assert_eq!(params, json!({ "session_id": "session-123" }));
+        response
+            .send(Ok(
+                json!({ "working_tree_path": directory.path(), "branch": "topic" }),
+            ))
+            .unwrap();
+
+        let ControllerEvent::HostCall {
+            method,
+            params,
+            response,
+            ..
+        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected session-prompt callback");
+        };
+        assert_eq!(method, "host.sessions.prompt");
+        assert_eq!(params["session_id"], "session-123");
+        assert!(params["text"]
+            .as_str()
+            .unwrap()
+            .contains("checkRun cargo fmt --check"));
+        response.send(Ok(json!({ "delivered": true }))).unwrap();
+
+        assert_eq!(worker.join().unwrap().unwrap(), json!({ "sent": true }));
     }
 
     #[test]
