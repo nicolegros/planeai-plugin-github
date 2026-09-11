@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PLUGIN_ID: &str = "github";
 const PLUGIN_NAME: &str = "GitHub";
-const PLUGIN_VERSION: &str = "0.1.0";
+const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOST_API_VERSION: &str = "planeai.plugin-host.v1";
 const CANCELLATION_ERROR_CODE: i64 = -32800;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -1646,6 +1646,17 @@ mod tests {
             failed["error"].as_str().unwrap().chars().count(),
             MAX_RECONCILIATION_ERROR_CHARS
         );
+    }
+
+    #[test]
+    fn handshake_identity_matches_manifest() {
+        let manifest: Value = serde_json::from_str(include_str!("../planeai-plugin.json")).unwrap();
+        let response = handshake(&json!({ "host_api_version": HOST_API_VERSION })).unwrap();
+
+        assert_eq!(response["plugin_id"], manifest["id"]);
+        assert_eq!(response["plugin_name"], manifest["name"]);
+        assert_eq!(response["plugin_version"], manifest["version"]);
+        assert_eq!(response["host_api_version"], manifest["host_api_version"]);
     }
 
     fn test_context(runner: CommandRunner) -> ExecutionContext {
