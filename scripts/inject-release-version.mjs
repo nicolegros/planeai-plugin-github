@@ -30,7 +30,7 @@ rewriteJsonVersion("planeai-plugin.json");
 replaceExactlyOnce("Cargo.toml", /^version = "0\.0\.0"$/m, `version = "${version}"`);
 replaceExactlyOnce(
   "Cargo.lock",
-  /(\[\[package\]\]\nname = "planeai-plugin-github"\nversion = )"0\.0\.0"/,
+  /(\[\[package\]\]\r?\nname = "planeai-plugin-github"\r?\nversion = )"0\.0\.0"/,
   `$1"${version}"`,
 );
 

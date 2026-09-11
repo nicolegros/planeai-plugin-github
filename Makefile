@@ -27,6 +27,7 @@ build-ui:
 test: build-ui
 	cargo test
 	node --test build/tests/ui-entry-shortcuts.test.js
+	node --test tests/release-version-injection.test.mjs
 
 package: build-ui
 	cargo build --release
