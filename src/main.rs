@@ -1035,7 +1035,10 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
             let pr: Value = serde_json::from_str(&raw).map_err(|error| {
                 RequestError::Message(format!("failed to parse gh pr view output: {error}"))
             })?;
-            let merge_methods = repository_merge_methods(context, &cwd, remote.trim())?;
+            let merge_methods = optional_merge_methods(
+                repository_merge_methods(context, &cwd, remote.trim()),
+                session_id,
+            );
             let projected = project_pr_status(&pr, merge_methods);
             let url = strict_string(projected.get("url"), "pull request url")?;
             let pr_state = strict_string(projected.get("state"), "pull request state")?;
@@ -1532,6 +1535,19 @@ fn repository_merge_methods(
     Ok(enabled_repository_merge_methods(&repository))
 }
 
+fn optional_merge_methods(
+    result: Result<Vec<String>, RequestError>,
+    session_id: &str,
+) -> Vec<String> {
+    match result {
+        Ok(methods) => methods,
+        Err(error) => {
+            eprintln!("could not load enabled GitHub merge methods for {session_id}: {error:?}");
+            Vec::new()
+        }
+    }
+}
+
 fn project_pr_status(pr: &Value, merge_methods: Vec<String>) -> Value {
     let state = if pr.get("isDraft").and_then(Value::as_bool) == Some(true) {
         "draft".to_string()
@@ -1743,6 +1759,39 @@ fn write_frame(output: &mut impl Write, frame: &Value) -> io::Result<()> {
     output.flush()
 }
 
+fn read_task_transitions(
+    context: &ExecutionContext,
+    allow_cancelled: bool,
+) -> Result<Value, RequestError> {
+    ensure_durable_state(context, allow_cancelled)?;
+    let response = host_call_with_cancellation(
+        context,
+        "github-settings-task-transitions",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "task_transitions"] }),
+        allow_cancelled,
+    )?;
+    let transitions = settings_value_from_host_response(&response)?;
+    validate_task_transitions(&transitions)?;
+    Ok(transitions)
+}
+
+fn github_settings(context: &ExecutionContext) -> Result<Value, RequestError> {
+    Ok(json!({ "task_transitions": read_task_transitions(context, false)? }))
+}
+
+fn update_github_settings(
+    params: &Value,
+    context: &ExecutionContext,
+) -> Result<Value, RequestError> {
+    let transitions = params
+        .get("task_transitions")
+        .ok_or_else(|| RequestError::Message("task_transitions is required".to_string()))?;
+    validate_task_transitions(transitions)?;
+    patch_durable_state(context, false, json!({ "task_transitions": transitions }))?;
+    Ok(json!({ "task_transitions": transitions }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1782,6 +1831,26 @@ mod tests {
         );
         assert_eq!(status["state"], "draft");
         assert_eq!(status["conflicting"], true);
+    }
+
+    #[test]
+    fn unavailable_merge_method_lookup_keeps_pr_status_usable() {
+        let merge_methods = optional_merge_methods(
+            Err(RequestError::Message("GitHub API unavailable".to_string())),
+            "session-1",
+        );
+        let status = project_pr_status(
+            &json!({
+                "url": "https://github.com/o/r/pull/1",
+                "state": "OPEN",
+                "statusCheckRollup": []
+            }),
+            merge_methods,
+        );
+
+        assert_eq!(status["url"], "https://github.com/o/r/pull/1");
+        assert_eq!(status["state"], "open");
+        assert_eq!(status["merge_methods"], json!([]));
     }
 
     #[cfg(unix)]
@@ -2341,37 +2410,4 @@ fi
             thread::sleep(Duration::from_millis(10));
         }
     }
-}
-
-fn read_task_transitions(
-    context: &ExecutionContext,
-    allow_cancelled: bool,
-) -> Result<Value, RequestError> {
-    ensure_durable_state(context, allow_cancelled)?;
-    let response = host_call_with_cancellation(
-        context,
-        "github-settings-task-transitions",
-        "host.settings.get",
-        json!({ "path": [STATE_NAMESPACE, "task_transitions"] }),
-        allow_cancelled,
-    )?;
-    let transitions = settings_value_from_host_response(&response)?;
-    validate_task_transitions(&transitions)?;
-    Ok(transitions)
-}
-
-fn github_settings(context: &ExecutionContext) -> Result<Value, RequestError> {
-    Ok(json!({ "task_transitions": read_task_transitions(context, false)? }))
-}
-
-fn update_github_settings(
-    params: &Value,
-    context: &ExecutionContext,
-) -> Result<Value, RequestError> {
-    let transitions = params
-        .get("task_transitions")
-        .ok_or_else(|| RequestError::Message("task_transitions is required".to_string()))?;
-    validate_task_transitions(transitions)?;
-    patch_durable_state(context, false, json!({ "task_transitions": transitions }))?;
-    Ok(json!({ "task_transitions": transitions }))
 }
