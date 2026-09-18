@@ -42,6 +42,12 @@
       "label": "GitHub",
       "placement": "titlebar",
       "entrypoint": "ui/titlebar.js"
+    },
+    {
+      "id": "pr-check-indicator",
+      "label": "GitHub CI",
+      "placement": "session.indicator",
+      "entrypoint": "ui/indicator.js"
     }
   ]
 }

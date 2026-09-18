@@ -21,6 +21,13 @@ test("manifest uses PlaneAI PluginBackgroundService schema and documented capabi
   assert.ok(manifest.capabilities.includes("tasks.read"));
 });
 
+test("manifest exposes the visual-only cached PR-check indicator", () => {
+  assert.deepEqual(
+    manifest.ui_contributions.find((contribution) => contribution.id === "pr-check-indicator"),
+    { id: "pr-check-indicator", label: "GitHub CI", placement: "session.indicator", entrypoint: "ui/indicator.js" },
+  );
+});
+
 test("manifest exposes the GitHub transition preferences UI", () => {
   assert.deepEqual(
     manifest.ui_contributions.find((contribution) => contribution.id === "github-settings"),

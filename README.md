@@ -28,7 +28,7 @@ The **Preferences → GitHub** page can automatically transition a session's lin
 
 ## Development
 
-The editable browser UI is TypeScript in `ui/entry.ts` and `ui/titlebar.ts`. PlaneAI loads a browser JavaScript Blob, so `make package` compiles those sources into `build/ui/*.js` and stages the emitted JavaScript at the manifest paths `ui/*.js` in the package.
+The editable browser UI is TypeScript in `ui/entry.ts`, `ui/titlebar.ts`, `ui/settings.ts`, and `ui/indicator.ts`. PlaneAI loads a browser JavaScript Blob, so `make package` compiles those sources into `build/ui/*.js` and stages the emitted JavaScript at the manifest paths `ui/*.js` in the package.
 
 ```bash
 pnpm install --frozen-lockfile
@@ -50,4 +50,4 @@ The manifest declares `github.reconcile` as the host-managed background service.
 
 ## Release artifacts
 
-The automated release workflow builds package archives for macOS arm64, Linux x64, and Windows x64. It derives release versions from conventional commits on `main`, creates a draft release, builds the tag on every supported platform, verifies each staged binary handshake against its manifest, and publishes only after every build succeeds. Each archive contains `planeai-plugin.json`, generated `ui/entry.js` and `ui/titlebar.js`, and the binary under the manifest-declared `bin/<platform>/` path.
+The automated release workflow builds package archives for macOS arm64, Linux x64, and Windows x64. It derives release versions from conventional commits on `main`, creates a draft release, builds the tag on every supported platform, verifies each staged binary handshake against its manifest, and publishes only after every build succeeds. Each archive contains `planeai-plugin.json`, generated UI entrypoints including `ui/indicator.js`, and the binary under the manifest-declared `bin/<platform>/` path.

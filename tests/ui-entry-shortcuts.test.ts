@@ -5,6 +5,7 @@ import test from "node:test";
 const entry = await readFile(new URL("../../ui/entry.ts", import.meta.url), "utf8");
 const settings = await readFile(new URL("../../ui/settings.ts", import.meta.url), "utf8");
 const titlebar = await readFile(new URL("../../ui/titlebar.ts", import.meta.url), "utf8");
+const indicator = await readFile(new URL("../../ui/indicator.ts", import.meta.url), "utf8");
 
 test("GitHub session panel uses the compact PR layout and capture-phase shortcuts", () => {
   assert.match(entry, /\.header \{ display:flex; align-items:center; gap:var\(--planeai-space-2\); padding:0 0/);
@@ -31,6 +32,26 @@ test("GitHub session panel uses the compact PR layout and capture-phase shortcut
   assert.match(entry, /context\.host\.data\.notify\("CI failures sent to agent", "success"\)/);
   assert.doesNotMatch(entry, /call\("github\.failureLogs"\)/);
   assert.doesNotMatch(entry, /render\(result\.message/);
+});
+
+test("GitHub check indicator reads only cached summaries and remains visual-only", () => {
+  assert.match(indicator, /context\.host\.call\("github\.indicator"/);
+  assert.doesNotMatch(indicator, /github\.status/);
+  assert.doesNotMatch(indicator, /navigation\./);
+  assert.match(indicator, /role", "img"/);
+  assert.match(indicator, /GitHub CI passing/);
+  assert.match(indicator, /<circle cx="12" cy="12" r="10"\/>/);
+  assert.match(indicator, /m9 12 2 2 4-4/);
+  assert.match(indicator, /m15 9-6 6/);
+  assert.match(indicator, /github-check-dot/);
+  assert.match(indicator, /background:#f59e0b/);
+  assert.match(indicator, /animation:pulse-dot 1\.6s ease-in-out infinite/);
+  assert.match(indicator, /opacity:\.4;transform:scale\(\.78\)/);
+  assert.match(indicator, /type: "content-width", width/);
+  assert.match(indicator, /reportContentWidth\(0\)/);
+  assert.match(indicator, /reportContentWidth\(16\)/);
+  assert.match(indicator, /context\.host\.data\.onChanged/);
+  assert.match(indicator, /prefers-reduced-motion:reduce/);
 });
 
 test("GitHub titlebar keeps the compact ready/create control", () => {
