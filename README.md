@@ -20,11 +20,15 @@ Download and extract the archive for your platform, then select **Preferences �
 
 `Cmd+Shift+P` on macOS (`Ctrl+Shift+P` elsewhere) opens the GitHub pull-request session panel whenever the plugin is running for the selected session. PlaneAI falls back to its legacy pull-request panel only when this plugin contribution is unavailable.
 
-When the GitHub session panel has focus, use `R` to refresh, `C` to create a pull request, `O` to open the pull request in GitHub, `Shift+R` to mark a draft ready, and `F` to retrieve failed-check logs. `S` cycles the available merge strategies; activate the focused strategy with `Enter` or `Space`. This deliberate two-step merge interaction avoids merging from a bare shortcut.
+When the GitHub session panel has focus, use `R` to refresh, `C` to create a pull request, `O` to open the pull request in GitHub, `Shift+R` to mark a draft ready, and `F` to retrieve failed-check logs. The empty state also offers **Link existing pull request**, which validates and attaches a pasted GitHub PR URL. `S` cycles the repository-enabled merge strategies; activate the focused strategy with `Enter` or `Space`. This deliberate two-step merge interaction avoids merging from a bare shortcut.
+
+## Task transitions
+
+The **Preferences → GitHub** page can automatically transition a session's linked PlaneAI task when its PR opens or merges. Each action is optional and can move the task to `todo`, `in_progress`, `in_review`, or `done`. The plugin invokes the host transition only after it has successfully persisted an actual PR state change (`draft`/absent → `open`, or `open` → `merged`); repeated reconciliation of an unchanged PR never repeats the task action.
 
 ## Development
 
-The editable browser UI is TypeScript in `ui/entry.ts` and `ui/titlebar.ts`. PlaneAI loads a browser JavaScript Blob, so `make package` compiles those sources into `build/ui/*.js` and stages the emitted JavaScript at the manifest paths `ui/*.js` in the package.
+The editable browser UI is TypeScript in `ui/entry.ts`, `ui/titlebar.ts`, `ui/settings.ts`, and `ui/indicator.ts`. PlaneAI loads a browser JavaScript Blob, so `make package` compiles those sources into `build/ui/*.js` and stages the emitted JavaScript at the manifest paths `ui/*.js` in the package.
 
 ```bash
 pnpm install --frozen-lockfile
@@ -40,10 +44,10 @@ The sidecar speaks newline-delimited JSON-RPC on stdin/stdout. Stdout is protoco
 
 ## Durable state
 
-With the manifest-granted `settings` capability, the sidecar persists only its `github` namespace through `host.settings.get` and `host.settings.replace`; it read-merges-replaces so unrelated plugin settings survive. The namespace is a strict version-1 JSON document containing `pull_requests` keyed by session ID (session ID, PR URL/state, known remote/branch, and update timestamp) and a reconciliation ledger. Missing state starts as an empty v1 document; malformed or unsupported documents are rejected rather than migrated implicitly. `github.status`, `github.create`, `github.link`, and `github.merge` update mappings only after their GitHub operation succeeds; a successful status lookup with no PR clears that session mapping.
+With the manifest-granted `settings` capability, the sidecar persists only its `github` namespace through `host.settings.get` and `host.settings.patch`; host deep-merge semantics preserve unrelated plugin settings. The namespace is a strict version-2 JSON document containing `pull_requests` keyed by session ID (session ID, PR URL/state, known remote/branch, and update timestamp), a reconciliation ledger, and optional `task_transitions`. Existing valid version-1 documents migrate in place by adding the transition defaults and bumping only their version—existing PR mappings and reconciliation data are retained. Malformed or unsupported documents are rejected rather than migrated implicitly. `github.status`, `github.create`, `github.link`, and `github.merge` update mappings only after their GitHub operation succeeds; a successful status lookup with no PR clears that session mapping.
 
-`github.reconcile` remains an explicit, on-demand RPC. It writes a unique fenced `running` attempt before checking active sessions, records a previously persisted running attempt as recovered, and then writes `idle` counts/timestamps or bounded `failed` error details (including cancellation). It never schedules or enables background reconciliation.
+The manifest declares `github.reconcile` as the host-managed background service. PlaneAI runs it on the configured `github_reconciliation_interval_ms` setting (two minutes by default), while it remains safe to call explicitly. It writes a unique fenced `running` attempt before checking active sessions, records a previously persisted running attempt as recovered, and then writes `idle` counts/timestamps or bounded `failed` error details (including cancellation).
 
 ## Release artifacts
 
-The automated release workflow builds package archives for macOS arm64, Linux x64, and Windows x64. It derives release versions from conventional commits on `main`, creates a draft release, builds the tag on every supported platform, verifies each staged binary handshake against its manifest, and publishes only after every build succeeds. Each archive contains `planeai-plugin.json`, generated `ui/entry.js` and `ui/titlebar.js`, and the binary under the manifest-declared `bin/<platform>/` path.
+The automated release workflow builds package archives for macOS arm64, Linux x64, and Windows x64. It derives release versions from conventional commits on `main`, creates a draft release, builds the tag on every supported platform, verifies each staged binary handshake against its manifest, and publishes only after every build succeeds. Each archive contains `planeai-plugin.json`, generated UI entrypoints including `ui/indicator.js`, and the binary under the manifest-declared `bin/<platform>/` path.

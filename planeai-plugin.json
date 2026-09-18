@@ -14,8 +14,15 @@
     "settings",
     "sessions.read",
     "sessions.repository-context",
-    "sessions.prompt"
+    "sessions.prompt",
+    "tasks.read",
+    "tasks.transition"
   ],
+  "background_service": {
+    "method": "github.reconcile",
+    "interval_setting": "github_reconciliation_interval_ms",
+    "default_interval_ms": 120000
+  },
   "ui_contributions": [
     {
       "id": "pull-request",
@@ -25,10 +32,22 @@
       "shortcut": "Mod+Shift+P"
     },
     {
+      "id": "github-settings",
+      "label": "GitHub",
+      "placement": "preferences",
+      "entrypoint": "ui/settings.js"
+    },
+    {
       "id": "pull-request-titlebar",
       "label": "GitHub",
       "placement": "titlebar",
       "entrypoint": "ui/titlebar.js"
+    },
+    {
+      "id": "pr-check-indicator",
+      "label": "GitHub CI",
+      "placement": "session.indicator",
+      "entrypoint": "ui/indicator.js"
     }
   ]
 }
