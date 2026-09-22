@@ -1165,6 +1165,26 @@ fn repository_context(params: &Value, context: &ExecutionContext) -> Result<Valu
     )
 }
 
+fn linked_pr_mapping(context: &ExecutionContext, session_id: &str) -> Result<Value, RequestError> {
+    let response = host_call(
+        context,
+        "github-linked-pr-mapping",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "pull_requests", session_id] }),
+    )?;
+    settings_value_from_host_response(&response)
+}
+
+fn pr_view_reference(branch: &str, mapping: &Value) -> Result<String, RequestError> {
+    match mapping {
+        Value::Null => Ok(branch.to_string()),
+        Value::Object(mapping) => strict_string(mapping.get("url"), "pull request url"),
+        _ => Err(RequestError::Message(
+            "GitHub durable state pull request must be an object".to_string(),
+        )),
+    }
+}
+
 fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
     let repository = repository_context(params, context)?;
@@ -1176,13 +1196,15 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
         );
     }
     let branch = context_string(&repository, "branch")?;
+    let mapping = linked_pr_mapping(context, session_id)?;
+    let pr_reference = pr_view_reference(&branch, &mapping)?;
     let raw = gh_output(
         context,
         &cwd,
         [
             "pr",
             "view",
-            &branch,
+            &pr_reference,
             "--json",
             "url,state,isDraft,statusCheckRollup,mergeable,mergeStateStatus,reviewDecision",
         ],
@@ -1513,13 +1535,16 @@ fn mark_ready(params: &Value, context: &ExecutionContext) -> Result<Value, Reque
 }
 
 fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<String, RequestError> {
+    let session_id = required_string(params, "session_id")?;
     let repository = repository_context(params, context)?;
     let cwd = context_path(&repository)?;
     let branch = context_string(&repository, "branch")?;
+    let mapping = linked_pr_mapping(context, session_id)?;
+    let pr_reference = pr_view_reference(&branch, &mapping)?;
     let raw = gh_output(
         context,
         &cwd,
-        ["pr", "view", &branch, "--json", "statusCheckRollup"],
+        ["pr", "view", &pr_reference, "--json", "statusCheckRollup"],
     )?;
     let status: Value = serde_json::from_str(&raw)
         .map_err(|error| RequestError::Message(format!("failed to parse CI status: {error}")))?;
@@ -2100,6 +2125,19 @@ mod tests {
         input_tx
             .send(json!({ "jsonrpc": "2.0", "id": callback_id, "result": { "working_tree_path": directory.path(), "branch": "topic" } }).to_string())
             .unwrap();
+        let callback = receive_frame(&output_rx);
+        let callback_id = callback["id"].as_str().unwrap();
+        assert_eq!(callback["method"], "host.settings.get");
+        assert_eq!(
+            callback["params"],
+            json!({ "path": ["github", "pull_requests", "s1"] })
+        );
+        input_tx
+            .send(
+                json!({ "jsonrpc": "2.0", "id": callback_id, "result": { "settings": null } })
+                    .to_string(),
+            )
+            .unwrap();
         wait_for_file(&marker);
         input_tx
             .send(json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": "request-1" } }).to_string())
@@ -2309,15 +2347,20 @@ mod tests {
     #[test]
     fn sends_failure_logs_to_the_currently_focused_agent_through_host_callback() {
         let directory = TestDirectory::new();
+        let gh_args = directory.0.join("gh-args");
         let gh = directory.script(
             "gh",
-            r#"#!/bin/sh
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" >> '{}'
 if [ "$1" = "pr" ]; then
-  printf '%s\n' '{"statusCheckRollup":[{"conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/123/job/45"}]}'
+  printf '%s\n' '{{"statusCheckRollup":[{{"conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/123/job/45"}}]}}'
 else
   printf 'checkRun cargo fmt --check\nDiff in src-tauri/src/plugins.rs\n'
 fi
 "#,
+                gh_args.display()
+            ),
         );
         let (events, events_rx) = mpsc::channel();
         let context = ExecutionContext {
@@ -2365,9 +2408,33 @@ fi
             ..
         } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
         else {
+            panic!("expected linked-pr mapping callback");
+        };
+        assert_eq!(method, "host.settings.get");
+        assert_eq!(
+            params,
+            json!({ "path": ["github", "pull_requests", "pull-request-session"] })
+        );
+        response
+            .send(Ok(json!({
+                "settings": { "url": "https://github.com/o/r/pull/456" }
+            })))
+            .unwrap();
+
+        let ControllerEvent::HostCall {
+            method,
+            params,
+            response,
+            ..
+        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
             panic!("expected session-prompt callback");
         };
         assert_eq!(method, "host.sessions.prompt");
+        assert_eq!(
+            fs::read_to_string(&gh_args).unwrap(),
+            "pr\nview\nhttps://github.com/o/r/pull/456\n--json\nstatusCheckRollup\nrun\nview\n123\n--log-failed\n"
+        );
         assert_eq!(params["session_id"], "currently-focused-agent-session");
         assert!(params["text"]
             .as_str()
@@ -2539,6 +2606,22 @@ fi
             Some(PrStateTransition::Merged)
         );
         assert_eq!(detect_pr_state_transition(Some("merged"), "merged"), None);
+    }
+
+    #[test]
+    fn linked_pr_url_overrides_the_session_branch_for_status_lookup() {
+        assert_eq!(
+            pr_view_reference(
+                "feat/plugin-discovery",
+                &json!({ "url": "https://github.com/owner/repository/pull/42" }),
+            )
+            .unwrap(),
+            "https://github.com/owner/repository/pull/42"
+        );
+        assert_eq!(
+            pr_view_reference("feat/plugin-discovery", &Value::Null).unwrap(),
+            "feat/plugin-discovery"
+        );
     }
 
     #[test]
