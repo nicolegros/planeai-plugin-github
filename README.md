@@ -20,7 +20,7 @@ Download and extract the archive for your platform, then select **Preferences â†
 
 `Cmd+Shift+P` on macOS (`Ctrl+Shift+P` elsewhere) opens the GitHub pull-request session panel whenever the plugin is running for the selected session. PlaneAI falls back to its legacy pull-request panel only when this plugin contribution is unavailable.
 
-When the GitHub session panel has focus, use `R` to refresh, `C` to create a pull request, `O` to open the pull request in GitHub, `Shift+R` to mark a draft ready, and `F` to retrieve failed-check logs and send them to the currently focused agent session. `S` cycles the available merge strategies; activate the focused strategy with `Enter` or `Space`. This deliberate two-step merge interaction avoids merging from a bare shortcut.
+When the GitHub session panel has focus, use `R` to refresh, `C` to create a pull request, `L` to link an existing pull request, `O` to open the pull request in GitHub, `Shift+R` to mark a draft ready, and `F` to retrieve failed-check logs and send them to the currently focused agent session. `S` cycles the available merge strategies; activate the focused strategy with `Enter` or `Space`. This deliberate two-step merge interaction avoids merging from a bare shortcut.
 
 ## Development
 

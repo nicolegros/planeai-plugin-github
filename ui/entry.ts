@@ -20,6 +20,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     let snapshot = null;
     let defaults = null;
     let creating = false;
+    let linking = false;
     let busy = false;
     let disposed = false;
     let selectedStrategy = "squash";
@@ -186,6 +187,32 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       appendFooter([["C", "create"], ["Esc", "close"]]);
     }
 
+    function renderLink() {
+      appendHeader(null);
+      const section = document.createElement("section"); section.className = "section";
+      const title = document.createElement("div"); title.className = "section-title"; title.textContent = "Link existing pull request";
+      const form = document.createElement("form");
+      const urlField = document.createElement("input"); urlField.type = "url"; urlField.required = true; urlField.placeholder = "https://github.com/owner/repo/pull/123";
+      const label = document.createElement("label"); label.textContent = "Pull request URL"; label.append(urlField);
+      const actions = document.createElement("div"); actions.className = "form-actions";
+      const link = async () => {
+        busy = true; render();
+        try {
+          await call("github.link", { url: urlField.value });
+          linking = false;
+          busy = false;
+          await load();
+        } catch (error) {
+          busy = false;
+          render(String(error));
+        }
+      };
+      actions.append(button("Cancel", () => { linking = false; render(); }), button("Link", link, { shortcut: "l" }));
+      form.addEventListener("submit", (event) => { event.preventDefault(); void link(); });
+      form.append(label, actions); section.append(title, form); content.append(section);
+      appendFooter([["L", "link"], ["Esc", "close"]]);
+    }
+
     function appendChecks(checks) {
       if (!checks.length) return;
       const section = document.createElement("section"); section.className = "section";
@@ -294,13 +321,17 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       if (!snapshot) { appendHeader(null); appendStatus("Refreshing GitHub status…", error); return; }
       if (!snapshot.applicable) { renderSetup(snapshot.reason || "GitHub is not applicable to this session."); return; }
       if (creating) { renderCreate(); return; }
+      if (linking) { renderLink(); return; }
       if (snapshot.pr) { renderPr(snapshot.pr); if (error) appendStatus("GitHub status could not be loaded.", error); return; }
       appendHeader(null);
       const section = document.createElement("section"); section.className = "section";
       section.innerHTML = `<div class="section-title">No pull request</div><p class="muted">Create a pull request for the selected session branch.</p>`;
-      section.append(button("Create pull request", async () => { try { defaults = await call("github.defaults"); creating = true; render(); } catch (loadError) { render(String(loadError)); } }, { shortcut: "c" }));
+      section.append(
+        button("Create pull request", async () => { try { defaults = await call("github.defaults"); creating = true; render(); } catch (loadError) { render(String(loadError)); } }, { shortcut: "c" }),
+        button("Link existing pull request", () => { linking = true; render(); }, { shortcut: "l" }),
+      );
       content.append(section);
-      appendFooter([["C", "create"], ["Esc", "close"]]);
+      appendFooter([["C", "create"], ["L", "link"], ["Esc", "close"]]);
     }
 
     function triggerShortcut(shortcut) {
@@ -320,7 +351,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         return;
       }
       const shortcut = event.key === "R" ? "shift+r" : event.key.toLowerCase();
-      if (!new Set(["r", "c", "o", "shift+r", "s", "f"]).has(shortcut) || !triggerShortcut(shortcut)) return;
+      if (!new Set(["r", "c", "l", "o", "shift+r", "s", "f"]).has(shortcut) || !triggerShortcut(shortcut)) return;
       event.preventDefault();
       event.stopPropagation();
     }
