@@ -20,6 +20,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     let snapshot = null;
     let defaults = null;
     let creating = false;
+    let linking = false;
     let busy = false;
     let disposed = false;
     let selectedStrategy = "squash";
@@ -109,6 +110,19 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       return element;
     }
 
+    function installFormKeyboard(form, focusField, cancel) {
+      form.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          cancel();
+        } else if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+          event.preventDefault();
+          form.requestSubmit();
+        }
+      });
+      requestAnimationFrame(() => focusField.focus());
+    }
+
     function appendHeader(pr) {
       const header = document.createElement("div");
       header.className = "header";
@@ -180,10 +194,34 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         }, { shortcut: "c" }),
       );
       form.addEventListener("submit", (event) => { event.preventDefault(); actions.querySelectorAll("button")[1]?.click(); });
+      installFormKeyboard(form, titleField, () => { creating = false; render(); });
       form.append(labelled("Title", titleField), labelled("Body", bodyField), labelled("Base branch", baseField), draftLabel, actions);
       section.append(title, form);
       content.append(section);
       appendFooter([["C", "create"], ["Esc", "close"]]);
+    }
+
+    function renderLink() {
+      appendHeader(null);
+      const section = document.createElement("section");
+      section.className = "section";
+      const title = document.createElement("div"); title.className = "section-title"; title.textContent = "Link existing pull request";
+      const form = document.createElement("form");
+      const urlField = document.createElement("input"); urlField.type = "url"; urlField.required = true; urlField.placeholder = "https://github.com/owner/repo/pull/123";
+      const labelled = document.createElement("label"); labelled.textContent = "Pull request URL"; labelled.append(urlField);
+      const actions = document.createElement("div"); actions.className = "form-actions";
+      actions.append(
+        button("Cancel", () => { linking = false; render(); }),
+        button("Link pull request", async () => {
+          busy = true; render();
+          try { await call("github.link", { url: urlField.value }); linking = false; await load(); context.host.data.notify("Pull request linked", "success"); }
+          catch (error) { render(String(error)); } finally { busy = false; }
+        }, { shortcut: "l" }),
+      );
+      form.addEventListener("submit", (event) => { event.preventDefault(); actions.querySelectorAll("button")[1]?.click(); });
+      installFormKeyboard(form, urlField, () => { linking = false; render(); });
+      form.append(labelled, actions); section.append(title, form); content.append(section);
+      appendFooter([["L", "link"], ["Esc", "close"]]);
     }
 
     function appendChecks(checks) {
@@ -264,11 +302,13 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         content.append(section);
       }
 
-      if (!isMerged(pr) && !isDraft(pr)) {
+      const mergeMethods = Array.isArray(pr.merge_methods) ? pr.merge_methods.filter((method) => ["squash", "merge", "rebase"].includes(method)) : [];
+      if (!mergeMethods.includes(selectedStrategy)) selectedStrategy = mergeMethods[0] || "squash";
+      if (!isMerged(pr) && !isDraft(pr) && mergeMethods.length) {
         const section = document.createElement("section"); section.className = "section";
         const label = document.createElement("div"); label.className = "section-title"; label.textContent = "Merge";
         const strategies = document.createElement("div"); strategies.className = "strategies";
-        for (const strategy of ["squash", "merge", "rebase"]) {
+        for (const strategy of mergeMethods) {
           const choice = button(strategy, () => selectMergeStrategy(strategy), { disabled: !canMerge(pr) });
           choice.dataset.mergeStrategy = strategy;
           choice.setAttribute("aria-pressed", String(strategy === selectedStrategy));
@@ -294,13 +334,19 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       if (!snapshot) { appendHeader(null); appendStatus("Refreshing GitHub status…", error); return; }
       if (!snapshot.applicable) { renderSetup(snapshot.reason || "GitHub is not applicable to this session."); return; }
       if (creating) { renderCreate(); return; }
+      if (linking) { renderLink(); return; }
       if (snapshot.pr) { renderPr(snapshot.pr); if (error) appendStatus("GitHub status could not be loaded.", error); return; }
       appendHeader(null);
       const section = document.createElement("section"); section.className = "section";
       section.innerHTML = `<div class="section-title">No pull request</div><p class="muted">Create a pull request for the selected session branch.</p>`;
-      section.append(button("Create pull request", async () => { try { defaults = await call("github.defaults"); creating = true; render(); } catch (loadError) { render(String(loadError)); } }, { shortcut: "c" }));
+      const actions = document.createElement("div"); actions.className = "form-actions";
+      actions.append(
+        button("Create pull request", async () => { try { defaults = await call("github.defaults"); creating = true; render(); } catch (loadError) { render(String(loadError)); } }, { shortcut: "c" }),
+        button("Link existing pull request", () => { linking = true; render(); }, { shortcut: "l" }),
+      );
+      section.append(actions);
       content.append(section);
-      appendFooter([["C", "create"], ["Esc", "close"]]);
+      appendFooter([["C", "create"], ["L", "link"], ["Esc", "close"]]);
     }
 
     function triggerShortcut(shortcut) {
@@ -320,7 +366,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         return;
       }
       const shortcut = event.key === "R" ? "shift+r" : event.key.toLowerCase();
-      if (!new Set(["r", "c", "o", "shift+r", "s", "f"]).has(shortcut) || !triggerShortcut(shortcut)) return;
+      if (!new Set(["r", "c", "l", "o", "shift+r", "s", "f"]).has(shortcut) || !triggerShortcut(shortcut)) return;
       event.preventDefault();
       event.stopPropagation();
     }

@@ -1,5 +1,6 @@
 type GithubPullRequest = {
   url?: string;
+  state?: string;
 };
 
 type GithubStatus = {
@@ -35,6 +36,7 @@ const githubTitlebarEntrypoint: GithubTitlebarEntrypoint = {
         main { display:flex; align-items:stretch; }
         button { width:fit-content; max-width:100%; min-height:25px; height:25px; border:1px solid transparent; border-radius:7px; padding:0 9px; font:500 11.5px/18px var(--planeai-font-sans); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--planeai-text-muted); background:transparent; cursor:pointer; }
         button[data-state="ready"] { color:var(--planeai-success); background:rgba(63,185,80,.18); }
+        button[data-state="merged"] { color:#bc8cff; background:rgba(188,140,255,.18); }
         button[data-state="create"] { border-color:var(--planeai-border); padding:0 10px; }
         button[data-state="create"]:hover { background:var(--planeai-surface-raised); }
       </style>`;
@@ -67,7 +69,8 @@ const githubTitlebarEntrypoint: GithubTitlebarEntrypoint = {
           return;
         }
         const number = status.pr.url.match(/\/(?:pull|pulls)\/(\d+)(?:$|[?#])/i)?.[1];
-        setButton(number ? `PR #${number}` : "Pull request", "ready", false);
+        const state = status.pr.state === "merged" ? "merged" : "ready";
+        setButton(number ? `PR #${number}` : "Pull request", state, false);
       } catch (_error) {
         setButton("GitHub", "unavailable", true);
       }
