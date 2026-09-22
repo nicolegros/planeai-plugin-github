@@ -3,6 +3,9 @@ type GithubPluginContext = {
   host: {
     call: (method: string, params?: Record<string, unknown>) => Promise<any>;
     navigation: { openExternal: (url: string) => void };
+    recipient: {
+      getFocusedAgentSession: () => Promise<{ id: string } | null>;
+    };
     data: { notify: (message: string, kind?: "success" | "error") => void };
   };
 };
@@ -13,7 +16,7 @@ type GithubPluginEntrypoint = {
 
 const githubEntrypoint: GithubPluginEntrypoint = {
   mount(root, context) {
-    const sessionId = context.session?.id;
+    const sourceSessionId = context.session?.id;
     let snapshot = null;
     let defaults = null;
     let creating = false;
@@ -77,7 +80,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     };
     const contentObserver = new MutationObserver(() => requestAnimationFrame(reportContentHeight));
     contentObserver.observe(content, { childList: true, subtree: true, characterData: true });
-    const call = (method, params = {}) => context.host.call(method, { session_id: sessionId, ...params });
+    const call = (method, params = {}) => context.host.call(method, { session_id: sourceSessionId, ...params });
     const editableTarget = (target) => target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']");
 
     const stateName = (pr) => pr?.state || "open";
@@ -319,7 +322,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
       if (failed) {
         const section = document.createElement("section"); section.className = "section";
-        section.append(button("Send failures to agent", async () => { busy = true; render(); try { await call("github.sendFailureLogs"); context.host.data.notify("CI failures sent to agent", "success"); } catch (error) { busy = false; render(String(error)); return; } busy = false; render(); }, { shortcut: "f", className: "failure" }));
+        section.append(button("Send failures to agent", async () => { busy = true; render(); try { const recipient = await context.host.recipient.getFocusedAgentSession(); if (!recipient) throw new Error("Focus an agent session before sending CI failures."); await call("github.sendFailureLogs", { recipient_session_id: recipient.id }); context.host.data.notify("CI failures sent to agent", "success"); } catch (error) { busy = false; render(String(error)); return; } busy = false; render(); }, { shortcut: "f", className: "failure" }));
         content.append(section);
       }
       appendFooter([["O", "open"], ["S", "strategy"], ["R", "refresh"]]);
@@ -327,7 +330,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
     function render(error = "") {
       content.replaceChildren();
-      if (!sessionId) { renderSetup("Select a PlaneAI session before opening this panel."); return; }
+      if (!sourceSessionId) { renderSetup("Select a PlaneAI session before opening this panel."); return; }
       if (!snapshot) { appendHeader(null); appendStatus("Refreshing GitHub status…", error); return; }
       if (!snapshot.applicable) { renderSetup(snapshot.reason || "GitHub is not applicable to this session."); return; }
       if (creating) { renderCreate(); return; }
@@ -369,7 +372,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     }
 
     async function load() {
-      if (!sessionId) { render(); return; }
+      if (!sourceSessionId) { render(); return; }
       snapshot = null; render();
       try { snapshot = await call("github.status"); render(); }
       catch (error) { snapshot = null; render(String(error)); }

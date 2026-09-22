@@ -8,7 +8,7 @@ The plugin is intentionally GitHub-specific. PlaneAI core supplies generic plugi
 
 ## Requirements
 
-- PlaneAI with `sessions.repository-context` and `session.panel` plugin-platform support.
+- PlaneAI with `planeai.plugin-host.v2`, `sessions.repository-context`, and `session.panel` plugin-platform support.
 - `git` and `gh` on `PATH`.
 - `gh auth login` completed for `github.com`.
 
@@ -20,7 +20,7 @@ Download and extract the archive for your platform, then select **Preferences �
 
 `Cmd+Shift+P` on macOS (`Ctrl+Shift+P` elsewhere) opens the GitHub pull-request session panel whenever the plugin is running for the selected session. PlaneAI falls back to its legacy pull-request panel only when this plugin contribution is unavailable.
 
-When the GitHub session panel has focus, use `R` to refresh, `C` to create a pull request, `O` to open the pull request in GitHub, `Shift+R` to mark a draft ready, and `F` to retrieve failed-check logs. The empty state also offers **Link existing pull request**, which validates and attaches a pasted GitHub PR URL. `S` cycles the repository-enabled merge strategies; activate the focused strategy with `Enter` or `Space`. This deliberate two-step merge interaction avoids merging from a bare shortcut.
+When the GitHub session panel has focus, use `R` to refresh, `C` to create a pull request, `L` to link an existing pull request, `O` to open the pull request in GitHub, `Shift+R` to mark a draft ready, and `F` to retrieve failed-check logs and send them to the currently focused agent session. `S` cycles the available merge strategies; activate the focused strategy with `Enter` or `Space`. This deliberate two-step merge interaction avoids merging from a bare shortcut.
 
 ## Task transitions
 
@@ -44,7 +44,7 @@ The sidecar speaks newline-delimited JSON-RPC on stdin/stdout. Stdout is protoco
 
 ## Durable state
 
-With the manifest-granted `settings` capability, the sidecar persists only its `github` namespace through `host.settings.get` and `host.settings.patch`; host deep-merge semantics preserve unrelated plugin settings. The namespace is a strict version-2 JSON document containing `pull_requests` keyed by session ID (session ID, PR URL/state, known remote/branch, and update timestamp), a reconciliation ledger, and optional `task_transitions`. Existing valid version-1 documents migrate in place by adding the transition defaults and bumping only their version—existing PR mappings and reconciliation data are retained. Malformed or unsupported documents are rejected rather than migrated implicitly. `github.status`, `github.create`, `github.link`, and `github.merge` update mappings only after their GitHub operation succeeds; a successful status lookup with no PR clears that session mapping.
+With the manifest-granted `settings` capability, the sidecar persists only its `github` namespace through `host.settings.get` and `host.settings.patch`; host deep-merge semantics preserve unrelated plugin settings. The namespace is a strict version-2 JSON document containing `pull_requests` keyed by session ID (session ID, PR URL/state, known remote/branch, and update timestamp), a reconciliation ledger, and optional `task_transitions`. Existing valid version-1 documents migrate in place by adding the transition defaults and bumping only their version—existing PR mappings and reconciliation data are retained. Malformed or unsupported documents are rejected rather than migrated implicitly. `github.status`, `github.create`, `github.link`, and `github.merge` update mappings only after their GitHub operation succeeds; a successful status lookup with no PR clears that session mapping. For an explicitly linked PR, status and CI failure-log lookup resolve the saved URL rather than assuming the source session branch owns the PR.
 
 The manifest declares `github.reconcile` as the host-managed background service. PlaneAI runs it on the configured `github_reconciliation_interval_ms` setting (two minutes by default), while it remains safe to call explicitly. It writes a unique fenced `running` attempt before checking active sessions, records a previously persisted running attempt as recovered, and then writes `idle` counts/timestamps or bounded `failed` error details (including cancellation).
 

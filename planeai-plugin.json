@@ -3,7 +3,7 @@
   "id": "github",
   "name": "GitHub",
   "version": "0.0.0",
-  "host_api_version": "planeai.plugin-host.v1",
+  "host_api_version": "planeai.plugin-host.v2",
   "source_kind": "local",
   "backend_entrypoints": {
     "macos-arm64": "bin/macos-arm64/planeai-plugin-github",
