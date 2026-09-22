@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const PLUGIN_ID: &str = "github";
 const PLUGIN_NAME: &str = "GitHub";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
-const HOST_API_VERSION: &str = "planeai.plugin-host.v1";
+const HOST_API_VERSION: &str = "planeai.plugin-host.v2";
 const CANCELLATION_ERROR_CODE: i64 = -32800;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -1081,13 +1081,14 @@ fn failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, Req
 }
 
 fn send_failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let session_id = required_string(params, "session_id")?;
-    let text = failure_log_message(params, context)?;
+    let source_session_id = required_string(params, "session_id")?;
+    let recipient_session_id = required_string(params, "recipient_session_id")?;
+    let text = failure_log_message(&json!({ "session_id": source_session_id }), context)?;
     let response = host_call_with_cancellation(
         context,
         "github-send-failure-logs",
         "host.sessions.prompt",
-        json!({ "session_id": session_id, "text": text }),
+        json!({ "session_id": recipient_session_id, "text": text }),
         false,
     )?;
     if response.get("delivered").and_then(Value::as_bool) != Some(true) {
@@ -1673,7 +1674,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sends_failure_logs_to_the_selected_agent_through_host_callback() {
+    fn sends_failure_logs_to_the_currently_focused_agent_through_host_callback() {
         let directory = TestDirectory::new();
         let gh = directory.script(
             "gh",
@@ -1697,7 +1698,13 @@ fi
             },
         };
         let worker = thread::spawn(move || {
-            send_failure_logs(&json!({ "session_id": "session-123" }), &context)
+            send_failure_logs(
+                &json!({
+                    "session_id": "pull-request-session",
+                    "recipient_session_id": "currently-focused-agent-session",
+                }),
+                &context,
+            )
         });
 
         let ControllerEvent::HostCall {
@@ -1710,7 +1717,7 @@ fi
             panic!("expected repository-context callback");
         };
         assert_eq!(method, "host.sessions.repositoryContext");
-        assert_eq!(params, json!({ "session_id": "session-123" }));
+        assert_eq!(params, json!({ "session_id": "pull-request-session" }));
         response
             .send(Ok(
                 json!({ "working_tree_path": directory.path(), "branch": "topic" }),
@@ -1727,7 +1734,7 @@ fi
             panic!("expected session-prompt callback");
         };
         assert_eq!(method, "host.sessions.prompt");
-        assert_eq!(params["session_id"], "session-123");
+        assert_eq!(params["session_id"], "currently-focused-agent-session");
         assert!(params["text"]
             .as_str()
             .unwrap()
