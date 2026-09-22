@@ -19,8 +19,11 @@ const CANCELLATION_ERROR_CODE: i64 = -32800;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STATE_NAMESPACE: &str = "github";
-const STATE_VERSION: u64 = 1;
+const STATE_VERSION: u64 = 3;
+const LEGACY_STATE_VERSION: u64 = 1;
+const V2_STATE_VERSION: u64 = 2;
 const MAX_RECONCILIATION_ERROR_CHARS: usize = 500;
+const TASK_STATUSES: &[&str] = &["todo", "in_progress", "in_review", "done"];
 
 #[derive(Clone)]
 struct CommandRunner {
@@ -50,6 +53,7 @@ impl CommandRunner {
 #[derive(Clone)]
 struct DurableStateLocks {
     reconciliation: Arc<Mutex<()>>,
+    pull_requests: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -130,6 +134,7 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
     let callback_sequence = Arc::new(AtomicU64::new(1));
     let durable_state_locks = DurableStateLocks {
         reconciliation: Arc::new(Mutex::new(())),
+        pull_requests: Arc::new(Mutex::new(())),
     };
     let mut input_open = true;
     let mut stopping = false;
@@ -328,7 +333,10 @@ fn dispatch(
         "plugin.handshake" => handshake(&params).map_err(Into::into),
         "plugin.shutdown" => Ok(json!({ "stopping": true })),
         "github.status" => status(&params, context),
+        "github.indicator" => indicator(&params, context),
         "github.defaults" => defaults(&params, context),
+        "github.settings" => github_settings(context),
+        "github.settings.update" => update_github_settings(&params, context),
         "github.create" => create_pull_request(&params, context),
         "github.link" => link_pull_request(&params, context),
         "github.merge" => merge_pull_request(&params, context),
@@ -362,6 +370,10 @@ fn unix_timestamp_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn empty_task_transitions() -> Value {
+    json!({ "on_open": Value::Null, "on_merge": Value::Null })
+}
+
 fn empty_durable_state() -> Value {
     json!({
         "version": STATE_VERSION,
@@ -376,6 +388,7 @@ fn empty_durable_state() -> Value {
             "recovered_at": Value::Null,
             "error": Value::Null,
         },
+        "task_transitions": empty_task_transitions(),
     })
 }
 
@@ -424,11 +437,153 @@ fn strict_optional_timestamp(value: Option<&Value>, field: &str) -> Result<(), R
     }
 }
 
+fn validate_check_summary(value: &Value) -> Result<(), RequestError> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Object(summary) => {
+            require_only_keys(summary, &["state", "updated_at"])?;
+            if !matches!(
+                summary.get("state").and_then(Value::as_str),
+                Some("passing" | "failing" | "pending")
+            ) || summary.get("updated_at").and_then(Value::as_u64).is_none()
+            {
+                return Err(RequestError::Message(
+                    "GitHub durable state has an invalid check summary".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(RequestError::Message(
+            "GitHub durable state has an invalid check summary".to_string(),
+        )),
+    }
+}
+
+fn validate_task_transitions(value: &Value) -> Result<(), RequestError> {
+    let transitions = value.as_object().ok_or_else(|| {
+        RequestError::Message("GitHub durable state task_transitions must be an object".to_string())
+    })?;
+    require_only_keys(transitions, &["on_open", "on_merge"])?;
+    for field in ["on_open", "on_merge"] {
+        match transitions.get(field) {
+            Some(Value::Null) => {}
+            Some(Value::String(status)) if TASK_STATUSES.contains(&status.as_str()) => {}
+            _ => {
+                return Err(RequestError::Message(format!(
+                    "GitHub durable state has invalid {field} transition"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_empty_check_summaries(state: &mut Value) -> Result<(), RequestError> {
+    let mappings = state
+        .get_mut("pull_requests")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            RequestError::Message(
+                "GitHub durable state pull_requests must be an object".to_string(),
+            )
+        })?;
+    for mapping in mappings.values_mut() {
+        let mapping = mapping.as_object_mut().ok_or_else(|| {
+            RequestError::Message("GitHub durable state pull request must be an object".to_string())
+        })?;
+        mapping
+            .entry("check_summary".to_string())
+            .or_insert(Value::Null);
+    }
+    Ok(())
+}
+
+fn migrate_v1_durable_state(state: &Value) -> Result<Value, RequestError> {
+    let mut migrated = state.clone();
+    let object = migrated.as_object_mut().ok_or_else(|| {
+        RequestError::Message("GitHub durable state must be a JSON object".to_string())
+    })?;
+    require_only_keys(object, &["version", "pull_requests", "reconciliation"])?;
+    if object.get("version").and_then(Value::as_u64) != Some(LEGACY_STATE_VERSION) {
+        return Err(RequestError::Message(
+            "unsupported GitHub durable state version".to_string(),
+        ));
+    }
+    object.insert("version".to_string(), json!(STATE_VERSION));
+    object.insert("task_transitions".to_string(), empty_task_transitions());
+    add_empty_check_summaries(&mut migrated)?;
+    validate_durable_state(&migrated)?;
+    Ok(migrated)
+}
+
+fn normalize_task_transitions(state: &mut Value) -> Result<(), RequestError> {
+    let object = state.as_object_mut().ok_or_else(|| {
+        RequestError::Message("GitHub durable state must be a JSON object".to_string())
+    })?;
+    let transitions = object
+        .entry("task_transitions".to_string())
+        .or_insert_with(empty_task_transitions)
+        .as_object_mut()
+        .ok_or_else(|| {
+            RequestError::Message(
+                "GitHub durable state task_transitions must be an object".to_string(),
+            )
+        })?;
+    if transitions
+        .keys()
+        .any(|key| !["on_open", "on_merge"].contains(&key.as_str()))
+    {
+        return Err(RequestError::Message(
+            "GitHub durable state contains unknown fields".to_string(),
+        ));
+    }
+    for key in ["on_open", "on_merge"] {
+        transitions.entry(key.to_string()).or_insert(Value::Null);
+    }
+    Ok(())
+}
+
+fn migrate_v2_durable_state(state: &Value) -> Result<Value, RequestError> {
+    let mut migrated = state.clone();
+    let object = migrated.as_object_mut().ok_or_else(|| {
+        RequestError::Message("GitHub durable state must be a JSON object".to_string())
+    })?;
+    if object.keys().any(|key| {
+        ![
+            "version",
+            "pull_requests",
+            "reconciliation",
+            "task_transitions",
+        ]
+        .contains(&key.as_str())
+    }) || object.get("version").and_then(Value::as_u64) != Some(V2_STATE_VERSION)
+        || !object.contains_key("pull_requests")
+        || !object.contains_key("reconciliation")
+    {
+        return Err(RequestError::Message(
+            "unsupported GitHub durable state version".to_string(),
+        ));
+    }
+    object.insert("version".to_string(), json!(STATE_VERSION));
+    normalize_task_transitions(&mut migrated)?;
+    add_empty_check_summaries(&mut migrated)?;
+    validate_durable_state(&migrated)?;
+    Ok(migrated)
+}
+
 fn validate_durable_state(state: &Value) -> Result<(), RequestError> {
     let object = state.as_object().ok_or_else(|| {
         RequestError::Message("GitHub durable state must be a JSON object".to_string())
     })?;
-    require_only_keys(object, &["version", "pull_requests", "reconciliation"])?;
+    require_only_keys(
+        object,
+        &[
+            "version",
+            "pull_requests",
+            "reconciliation",
+            "task_transitions",
+        ],
+    )?;
     if object.get("version").and_then(Value::as_u64) != Some(STATE_VERSION) {
         return Err(RequestError::Message(
             "unsupported GitHub durable state version".to_string(),
@@ -459,6 +614,7 @@ fn validate_durable_state(state: &Value) -> Result<(), RequestError> {
                 "remote",
                 "branch",
                 "updated_at",
+                "check_summary",
             ]
             .contains(&key.as_str())
         }) {
@@ -487,6 +643,11 @@ fn validate_durable_state(state: &Value) -> Result<(), RequestError> {
                 }
             }
         }
+        validate_check_summary(
+            pull_request
+                .get("check_summary")
+                .expect("required check summary was validated"),
+        )?;
     }
     let reconciliation = object
         .get("reconciliation")
@@ -527,6 +688,11 @@ fn validate_durable_state(state: &Value) -> Result<(), RequestError> {
     for field in ["started_at", "finished_at", "recovered_at"] {
         strict_optional_timestamp(reconciliation.get(field), field)?;
     }
+    validate_task_transitions(
+        object
+            .get("task_transitions")
+            .expect("required task transitions were validated"),
+    )?;
     Ok(())
 }
 
@@ -539,8 +705,14 @@ fn durable_state_from_settings(settings: &Value) -> Result<Value, RequestError> 
         .get(STATE_NAMESPACE)
         .cloned()
         .unwrap_or_else(empty_durable_state);
-    validate_durable_state(&state)?;
-    Ok(state)
+    match state.get("version").and_then(Value::as_u64) {
+        Some(LEGACY_STATE_VERSION) => migrate_v1_durable_state(&state),
+        Some(V2_STATE_VERSION) => migrate_v2_durable_state(&state),
+        _ => {
+            validate_durable_state(&state)?;
+            Ok(state)
+        }
+    }
 }
 
 fn settings_value_from_host_response(response: &Value) -> Result<Value, RequestError> {
@@ -619,6 +791,41 @@ fn ensure_durable_state(
             Ok(())
         }
         Value::Number(version) if version.as_u64() == Some(STATE_VERSION) => Ok(()),
+        Value::Number(version)
+            if matches!(
+                version.as_u64(),
+                Some(LEGACY_STATE_VERSION | V2_STATE_VERSION)
+            ) =>
+        {
+            let version = version.as_u64().expect("matched GitHub state version");
+            let response = host_call_with_cancellation(
+                context,
+                &format!("github-settings-v{version}"),
+                "host.settings.get",
+                json!({ "path": [STATE_NAMESPACE] }),
+                allow_cancelled,
+            )?;
+            let state = settings_value_from_host_response(&response)?;
+            let migrated = if version == LEGACY_STATE_VERSION {
+                migrate_v1_durable_state(&state)?
+            } else {
+                migrate_v2_durable_state(&state)?
+            };
+            let response = host_call_with_cancellation(
+                context,
+                &format!("github-settings-migrate-v{version}"),
+                "host.settings.patch",
+                durable_state_patch_request(migrated),
+                allow_cancelled,
+            )?;
+            if response.get("updated").and_then(Value::as_bool) == Some(true) {
+                Ok(())
+            } else {
+                Err(RequestError::Message(
+                    "host settings patch response did not confirm the migration".to_string(),
+                ))
+            }
+        }
         _ => Err(RequestError::Message(
             "unsupported GitHub durable state version".to_string(),
         )),
@@ -672,6 +879,44 @@ fn read_reconciliation_state(
     reconciliation_from_settings_value(settings_value_from_host_response(&response)?)
 }
 
+fn check_summary(checks: &Value, updated_at: u64) -> Value {
+    let checks = checks.as_array().map(Vec::as_slice).unwrap_or_default();
+    if checks.is_empty() {
+        return Value::Null;
+    }
+    let mut has_failure = false;
+    let mut has_pending = false;
+    for check in checks {
+        let value = check
+            .get("conclusion")
+            .or_else(|| check.get("status"))
+            .or_else(|| check.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if [
+            "FAILURE",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "ERROR",
+            "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+            "STALE",
+        ]
+        .contains(&value.as_str())
+        {
+            has_failure = true;
+        } else if !["SUCCESS", "PASSED", "PASS", "NEUTRAL", "SKIPPED"].contains(&value.as_str()) {
+            has_pending = true;
+        }
+    }
+    json!({
+        "state": if has_failure { "failing" } else if has_pending { "pending" } else { "passing" },
+        "updated_at": updated_at,
+    })
+}
+
 fn pr_mapping(
     session_id: &str,
     url: &str,
@@ -679,6 +924,7 @@ fn pr_mapping(
     remote: Option<&str>,
     branch: Option<&str>,
     updated_at: u64,
+    check_summary: Value,
 ) -> Value {
     let mut mapping = serde_json::Map::new();
     mapping.insert("session_id".to_string(), json!(session_id));
@@ -691,7 +937,37 @@ fn pr_mapping(
         mapping.insert("branch".to_string(), json!(branch));
     }
     mapping.insert("updated_at".to_string(), json!(updated_at));
+    mapping.insert("check_summary".to_string(), check_summary);
     Value::Object(mapping)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrStateTransition {
+    Opened,
+    Merged,
+}
+
+fn detect_pr_state_transition(
+    old_state: Option<&str>,
+    new_state: &str,
+) -> Option<PrStateTransition> {
+    match (old_state, new_state) {
+        (None | Some("draft"), "open") => Some(PrStateTransition::Opened),
+        (Some("open"), "merged") => Some(PrStateTransition::Merged),
+        _ => None,
+    }
+}
+
+fn persisted_pr_state(value: &Value) -> Result<Option<String>, RequestError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Object(mapping) => {
+            strict_string(mapping.get("state"), "pull request state").map(Some)
+        }
+        _ => Err(RequestError::Message(
+            "GitHub durable state pull request must be an object".to_string(),
+        )),
+    }
 }
 
 fn persist_pr_mapping(
@@ -701,7 +977,21 @@ fn persist_pr_mapping(
     pr_state: &str,
     remote: Option<&str>,
     branch: Option<&str>,
-) -> Result<(), RequestError> {
+    check_summary: Value,
+) -> Result<Option<PrStateTransition>, RequestError> {
+    let _persistence = context
+        .durable_state_locks
+        .pull_requests
+        .lock()
+        .map_err(|_| RequestError::Message("pull request persistence lock poisoned".to_string()))?;
+    ensure_durable_state(context, false)?;
+    let response = host_call(
+        context,
+        "github-settings-pr-mapping",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "pull_requests", session_id] }),
+    )?;
+    let old_state = persisted_pr_state(&settings_value_from_host_response(&response)?)?;
     let mut pull_requests = serde_json::Map::new();
     pull_requests.insert(
         session_id.to_string(),
@@ -712,16 +1002,23 @@ fn persist_pr_mapping(
             remote,
             branch,
             unix_timestamp_ms(),
+            check_summary,
         ),
     );
     patch_durable_state(
         context,
         false,
         json!({ "pull_requests": Value::Object(pull_requests) }),
-    )
+    )?;
+    Ok(detect_pr_state_transition(old_state.as_deref(), pr_state))
 }
 
 fn clear_pr_mapping(context: &ExecutionContext, session_id: &str) -> Result<(), RequestError> {
+    let _persistence = context
+        .durable_state_locks
+        .pull_requests
+        .lock()
+        .map_err(|_| RequestError::Message("pull request persistence lock poisoned".to_string()))?;
     let mut pull_requests = serde_json::Map::new();
     pull_requests.insert(session_id.to_string(), Value::Null);
     patch_durable_state(
@@ -729,6 +1026,36 @@ fn clear_pr_mapping(context: &ExecutionContext, session_id: &str) -> Result<(), 
         false,
         json!({ "pull_requests": Value::Object(pull_requests) }),
     )
+}
+
+fn apply_task_transition(
+    context: &ExecutionContext,
+    session_id: &str,
+    transition: Option<PrStateTransition>,
+) {
+    let Some(transition) = transition else { return };
+    let field = match transition {
+        PrStateTransition::Opened => "on_open",
+        PrStateTransition::Merged => "on_merge",
+    };
+    let Ok(transitions) = read_task_transitions(context, false) else {
+        return;
+    };
+    let Some(status) = transitions.get(field).and_then(Value::as_str) else {
+        return;
+    };
+    if let Err(error) = host_call(
+        context,
+        "github-transition-linked-task",
+        "host.sessions.transitionLinkedTask",
+        json!({ "session_id": session_id, "status": status }),
+    ) {
+        let message = match error {
+            RequestError::Cancelled => "request cancelled".to_string(),
+            RequestError::Message(message) => message,
+        };
+        eprintln!("{PLUGIN_ID} failed configured {field} task transition: {message}");
+    }
 }
 
 fn begin_reconciliation_patch(
@@ -865,17 +1192,26 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
             let pr: Value = serde_json::from_str(&raw).map_err(|error| {
                 RequestError::Message(format!("failed to parse gh pr view output: {error}"))
             })?;
-            let projected = project_pr_status(&pr);
+            let merge_methods = optional_merge_methods(
+                repository_merge_methods(context, &cwd, remote.trim()),
+                session_id,
+            );
+            let projected = project_pr_status(&pr, merge_methods);
             let url = strict_string(projected.get("url"), "pull request url")?;
             let pr_state = strict_string(projected.get("state"), "pull request state")?;
-            persist_pr_mapping(
+            let transition = persist_pr_mapping(
                 context,
                 session_id,
                 &url,
                 &pr_state,
                 Some(remote.trim()),
                 Some(&branch),
+                check_summary(
+                    projected.get("checks").unwrap_or(&Value::Null),
+                    unix_timestamp_ms(),
+                ),
             )?;
+            apply_task_transition(context, session_id, transition);
             Ok(json!({ "applicable": true, "remote": remote.trim(), "pr": projected }))
         }
         Err(RequestError::Message(error)) if is_no_pull_request(&error) => {
@@ -886,7 +1222,115 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
     }
 }
 
+fn indicator_payload(mapping: Value) -> Result<Value, RequestError> {
+    let check_summary = match mapping {
+        Value::Null => Value::Null,
+        Value::Object(mapping) => {
+            let check_summary = mapping.get("check_summary").cloned().unwrap_or(Value::Null);
+            validate_check_summary(&check_summary)?;
+            check_summary
+        }
+        _ => {
+            return Err(RequestError::Message(
+                "GitHub durable state pull request must be an object".to_string(),
+            ))
+        }
+    };
+    Ok(json!({ "check_summary": check_summary }))
+}
+
+fn indicator(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
+    let response = host_call(
+        context,
+        "github-indicator",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "pull_requests", session_id] }),
+    )?;
+    indicator_payload(settings_value_from_host_response(&response)?)
+}
+
+fn session_name(context: &ExecutionContext, session_id: &str, fallback: &str) -> String {
+    host_call(
+        context,
+        "github-sessions-for-defaults",
+        "host.sessions.list",
+        Value::Null,
+    )
+    .ok()
+    .and_then(|sessions| {
+        sessions
+            .get("sessions")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))?
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string)
+    })
+    .unwrap_or_else(|| fallback.to_string())
+}
+
+fn task_title(context: &ExecutionContext, key: &str) -> Option<String> {
+    host_call(
+        context,
+        "github-task-for-defaults",
+        "host.task.get",
+        json!({ "key": key }),
+    )
+    .ok()
+    .and_then(|response| {
+        response
+            .get("task")?
+            .get("title")?
+            .as_str()
+            .map(str::to_string)
+    })
+    .filter(|title| !title.trim().is_empty())
+}
+
+fn default_pr_title(
+    session_name: &str,
+    branch: &str,
+    task_key: Option<&str>,
+    task_title: Option<String>,
+) -> String {
+    match task_key {
+        Some(key) => {
+            let fallback = session_name
+                .strip_prefix(&format!("{key}: "))
+                .unwrap_or(session_name);
+            let name = task_title
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if fallback.trim().is_empty() {
+                        branch.to_string()
+                    } else {
+                        fallback.to_string()
+                    }
+                });
+            format!("{name} [{key}]")
+        }
+        None if !session_name.trim().is_empty() => session_name.to_string(),
+        None => branch.to_string(),
+    }
+}
+
+fn detect_default_branch(context: &ExecutionContext, cwd: &str) -> String {
+    git_output(
+        context,
+        cwd,
+        ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+    )
+    .ok()
+    .and_then(|value| value.trim().strip_prefix("origin/").map(str::to_string))
+    .filter(|value| !value.is_empty())
+    .unwrap_or_else(|| "main".to_string())
+}
+
 fn defaults(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
     let repository = repository_context(params, context)?;
     let cwd = context_path(&repository)?;
     let branch = context_string(&repository, "branch")?;
@@ -895,7 +1339,18 @@ fn defaults(params: &Value, context: &ExecutionContext) -> Result<Value, Request
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| "main".to_string());
+        .unwrap_or_else(|| detect_default_branch(context, &cwd));
+    let name = session_name(context, session_id, &branch);
+    let task_key = repository
+        .get("linked_task_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.trim().is_empty());
+    let title = default_pr_title(
+        &name,
+        &branch,
+        task_key,
+        task_key.and_then(|key| task_title(context, key)),
+    );
     let diff = git_output(
         context,
         &cwd,
@@ -907,7 +1362,7 @@ fn defaults(params: &Value, context: &ExecutionContext) -> Result<Value, Request
     } else {
         format!("## Changes\n\n```\n{}\n```", diff.trim())
     };
-    Ok(json!({ "title": branch, "body": body, "base_branch": base_branch }))
+    Ok(json!({ "title": title, "body": body, "base_branch": base_branch }))
 }
 
 fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
@@ -947,14 +1402,17 @@ fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Val
     )?;
     let url = url.trim();
     let remote = git_output(context, &cwd, ["remote", "get-url", "origin"])?;
-    persist_pr_mapping(
+    let session_id = required_string(params, "session_id")?;
+    let transition = persist_pr_mapping(
         context,
-        required_string(params, "session_id")?,
+        session_id,
         url,
         if draft { "draft" } else { "open" },
         Some(remote.trim()),
         Some(&branch),
+        Value::Null,
     )?;
+    apply_task_transition(context, session_id, transition);
     Ok(json!({ "url": url }))
 }
 
@@ -970,19 +1428,26 @@ fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value
     let pr: Value = serde_json::from_str(&raw).map_err(|error| {
         RequestError::Message(format!("failed to parse linked pull request: {error}"))
     })?;
-    let projected = project_pr_status(&pr);
-    let pr_url = strict_string(projected.get("url"), "pull request url")?;
-    let pr_state = strict_string(projected.get("state"), "pull request state")?;
     let branch = context_string(&repository, "branch").ok();
     let remote = git_output(context, &cwd, ["remote", "get-url", "origin"]).ok();
-    persist_pr_mapping(
+    let merge_methods = remote
+        .as_deref()
+        .and_then(|remote| repository_merge_methods(context, &cwd, remote.trim()).ok())
+        .unwrap_or_default();
+    let projected = project_pr_status(&pr, merge_methods);
+    let pr_url = strict_string(projected.get("url"), "pull request url")?;
+    let pr_state = strict_string(projected.get("state"), "pull request state")?;
+    let session_id = required_string(params, "session_id")?;
+    let transition = persist_pr_mapping(
         context,
-        required_string(params, "session_id")?,
+        session_id,
         &pr_url,
         &pr_state,
         remote.as_deref().map(str::trim),
         branch.as_deref(),
+        Value::Null,
     )?;
+    apply_task_transition(context, session_id, transition);
     Ok(json!({ "pr": projected }))
 }
 
@@ -990,11 +1455,11 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
     let repository = repository_context(params, context)?;
     let cwd = context_path(&repository)?;
     let branch = context_string(&repository, "branch")?;
-    let strategy = match params
+    let strategy = params
         .get("strategy")
         .and_then(Value::as_str)
-        .unwrap_or("squash")
-    {
+        .unwrap_or("squash");
+    let strategy_flag = match strategy {
         "squash" => "--squash",
         "merge" => "--merge",
         "rebase" => "--rebase",
@@ -1012,19 +1477,30 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
     })?;
     let url = strict_string(before_merge.get("url"), "pull request url")?;
     let remote = git_output(context, &cwd, ["remote", "get-url", "origin"])?;
+    if !repository_merge_methods(context, &cwd, remote.trim())?
+        .iter()
+        .any(|method| method == strategy)
+    {
+        return Err(RequestError::Message(format!(
+            "{strategy} merge is disabled for this GitHub repository"
+        )));
+    }
     gh_output(
         context,
         &cwd,
-        ["pr", "merge", &branch, strategy, "--delete-branch"],
+        ["pr", "merge", &branch, strategy_flag, "--delete-branch"],
     )?;
-    persist_pr_mapping(
+    let session_id = required_string(params, "session_id")?;
+    let transition = persist_pr_mapping(
         context,
-        required_string(params, "session_id")?,
+        session_id,
         &url,
         "merged",
         Some(remote.trim()),
         Some(&branch),
+        Value::Null,
     )?;
+    apply_task_transition(context, session_id, transition);
     Ok(json!({ "merged": true }))
 }
 
@@ -1204,7 +1680,68 @@ fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
     }
 }
 
-fn project_pr_status(pr: &Value) -> Value {
+fn github_repository_slug(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = [
+        "git@github.com:",
+        "git@github.com/",
+        "ssh://git@github.com/",
+        "https://github.com/",
+        "http://github.com/",
+        "git://github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| remote.strip_prefix(prefix))?;
+    let mut segments = path.split('/');
+    let owner = segments.next().filter(|segment| !segment.is_empty())?;
+    let repository = segments.next().filter(|segment| !segment.is_empty())?;
+    (segments.next().is_none()).then(|| format!("{owner}/{repository}"))
+}
+
+fn enabled_repository_merge_methods(repository: &Value) -> Vec<String> {
+    [
+        ("squash", "allow_squash_merge"),
+        ("merge", "allow_merge_commit"),
+        ("rebase", "allow_rebase_merge"),
+    ]
+    .into_iter()
+    .filter_map(|(method, field)| {
+        (repository.get(field).and_then(Value::as_bool) == Some(true)).then_some(method.to_string())
+    })
+    .collect()
+}
+
+fn repository_merge_methods(
+    context: &ExecutionContext,
+    cwd: &str,
+    remote: &str,
+) -> Result<Vec<String>, RequestError> {
+    let slug = github_repository_slug(remote).ok_or_else(|| {
+        RequestError::Message("GitHub remote does not include an owner and repository".to_string())
+    })?;
+    let raw = gh_output(context, cwd, ["api", &format!("repos/{slug}")])?;
+    let repository: Value = serde_json::from_str(&raw).map_err(|error| {
+        RequestError::Message(format!(
+            "failed to parse GitHub repository settings: {error}"
+        ))
+    })?;
+    Ok(enabled_repository_merge_methods(&repository))
+}
+
+fn optional_merge_methods(
+    result: Result<Vec<String>, RequestError>,
+    session_id: &str,
+) -> Vec<String> {
+    match result {
+        Ok(methods) => methods,
+        Err(error) => {
+            eprintln!("could not load enabled GitHub merge methods for {session_id}: {error:?}");
+            Vec::new()
+        }
+    }
+}
+
+fn project_pr_status(pr: &Value, merge_methods: Vec<String>) -> Value {
     let state = if pr.get("isDraft").and_then(Value::as_bool) == Some(true) {
         "draft".to_string()
     } else {
@@ -1227,6 +1764,7 @@ fn project_pr_status(pr: &Value) -> Value {
         "checks": pr.get("statusCheckRollup").cloned().unwrap_or_else(|| json!([])),
         "conflicting": mergeable == "CONFLICTING" || merge_state == "DIRTY",
         "merge_blocked": merge_state == "BLOCKED",
+        "merge_methods": merge_methods,
         "review_decision": pr.get("reviewDecision").cloned().unwrap_or(Value::Null),
     })
 }
@@ -1414,6 +1952,39 @@ fn write_frame(output: &mut impl Write, frame: &Value) -> io::Result<()> {
     output.flush()
 }
 
+fn read_task_transitions(
+    context: &ExecutionContext,
+    allow_cancelled: bool,
+) -> Result<Value, RequestError> {
+    ensure_durable_state(context, allow_cancelled)?;
+    let response = host_call_with_cancellation(
+        context,
+        "github-settings-task-transitions",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "task_transitions"] }),
+        allow_cancelled,
+    )?;
+    let transitions = settings_value_from_host_response(&response)?;
+    validate_task_transitions(&transitions)?;
+    Ok(transitions)
+}
+
+fn github_settings(context: &ExecutionContext) -> Result<Value, RequestError> {
+    Ok(json!({ "task_transitions": read_task_transitions(context, false)? }))
+}
+
+fn update_github_settings(
+    params: &Value,
+    context: &ExecutionContext,
+) -> Result<Value, RequestError> {
+    let transitions = params
+        .get("task_transitions")
+        .ok_or_else(|| RequestError::Message("task_transitions is required".to_string()))?;
+    validate_task_transitions(transitions)?;
+    patch_durable_state(context, false, json!({ "task_transitions": transitions }))?;
+    Ok(json!({ "task_transitions": transitions }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1440,16 +2011,39 @@ mod tests {
 
     #[test]
     fn projects_draft_and_conflict_status() {
-        let status = project_pr_status(&json!({
-            "url": "https://github.com/o/r/pull/1",
-            "state": "OPEN",
-            "isDraft": true,
-            "mergeable": "CONFLICTING",
-            "mergeStateStatus": "DIRTY",
-            "statusCheckRollup": []
-        }));
+        let status = project_pr_status(
+            &json!({
+                "url": "https://github.com/o/r/pull/1",
+                "state": "OPEN",
+                "isDraft": true,
+                "mergeable": "CONFLICTING",
+                "mergeStateStatus": "DIRTY",
+                "statusCheckRollup": []
+            }),
+            vec!["squash".to_string()],
+        );
         assert_eq!(status["state"], "draft");
         assert_eq!(status["conflicting"], true);
+    }
+
+    #[test]
+    fn unavailable_merge_method_lookup_keeps_pr_status_usable() {
+        let merge_methods = optional_merge_methods(
+            Err(RequestError::Message("GitHub API unavailable".to_string())),
+            "session-1",
+        );
+        let status = project_pr_status(
+            &json!({
+                "url": "https://github.com/o/r/pull/1",
+                "state": "OPEN",
+                "statusCheckRollup": []
+            }),
+            merge_methods,
+        );
+
+        assert_eq!(status["url"], "https://github.com/o/r/pull/1");
+        assert_eq!(status["state"], "open");
+        assert_eq!(status["merge_methods"], json!([]));
     }
 
     #[cfg(unix)]
@@ -1529,6 +2123,7 @@ mod tests {
             callback_sequence: Arc::new(AtomicU64::new(1)),
             durable_state_locks: DurableStateLocks {
                 reconciliation: Arc::new(Mutex::new(())),
+                pull_requests: Arc::new(Mutex::new(())),
             },
         };
         let worker = thread::spawn(move || {
@@ -1539,6 +2134,7 @@ mod tests {
                 "open",
                 Some("https://github.com/example/repository.git"),
                 Some("topic"),
+                Value::Null,
             )
         });
 
@@ -1564,6 +2160,39 @@ mod tests {
             ..
         } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
         else {
+            panic!("expected a host settings previous-mapping callback");
+        };
+        assert_eq!(method, "host.settings.get");
+        assert_eq!(
+            params,
+            json!({ "path": ["github", "pull_requests", "session-1"] })
+        );
+        response
+            .send(Ok(json!({ "settings": Value::Null })))
+            .unwrap();
+
+        let ControllerEvent::HostCall {
+            method,
+            params,
+            response,
+            ..
+        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected a host settings version callback before patch");
+        };
+        assert_eq!(method, "host.settings.get");
+        assert_eq!(params, json!({ "path": ["github", "version"] }));
+        response
+            .send(Ok(json!({ "settings": STATE_VERSION })))
+            .unwrap();
+
+        let ControllerEvent::HostCall {
+            method,
+            params,
+            response,
+            ..
+        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
             panic!("expected a host settings patch callback");
         };
         assert_eq!(method, "host.settings.patch");
@@ -1573,7 +2202,10 @@ mod tests {
         );
         assert!(params.to_string().len() < 2048);
         response.send(Ok(json!({ "updated": true }))).unwrap();
-        worker.join().unwrap().unwrap();
+        assert_eq!(
+            worker.join().unwrap().unwrap(),
+            Some(PrStateTransition::Opened)
+        );
     }
     #[test]
     fn durable_state_accepts_missing_settings_and_rejects_invalid_or_incompatible_documents() {
@@ -1608,6 +2240,7 @@ mod tests {
             Some("https://github.com/o/r.git"),
             Some("topic"),
             20,
+            Value::Null,
         );
         let request = durable_state_patch_request(json!({
             "pull_requests": { "s1": mapping }
@@ -1695,6 +2328,7 @@ fi
             callback_sequence: Arc::new(AtomicU64::new(1)),
             durable_state_locks: DurableStateLocks {
                 reconciliation: Arc::new(Mutex::new(())),
+                pull_requests: Arc::new(Mutex::new(())),
             },
         };
         let worker = thread::spawn(move || {
@@ -1745,6 +2379,169 @@ fi
     }
 
     #[test]
+    fn default_pr_title_prefers_linked_task_title_and_has_session_and_branch_fallbacks() {
+        assert_eq!(
+            default_pr_title(
+                "PLA-42: session name",
+                "feature/branch",
+                Some("PLA-42"),
+                Some("Task title".to_string())
+            ),
+            "Task title [PLA-42]"
+        );
+        assert_eq!(
+            default_pr_title(
+                "PLA-42: session name",
+                "feature/branch",
+                Some("PLA-42"),
+                None
+            ),
+            "session name [PLA-42]"
+        );
+        assert_eq!(
+            default_pr_title("", "feature/branch", Some("PLA-42"), None),
+            "feature/branch [PLA-42]"
+        );
+    }
+
+    #[test]
+    fn projects_only_github_enabled_merge_methods() {
+        let methods = enabled_repository_merge_methods(&json!({
+            "allow_squash_merge": true,
+            "allow_merge_commit": false,
+            "allow_rebase_merge": true,
+        }));
+        assert_eq!(methods, vec!["squash", "rebase"]);
+        let status = project_pr_status(
+            &json!({
+                "url": "https://github.com/o/r/pull/1",
+                "state": "OPEN",
+            }),
+            vec!["merge".to_string()],
+        );
+        assert_eq!(status["merge_methods"], json!(["merge"]));
+        assert_eq!(
+            github_repository_slug("git@github.com:o/r.git"),
+            Some("o/r".to_string())
+        );
+    }
+
+    #[test]
+    fn indicator_payload_reads_only_the_cached_check_summary() {
+        assert_eq!(
+            indicator_payload(Value::Null).unwrap(),
+            json!({ "check_summary": Value::Null })
+        );
+        assert_eq!(
+            indicator_payload(json!({ "state": "open" })).unwrap(),
+            json!({ "check_summary": Value::Null })
+        );
+        let cached = json!({ "check_summary": { "state": "passing", "updated_at": 7 } });
+        assert_eq!(
+            indicator_payload(cached).unwrap(),
+            json!({ "check_summary": { "state": "passing", "updated_at": 7 } })
+        );
+        assert!(indicator_payload(
+            json!({ "check_summary": { "state": "unknown", "updated_at": 7 } })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn check_summary_classifies_passing_failing_pending_and_absent_rollups() {
+        assert!(check_summary(&json!([]), 1).is_null());
+        assert_eq!(
+            check_summary(&json!([{ "conclusion": "SUCCESS" }]), 2)["state"],
+            "passing"
+        );
+        assert_eq!(
+            check_summary(&json!([{ "status": "IN_PROGRESS" }]), 3)["state"],
+            "pending"
+        );
+        assert_eq!(
+            check_summary(
+                &json!([{ "state": "SUCCESS" }, { "conclusion": "SKIPPED" }]),
+                4
+            )["state"],
+            "passing"
+        );
+        assert_eq!(
+            check_summary(
+                &json!([{ "state": "FAILURE" }, { "conclusion": "SUCCESS" }]),
+                5
+            )["state"],
+            "failing"
+        );
+        assert_eq!(
+            check_summary(&json!([{ "conclusion": "ACTION_REQUIRED" }]), 6)["state"],
+            "failing"
+        );
+    }
+
+    #[test]
+    fn v2_settings_migration_backfills_empty_task_transitions() {
+        let mut v2 = empty_durable_state();
+        v2["version"] = json!(V2_STATE_VERSION);
+        v2["task_transitions"] = json!({});
+
+        let migrated = migrate_v2_durable_state(&v2).unwrap();
+        assert_eq!(migrated["task_transitions"], empty_task_transitions());
+    }
+
+    #[test]
+    fn v2_settings_migration_preserves_pr_reconciliation_and_task_transition_data() {
+        let mut v2 = empty_durable_state();
+        v2["version"] = json!(V2_STATE_VERSION);
+        v2["pull_requests"]["s1"] = json!({
+            "session_id": "s1", "url": "https://github.com/o/r/pull/1", "state": "open",
+            "remote": "https://github.com/o/r.git", "branch": "topic", "updated_at": 7,
+        });
+        v2["reconciliation"]["error"] = json!("keep");
+        v2["task_transitions"]["on_open"] = json!("in_review");
+        let migrated = migrate_v2_durable_state(&v2).unwrap();
+        assert_eq!(migrated["version"], STATE_VERSION);
+        assert_eq!(
+            migrated["pull_requests"]["s1"]["url"],
+            v2["pull_requests"]["s1"]["url"]
+        );
+        assert!(migrated["pull_requests"]["s1"]["check_summary"].is_null());
+        assert_eq!(migrated["reconciliation"], v2["reconciliation"]);
+        assert_eq!(migrated["task_transitions"], v2["task_transitions"]);
+    }
+
+    #[test]
+    fn v1_settings_migration_preserves_existing_pr_and_reconciliation_data() {
+        let v1 = json!({
+            "version": LEGACY_STATE_VERSION,
+            "pull_requests": { "s1": pr_mapping("s1", "https://github.com/o/r/pull/1", "open", Some("https://github.com/o/r.git"), Some("topic"), 7, Value::Null) },
+            "reconciliation": empty_durable_state()["reconciliation"].clone(),
+        });
+        let migrated = migrate_v1_durable_state(&v1).unwrap();
+        assert_eq!(migrated["version"], STATE_VERSION);
+        assert_eq!(migrated["pull_requests"], v1["pull_requests"]);
+        assert_eq!(migrated["reconciliation"], v1["reconciliation"]);
+        assert_eq!(migrated["task_transitions"], empty_task_transitions());
+    }
+
+    #[test]
+    fn only_real_persisted_pr_state_transitions_are_eligible_for_task_actions() {
+        assert_eq!(
+            detect_pr_state_transition(None, "open"),
+            Some(PrStateTransition::Opened)
+        );
+        assert_eq!(
+            detect_pr_state_transition(Some("draft"), "open"),
+            Some(PrStateTransition::Opened)
+        );
+        assert_eq!(detect_pr_state_transition(Some("open"), "open"), None);
+        assert_eq!(
+            detect_pr_state_transition(Some("open"), "merged"),
+            Some(PrStateTransition::Merged)
+        );
+        assert_eq!(detect_pr_state_transition(Some("merged"), "merged"), None);
+    }
+
+    #[test]
     fn handshake_identity_matches_manifest() {
         let manifest: Value = serde_json::from_str(include_str!("../planeai-plugin.json")).unwrap();
         let response = handshake(&json!({ "host_api_version": HOST_API_VERSION })).unwrap();
@@ -1765,6 +2562,7 @@ fi
             callback_sequence: Arc::new(AtomicU64::new(1)),
             durable_state_locks: DurableStateLocks {
                 reconciliation: Arc::new(Mutex::new(())),
+                pull_requests: Arc::new(Mutex::new(())),
             },
         }
     }

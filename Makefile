@@ -35,7 +35,7 @@ package: build-ui
 	rm -rf $(DIST)
 	mkdir -p $(DIST)/bin/$(PLATFORM) $(DIST)/ui
 	cp planeai-plugin.json $(DIST)/
-	cp build/ui/entry.js build/ui/titlebar.js $(DIST)/ui/
+	cp build/ui/entry.js build/ui/titlebar.js build/ui/settings.js build/ui/indicator.js $(DIST)/ui/
 	cp target/release/$(PLUGIN) $(DIST)/bin/$(PLATFORM)/$(PLUGIN)
 	chmod +x $(DIST)/bin/$(PLATFORM)/$(PLUGIN)
 	@echo "Staged $(DIST) for $(PLATFORM)"
