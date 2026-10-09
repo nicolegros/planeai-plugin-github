@@ -11,3 +11,11 @@ test("release publish commands receive explicit repository context", () => {
   assert.match(uploadStep ?? "", /GH_REPO: \$\{\{ github\.repository \}\}/);
   assert.match(publishStep ?? "", /GH_REPO: \$\{\{ github\.repository \}\}/);
 });
+
+test("release matrix builds every manifest backend platform", () => {
+  const manifest = JSON.parse(fs.readFileSync(new URL("../planeai-plugin.json", import.meta.url), "utf8"));
+  const platforms = [...workflow.matchAll(/^\s+platform: (\S+)\r?$/gm)].map((match) => match[1]).sort();
+
+  assert.deepEqual(platforms, ["linux-x64", "macos-arm64", "macos-x64", "windows-x64"]);
+  assert.deepEqual(platforms, Object.keys(manifest.backend_entrypoints).sort());
+});

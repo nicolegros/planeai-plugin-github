@@ -50,4 +50,4 @@ The manifest declares `github.reconcile` as the host-managed background service.
 
 ## Release artifacts
 
-The automated release workflow builds package archives for macOS arm64, Linux x64, and Windows x64. It derives release versions from conventional commits on `main`, creates a draft release, builds the tag on every supported platform, verifies each staged binary handshake against its manifest, and publishes only after every build succeeds. Each archive contains `planeai-plugin.json`, generated UI entrypoints including `ui/indicator.js`, and the binary under the manifest-declared `bin/<platform>/` path.
+The automated release workflow builds package archives for macOS arm64, macOS x64 (Intel), Linux x64, and Windows x64. It derives release versions from conventional commits on `main`, creates a draft release, builds the tag on every supported platform, verifies each staged binary handshake against its manifest, and publishes only after every build succeeds. Each archive contains `planeai-plugin.json`, generated UI entrypoints including `ui/indicator.js`, and the binary under the manifest-declared `bin/<platform>/` path.
