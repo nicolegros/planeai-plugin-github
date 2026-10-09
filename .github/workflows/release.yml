@@ -99,6 +99,10 @@ jobs:
             platform: macos-arm64
             binary: planeai-plugin-github
             archive: planeai-plugin-github-macos-arm64.tar.gz
+          - os: macos-15-intel
+            platform: macos-x64
+            binary: planeai-plugin-github
+            archive: planeai-plugin-github-macos-x64.tar.gz
           - os: ubuntu-24.04
             platform: linux-x64
             binary: planeai-plugin-github

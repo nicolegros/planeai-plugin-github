@@ -7,6 +7,7 @@
   "source_kind": "local",
   "backend_entrypoints": {
     "macos-arm64": "bin/macos-arm64/planeai-plugin-github",
+    "macos-x64": "bin/macos-x64/planeai-plugin-github",
     "linux-x64": "bin/linux-x64/planeai-plugin-github",
     "windows-x64": "bin/windows-x64/planeai-plugin-github.exe"
   },
