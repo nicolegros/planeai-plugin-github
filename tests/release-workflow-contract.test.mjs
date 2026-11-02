@@ -19,3 +19,16 @@ test("release matrix builds every manifest backend platform", () => {
   assert.deepEqual(platforms, ["linux-x64", "macos-arm64", "macos-x64", "windows-x64"]);
   assert.deepEqual(platforms, Object.keys(manifest.backend_entrypoints).sort());
 });
+
+test("release packages stage every bundled manifest UI entrypoint", () => {
+  const manifest = JSON.parse(fs.readFileSync(new URL("../planeai-plugin.json", import.meta.url), "utf8"));
+  const makefile = fs.readFileSync(new URL("../Makefile", import.meta.url), "utf8");
+  const bundled = makefile.match(/^UI_ENTRYPOINTS := (.+)$/m)?.[1].split(/\s+/).sort();
+  const entrypoints = manifest.ui_contributions.map((contribution) => contribution.entrypoint.match(/^ui\/(.+)\.js$/)?.[1]).sort();
+
+  assert.deepEqual(bundled, entrypoints);
+  for (const name of entrypoints) {
+    assert.match(workflow, new RegExp(`cp [^\\n]*build/package/ui/${name}\\.js`), `${name}.js is staged on Unix`);
+    assert.match(workflow, new RegExp(`Copy-Item build/package/ui/${name}\\.js "\\$root/ui/${name}\\.js"`), `${name}.js is staged on Windows`);
+  }
+});

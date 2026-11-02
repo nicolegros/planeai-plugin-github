@@ -1,11 +1,9 @@
-type GithubPullRequest = {
-  url?: string;
-  state?: string;
-};
+import { PILL_STYLES, renderPill } from "./pill.js";
+import { tooltipLines, type PullRequest } from "./pull-requests.js";
 
 type GithubStatus = {
   applicable?: boolean;
-  pr?: GithubPullRequest | null;
+  pull_requests?: PullRequest[];
 };
 
 type GithubTitlebarContext = {
@@ -27,52 +25,56 @@ const githubTitlebarEntrypoint: GithubTitlebarEntrypoint = {
     const button = document.createElement("button");
     button.type = "button";
     button.disabled = true;
-    button.setAttribute("aria-label", "Open GitHub pull request");
 
     const page = document.createElement("main");
     page.innerHTML = `
       <style>
+        ${PILL_STYLES}
         html, body, main { height:100%; min-height:0; overflow:hidden; }
-        main { display:flex; align-items:stretch; }
-        button { width:fit-content; max-width:100%; min-height:25px; height:25px; border:1px solid transparent; border-radius:7px; padding:0 9px; font:500 11.5px/18px var(--planeai-font-sans); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--planeai-text-muted); background:transparent; cursor:pointer; }
-        button[data-state="ready"] { color:var(--planeai-success); background:rgba(63,185,80,.18); }
-        button[data-state="merged"] { color:#bc8cff; background:rgba(188,140,255,.18); }
+        main { display:flex; align-items:center; }
+        button { display:inline-flex; align-items:center; width:fit-content; max-width:100%; min-height:25px; height:25px; border:1px solid transparent; border-radius:7px; padding:0 9px; font:500 11.5px/18px var(--planeai-font-sans); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--planeai-text-muted); background:transparent; cursor:pointer; }
+        button[data-state="pull-requests"] { padding:0; border:0; background:transparent; }
+        button[data-state="pull-requests"]:hover:not(:disabled) { background:transparent; filter:brightness(1.08); }
+        button[data-state="pull-requests"] .pill { height:25px; gap:5px; padding:0 9px; border-radius:7px; font-size:11.5px; line-height:25px; }
+        button[data-state="pull-requests"] .layers, button[data-state="pull-requests"] svg.ci { width:12px; height:12px; }
         button[data-state="create"] { border-color:var(--planeai-border); padding:0 10px; }
         button[data-state="create"]:hover { background:var(--planeai-surface-raised); }
       </style>`;
     page.append(button);
     root.replaceChildren(page);
 
-    const setButton = (label: string, state: string, disabled: boolean) => {
+    const setButton = (content: string | HTMLElement, state: string, disabled: boolean, label: string) => {
       if (disposed) return;
-      button.textContent = label;
+      button.replaceChildren(content);
       button.dataset.state = state;
       button.disabled = disabled;
+      button.setAttribute("aria-label", label);
+      button.title = label;
     };
     const openPanel = () => context.host.navigation.open("github", "pull-request");
     button.addEventListener("click", openPanel);
 
     async function load() {
       if (!sessionId) {
-        setButton("GitHub", "unavailable", true);
+        setButton("GitHub", "unavailable", true, "GitHub");
         return;
       }
-      setButton("GitHub…", "loading", true);
+      setButton("GitHub…", "loading", true, "Loading GitHub pull requests");
       try {
         const status = await context.host.call("github.status", { session_id: sessionId });
         if (!status.applicable) {
-          setButton("GitHub", "unavailable", true);
+          setButton("GitHub", "unavailable", true, "GitHub is not available for this session");
           return;
         }
-        if (!status.pr?.url) {
-          setButton("＋ Create PR", "create", false);
+        const prs = status.pull_requests ?? [];
+        const pill = renderPill(prs);
+        if (!pill) {
+          setButton("＋ Create PR", "create", false, "Create a pull request");
           return;
         }
-        const number = status.pr.url.match(/\/(?:pull|pulls)\/(\d+)(?:$|[?#])/i)?.[1];
-        const state = status.pr.state === "merged" ? "merged" : "ready";
-        setButton(number ? `PR #${number}` : "Pull request", state, false);
+        setButton(pill, "pull-requests", false, ["Open pull requests", ...tooltipLines(prs).map((line) => line.text)].join("\n"));
       } catch (_error) {
-        setButton("GitHub", "unavailable", true);
+        setButton("GitHub", "unavailable", true, "GitHub status could not be loaded");
       }
     }
 

@@ -10,4 +10,5 @@ name = "planeai-plugin-github"
 path = "src/main.rs"
 
 [dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
