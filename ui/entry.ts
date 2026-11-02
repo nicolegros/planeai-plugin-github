@@ -62,7 +62,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         .checks-heading { display:flex; align-items:center; margin-bottom:var(--planeai-space-2); }
         .refresh { min-height:0; margin-left:auto; padding:0; border:0; border-radius:0; background:transparent; color:var(--planeai-text-subtle); font-size:14px; line-height:14px; }
         .refresh:hover:not(:disabled) { background:transparent; color:var(--planeai-text-muted); }
-        .passed { margin-left:var(--planeai-space-2); color:var(--planeai-success); font:10px var(--planeai-font-mono); }
+        .passed { margin-left:var(--planeai-space-2); color:var(--tone); font:10px var(--planeai-font-mono); }
         .pr-list { display:grid; margin:0 calc(-1 * var(--planeai-space-2)); }
         .pr-row { display:grid; grid-template-columns:8px 42px minmax(0, 1fr) 12px 52px 92px; align-items:center; column-gap:var(--planeai-space-2); min-height:32px; padding:4px var(--planeai-space-2); border-radius:6px; }
         .pr-row:hover { background:var(--planeai-accent-subtle); }
@@ -345,8 +345,13 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const section = document.createElement("section"); section.className = "section";
       const heading = document.createElement("div"); heading.className = "checks-heading";
       const label = document.createElement("span"); label.className = "section-title"; label.textContent = `Checks · #${pr.number}`;
-      const passed = document.createElement("span"); passed.className = "passed"; passed.textContent = `${checks.filter((check) => classifyCheck(check) === "pass").length} passed`;
-      heading.append(label, passed);
+      heading.append(label);
+      for (const [result, word, tone] of [["fail", "failed", "danger"], ["pending", "pending", "warning"], ["pass", "passed", "success"]]) {
+        const count = checks.filter((check) => classifyCheck(check) === result).length;
+        if (!count) continue;
+        const summary = document.createElement("span"); summary.className = "passed"; summary.dataset.tone = tone; summary.textContent = `${count} ${word}`;
+        heading.append(summary);
+      }
       const list = document.createElement("div"); list.className = "check-list";
       for (const [index, check] of checks.entries()) {
         const result = classifyCheck(check);
@@ -443,7 +448,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     function renderPullRequests(error = "") {
       const prs = pullRequests();
       const current = currentPullRequest(prs);
-      appendHeader(current);
+      // The header names the PR that the checks and merge below act on.
+      appendHeader(prs.find((pr) => pr.url === snapshot.pr?.url) ?? current);
       appendPullRequests(prs, current);
       if (snapshot.pr) appendDetail(snapshot.pr);
       appendActions();
