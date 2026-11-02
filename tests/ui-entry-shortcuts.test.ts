@@ -21,7 +21,7 @@ test("GitHub session panel uses the compact PR layout and capture-phase shortcut
   assert.doesNotMatch(entry, /page\.addEventListener\("keydown", handleKeydown\)/);
   assert.doesNotMatch(entry, /document\.addEventListener\("keydown", handleKeydown\)/);
   assert.match(entry, /editableTarget\(event\.target\)/);
-  assert.match(entry, /\["r", "c", "l", "o", "shift\+r", "s", "f"\]/);
+  assert.match(entry, /\["r", "c", "l", "o", "u", "shift\+r", "s", "f"\]/);
   assert.match(entry, /choice\.dataset\.mergeStrategy = strategy/);
   assert.match(entry, /merge\.dataset\.mergeConfirm = ""/);
   assert.match(entry, /const reportContentHeight = \(\) => \{/);
@@ -32,7 +32,7 @@ test("GitHub session panel uses the compact PR layout and capture-phase shortcut
   assert.match(entry, /function renderLink\(\)/);
   assert.match(entry, /Link pull request/);
   assert.match(entry, /await call\("github\.link", \{ url: urlField\.value \}\)/);
-  assert.match(entry, /\["r", "c", "l", "o", "shift\+r", "s", "f"\]/);
+  assert.match(entry, /\["r", "c", "l", "o", "u", "shift\+r", "s", "f"\]/);
   assert.match(entry, /const recipient = await context\.host\.recipient\.getFocusedAgentSession\(\)/);
   assert.doesNotMatch(entry, /github\.recipients/);
   assert.doesNotMatch(entry, /Recipient session/);
@@ -73,7 +73,7 @@ test("GitHub UI links existing PRs and configures automatic task transitions", (
   assert.match(entry, /button\("Link pull request", \(\) => \{ linking = true; render\(\); \}, \{ shortcut: "l" \}\)/, "L opens the link flow");
   assert.match(entry, /appendFooter\(\[\["L", "link"\], \["Esc", "close"\]\]\)/, "the link form documents its keyboard flow");
   assert.match(entry, /if \(!branchHasPullRequest\(\)\) \{\s*actions\.append\(button\("Create PR"[\s\S]*?\{ shortcut: "c" \}\)\);\s*\}\s*actions\.append\(button\("Link pull request"/, "Create PR shows only while the branch has no pull request, beside Link");
-  assert.match(entry, /\["r", "c", "l", "o", "shift\+r", "s", "f"\]/, "the global panel shortcut handler recognizes L");
+  assert.match(entry, /\["r", "c", "l", "o", "u", "shift\+r", "s", "f"\]/, "the global panel shortcut handler recognizes L");
   assert.match(entry, /function installFormKeyboard\(form, focusField, cancel\)/, "forms share keyboard behavior");
   assert.match(entry, /requestAnimationFrame\(\(\) => focusField\.focus\(\)\)/, "both forms autofocus their supplied first field");
   assert.match(entry, /event\.key === "Escape"/, "Escape cancels a form");
@@ -90,7 +90,12 @@ test("GitHub UI links existing PRs and configures automatic task transitions", (
 });
 
 test("GitHub session panel lists every pull request with per-row actions", () => {
-  assert.match(entry, /for \(const pr of displayOrder\(prs\)\) list\.append\(pullRequestRow\(pr, current\)\)/);
+  assert.match(entry, /for \(const pr of displayOrder\(prs\)\) list\.append\(pullRequestRow\(pr, current, selected\)\)/);
+  assert.match(entry, /list\.setAttribute\("role", "listbox"\)/, "the rows are one listbox");
+  assert.match(entry, /row\.setAttribute\("aria-selected", String\(isSelected\)\)/);
+  assert.match(entry, /const SELECTION_KEYS: Record<string, 1 \| -1> = \{ ArrowDown: 1, j: 1, ArrowUp: -1, k: -1 \}/, "arrows and j/k move the highlight");
+  assert.match(entry, /if \(isSelected\) remove\.dataset\.shortcut = "u"/, "U unlinks or dismisses the highlighted row");
+  assert.match(entry, /const detail = detailOf\(selected\);/, "the details follow the highlight");
   assert.match(entry, /const label = pr\.source === "stack" \? "Dismiss" : "Unlink";/, "stack rows dismiss, other rows unlink");
   assert.match(entry, /if \(pr\.source !== "branch"\)/, "branch rows cannot be unlinked");
   assert.match(entry, /call\("github\.unlink", \{ url: pr\.url \}\)/);
@@ -102,5 +107,6 @@ test("GitHub session panel lists every pull request with per-row actions", () =>
   assert.match(entry, /const hints = \[\["R", "refresh"\], \["L", "link"\]\];/);
   assert.match(entry, /hints\.splice\(1, 0, \["C", "create"\]\)/);
   assert.match(entry, /hints\.unshift\(\["S", "strategy"\]\)/);
-  assert.match(entry, /if \(current\) hints\.unshift\(\["O", "open"\]\)/, "O is hinted only when there is a pull request to open");
+  assert.match(entry, /if \(selected\) hints\.unshift\(\["O", "open"\]\)/, "O is hinted only when there is a pull request to open");
+  assert.match(entry, /if \(prs\.length > 1\) hints\.unshift\(\["↑↓", "select"\]\)/);
 });

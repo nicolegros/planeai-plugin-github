@@ -4,6 +4,8 @@ import {
   currentPullRequest,
   displayOrder,
   foreignRepository,
+  moveSelection,
+  resolveSelection,
   stackOrder,
   summarize,
   tooltipLines,
@@ -94,4 +96,24 @@ test("the repository is named only when it differs from the session's", () => {
   assert.equal(foreignRepository(pr(1, { repository: "x/y" }), "o/r"), "x/y");
   assert.equal(foreignRepository(pr(1, { repository: "o/other" }), "o/r"), "other", "a shared owner is left out");
   assert.equal(foreignRepository(pr(1), null), null);
+});
+
+test("the panel highlights the session's own pull request first, else the current one", () => {
+  const prs = [pr(1), pr(2), pr(3)];
+  assert.equal(resolveSelection(prs, null, prs[0].url)?.number, 1, "the session's own pull request wins");
+  assert.equal(resolveSelection(prs, null, null)?.number, currentPullRequest(prs)?.number);
+  assert.equal(resolveSelection(prs, prs[2].url, prs[0].url)?.number, 3, "a highlight survives a refresh");
+  assert.equal(resolveSelection(prs, "https://github.com/o/r/pull/99", prs[0].url)?.number, 1, "a vanished highlight falls back");
+  assert.equal(resolveSelection([], null, null), null);
+});
+
+test("moving the highlight follows display order and stops at the ends", () => {
+  const prs = [pr(1), pr(2, { state: "merged" }), pr(3)];
+  const order = displayOrder(prs).map((item) => item.number);
+  const from = (number: number, delta: 1 | -1) => moveSelection(prs, `https://github.com/o/r/pull/${number}`, delta)?.number;
+  assert.equal(from(order[0], 1), order[1]);
+  assert.equal(from(order[1], -1), order[0]);
+  assert.equal(from(order[0], -1), order[0], "the first row stays put going up");
+  assert.equal(from(order[2], 1), order[2], "the last row stays put going down");
+  assert.equal(moveSelection([], null, 1), null);
 });

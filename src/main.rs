@@ -1509,16 +1509,11 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
     };
     let group = session_task_group(context, session_id)?;
     let lists = read_group_links(context, &group)?;
-    let own = lists.get(session_id).map(Vec::as_slice).unwrap_or_default();
-    let detail_keys: BTreeSet<PrKey> = own
-        .iter()
-        .filter(|link| {
-            link.key.repository == session.repository
-                && matches!(
-                    link.source(),
-                    Some(TrackedSource::Branch | TrackedSource::Created | TrackedSource::Manual)
-                )
-        })
+    // The panel can highlight any of the task's pull requests, so each one gets its details.
+    let detail_keys: BTreeSet<PrKey> = lists
+        .values()
+        .flatten()
+        .filter(|link| link.source().is_some())
         .map(|link| link.key.clone())
         .collect();
     let targets = [BranchTarget {
@@ -1546,8 +1541,10 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
         .get(session_id)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let pr = detail_link(own, &session.repository)
-        .and_then(|link| outcome.fetched.get(&link.key))
+    let own_url = detail_link(own, &session.repository).map(|link| link.url.clone());
+    let details: Vec<Value> = outcome
+        .fetched
+        .values()
         .filter(|pr| pr.detail.is_some())
         .map(|pr| {
             project_detail(
@@ -1558,14 +1555,16 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
                     .cloned()
                     .unwrap_or_default(),
             )
-        });
+        })
+        .collect();
     Ok(json!({
         "applicable": true,
         "remote": session.remote,
         "repository": session.repository,
         "branch": session.branch,
         "pull_requests": prs_json(&update.prs),
-        "pr": pr,
+        "own_url": own_url,
+        "details": details,
         "changed": update.changed,
     }))
 }
@@ -1843,7 +1842,16 @@ fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<Str
         .filter_map(|check| check.get("detailsUrl").and_then(Value::as_str))
         .find_map(action_run_id)
         .ok_or_else(|| invalid_state("no failed GitHub Actions run found"))?;
-    let logs = gh_output(context, &cwd, ["run", "view", run_id, "--log-failed"])?;
+    // A linked pull request can live in another repository than the session's checkout.
+    let target = PrKey::from_url(&reference);
+    let logs = match &target {
+        Some(key) => gh_output(
+            context,
+            &cwd,
+            ["run", "view", run_id, "--log-failed", "-R", &key.repository],
+        )?,
+        None => gh_output(context, &cwd, ["run", "view", run_id, "--log-failed"])?,
+    };
     let tail = logs
         .lines()
         .rev()
@@ -1853,8 +1861,12 @@ fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<Str
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
+    let subject = match &target {
+        Some(key) => format!("{}#{}", key.repository, key.number),
+        None => format!("branch `{branch}`"),
+    };
     Ok(format!(
-        "CI failed on branch `{branch}`. Here are the failure logs:\n\n{tail}"
+        "CI failed on {subject}. Here are the failure logs:\n\n{tail}"
     ))
 }
 
@@ -2355,8 +2367,13 @@ fi
         assert_eq!(method, "host.sessions.prompt");
         assert_eq!(
             fs::read_to_string(&gh_args).unwrap(),
-            "pr\nview\nhttps://github.com/o/r/pull/456\n--json\nstatusCheckRollup\nrun\nview\n123\n--log-failed\n"
+            "pr\nview\nhttps://github.com/o/r/pull/456\n--json\nstatusCheckRollup\nrun\nview\n123\n--log-failed\n-R\no/r\n",
+            "the run is read from the pull request's repository, which can differ from the checkout"
         );
+        assert!(params["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("CI failed on o/r#456."));
         assert_eq!(params["session_id"], "currently-focused-agent-session");
         assert!(params["text"]
             .as_str()
@@ -2640,10 +2657,21 @@ fi
         );
         assert_eq!(first["repository"], "o/r");
         assert_eq!(
-            first["pr"]["number"], 4,
-            "the branch PR is the detailed one"
+            first["own_url"], "https://github.com/o/r/pull/4",
+            "the branch PR is the session's own"
         );
-        assert_eq!(first["pr"]["merge_methods"], json!(["squash", "merge"]));
+        assert_eq!(
+            numbers(&first["details"]),
+            vec![3, 4, 8],
+            "every PR of the task has details for the panel"
+        );
+        let own_detail = first["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|detail| detail["number"] == 4)
+            .unwrap();
+        assert_eq!(own_detail["merge_methods"], json!(["squash", "merge"]));
         assert_eq!(first["changed"], true);
         assert_eq!(
             cli.calls(),

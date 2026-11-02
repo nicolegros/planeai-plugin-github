@@ -121,3 +121,16 @@ export function foreignRepository(pr: PullRequest, sessionRepository: string | n
   const [owner, name] = pr.repository.split("/");
   return owner.toLowerCase() === sessionRepository.split("/")[0].toLowerCase() ? name : pr.repository;
 }
+
+/** The panel's highlighted pull request: the kept highlight, else the session's own, else the current one. */
+export function resolveSelection(prs: readonly PullRequest[], selectedUrl: string | null, ownUrl: string | null): PullRequest | null {
+  return prs.find((pr) => pr.url === selectedUrl) ?? prs.find((pr) => pr.url === ownUrl) ?? currentPullRequest(prs);
+}
+
+/** The row one step up or down from the highlight, in display order, clamped at the ends. */
+export function moveSelection(prs: readonly PullRequest[], selectedUrl: string | null, delta: 1 | -1): PullRequest | null {
+  const order = displayOrder(prs);
+  if (!order.length) return null;
+  const index = Math.max(0, order.findIndex((pr) => pr.url === selectedUrl));
+  return order[Math.min(order.length - 1, Math.max(0, index + delta))];
+}

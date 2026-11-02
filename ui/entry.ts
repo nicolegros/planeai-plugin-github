@@ -7,6 +7,8 @@ import {
   displayOrder,
   foreignRepository,
   isLive,
+  moveSelection,
+  resolveSelection,
   stateTone,
   type PullRequest,
 } from "./pull-requests.js";
@@ -37,6 +39,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     let busy = false;
     let disposed = false;
     let selectedStrategy = "squash";
+    // The highlighted pull request; the header, checks, merge, and failure hand-off follow it.
+    let selectedUrl: string | null = null;
 
     const page = document.createElement("main");
     page.innerHTML = `
@@ -65,7 +69,11 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         .passed { margin-left:var(--planeai-space-2); color:var(--tone); font:10px var(--planeai-font-mono); }
         .pr-list { display:grid; margin:0 calc(-1 * var(--planeai-space-2)); }
         .pr-row { display:grid; grid-template-columns:8px 42px minmax(0, 1fr) 12px 52px 92px; align-items:center; column-gap:var(--planeai-space-2); min-height:32px; padding:4px var(--planeai-space-2); border-radius:6px; }
+        .pr-list:focus { outline:none; }
+        .pr-row { cursor:default; }
         .pr-row:hover { background:var(--planeai-accent-subtle); }
+        .pr-row[aria-selected="true"] { background:color-mix(in srgb, var(--planeai-accent) 9%, transparent); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--planeai-accent) 22%, transparent); }
+        .pr-list:focus-visible .pr-row[aria-selected="true"] { box-shadow:inset 0 0 0 2px var(--planeai-accent); }
         .pr-row[data-current] .pr-number { font-weight:600; }
         .pr-dot { width:8px; height:8px; border-radius:999px; background:var(--tone); }
         .pr-dot[data-state="draft"] { background:transparent; box-shadow:inset 0 0 0 1.5px var(--tone); }
@@ -130,6 +138,9 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       return "pending";
     };
     const pullRequests = (): PullRequest[] => (Array.isArray(snapshot?.pull_requests) ? snapshot.pull_requests : []);
+    const details = () => (Array.isArray(snapshot?.details) ? snapshot.details : []);
+    const selection = () => resolveSelection(pullRequests(), selectedUrl, snapshot?.own_url ?? null);
+    const detailOf = (pr: PullRequest | null) => (pr ? details().find((detail) => detail.url === pr.url) ?? null : null);
     const branchHasPullRequest = () =>
       pullRequests().some((pr) => isLive(pr) && pr.head_branch === snapshot?.branch && !foreignRepository(pr, snapshot?.repository));
 
@@ -274,11 +285,19 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       appendFooter([["L", "link"], ["Esc", "close"]]);
     }
 
-    function pullRequestRow(pr: PullRequest, current: PullRequest | null) {
+    function pullRequestRow(pr: PullRequest, current: PullRequest | null, selected: PullRequest | null) {
       const row = document.createElement("div");
       row.className = "pr-row";
+      row.id = `pull-request-${pr.number}-${pr.repository.replace(/[^a-z0-9]/gi, "-")}`;
+      row.setAttribute("role", "option");
+      const isSelected = selected?.url === pr.url;
+      row.setAttribute("aria-selected", String(isSelected));
       row.dataset.tone = stateTone(pr.state);
       if (current && pr.url === current.url) row.dataset.current = "";
+      row.addEventListener("click", (event) => {
+        if (event.target instanceof Element && event.target.closest("button")) return;
+        select(pr.url);
+      });
       const dot = document.createElement("span"); dot.className = "pr-dot"; dot.dataset.state = pr.state;
       dot.setAttribute("role", "img"); dot.setAttribute("aria-label", STATE_LABELS[pr.state] ?? pr.state);
       const number = document.createElement("span"); number.className = "pr-number"; number.textContent = `#${pr.number}`;
@@ -302,6 +321,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         const label = pr.source === "stack" ? "Dismiss" : "Unlink";
         const remove = button(label, () => { void mutate(() => call("github.unlink", { url: pr.url })); });
         remove.setAttribute("aria-label", `${label} #${pr.number}`);
+        // U acts on the highlighted row; the footer hints it, so the row stays uncluttered.
+        if (isSelected) remove.dataset.shortcut = "u";
         actions.append(remove);
       }
       actions.append(open);
@@ -309,7 +330,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       return row;
     }
 
-    function appendPullRequests(prs: PullRequest[], current: PullRequest | null) {
+    function appendPullRequests(prs: PullRequest[], current: PullRequest | null, selected: PullRequest | null) {
       const section = document.createElement("section"); section.className = "section";
       const heading = document.createElement("div"); heading.className = "checks-heading";
       const label = document.createElement("span"); label.className = "section-title"; label.textContent = prs.length ? `Pull requests · ${prs.length}` : "No pull request";
@@ -319,7 +340,10 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       section.append(heading);
       if (prs.length) {
         const list = document.createElement("div"); list.className = "pr-list";
-        for (const pr of displayOrder(prs)) list.append(pullRequestRow(pr, current));
+        list.setAttribute("role", "listbox"); list.setAttribute("aria-label", "Pull requests"); list.tabIndex = 0;
+        for (const pr of displayOrder(prs)) list.append(pullRequestRow(pr, current, selected));
+        const active = list.querySelector('[aria-selected="true"]');
+        if (active) list.setAttribute("aria-activedescendant", active.id);
         section.append(list);
       } else {
         const hint = document.createElement("p"); hint.className = "muted"; hint.textContent = "Create a pull request for the session branch, or link an existing one.";
@@ -378,7 +402,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         button.setAttribute("aria-pressed", String(button.dataset.mergeStrategy === strategy));
       }
       const merge = content.querySelector("button[data-merge-confirm]");
-      if (merge) merge.textContent = `Merge #${snapshot?.pr?.number} with ${strategy}`;
+      if (merge) merge.textContent = `Merge #${detailOf(selection())?.number} with ${strategy}`;
     }
 
     function cycleMergeStrategy() {
@@ -406,7 +430,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       return true;
     }
 
-    /** Checks, merge, and CI hand-off for the session's own pull request. */
+    /** Checks, merge, and CI hand-off for the highlighted pull request. */
     function appendDetail(pr) {
       const checks = Array.isArray(pr.checks) ? pr.checks : [];
       const failed = checks.some((check) => classifyCheck(check) === "fail");
@@ -448,16 +472,20 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     function renderPullRequests(error = "") {
       const prs = pullRequests();
       const current = currentPullRequest(prs);
-      // The header names the PR that the checks and merge below act on.
-      appendHeader(prs.find((pr) => pr.url === snapshot.pr?.url) ?? current);
-      appendPullRequests(prs, current);
-      if (snapshot.pr) appendDetail(snapshot.pr);
+      const selected = selection();
+      selectedUrl = selected?.url ?? null;
+      appendHeader(selected);
+      appendPullRequests(prs, current, selected);
+      const detail = detailOf(selected);
+      if (detail) appendDetail(detail);
       appendActions();
       if (error) appendStatus("GitHub could not complete that action.", error);
       const hints = [["R", "refresh"], ["L", "link"]];
       if (!branchHasPullRequest()) hints.splice(1, 0, ["C", "create"]);
       if (content.querySelector("button[data-merge-strategy]")) hints.unshift(["S", "strategy"]);
-      if (current) hints.unshift(["O", "open"]);
+      if (selected && selected.source !== "branch") hints.unshift(["U", selected.source === "stack" ? "dismiss" : "unlink"]);
+      if (selected) hints.unshift(["O", "open"]);
+      if (prs.length > 1) hints.unshift(["↑↓", "select"]);
       appendFooter(hints);
     }
 
@@ -471,6 +499,16 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       renderPullRequests(error);
     }
 
+    function select(url: string | null) {
+      if (!url || url === selectedUrl) return;
+      const listFocused = document.activeElement?.closest?.(".pr-list") != null;
+      selectedUrl = url;
+      render();
+      if (listFocused) content.querySelector<HTMLElement>(".pr-list")?.focus();
+    }
+
+    const SELECTION_KEYS: Record<string, 1 | -1> = { ArrowDown: 1, j: 1, ArrowUp: -1, k: -1 };
+
     function triggerShortcut(shortcut) {
       if (shortcut === "s") return cycleMergeStrategy();
       const action = content.querySelector(`[data-shortcut="${shortcut}"]`);
@@ -480,15 +518,22 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     }
 
     function handleKeydown(event) {
-      if (disposed || event.repeat || event.altKey || event.ctrlKey || event.metaKey || editableTarget(event.target)) return;
+      if (disposed || (event.repeat && !SELECTION_KEYS[event.key]) || event.altKey || event.ctrlKey || event.metaKey || editableTarget(event.target)) return;
       if (event.key === "Enter" || event.key === " ") {
         if (!confirmFocusedMergeStrategy()) return;
         event.preventDefault();
         event.stopPropagation();
         return;
       }
+      const delta = SELECTION_KEYS[event.key];
+      if (delta && !event.shiftKey && snapshot?.applicable && !creating && !linking) {
+        select(moveSelection(pullRequests(), selectedUrl, delta)?.url ?? null);
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       const shortcut = event.key === "R" ? "shift+r" : event.key.toLowerCase();
-      if (!new Set(["r", "c", "l", "o", "shift+r", "s", "f"]).has(shortcut) || !triggerShortcut(shortcut)) return;
+      if (!new Set(["r", "c", "l", "o", "u", "shift+r", "s", "f"]).has(shortcut) || !triggerShortcut(shortcut)) return;
       event.preventDefault();
       event.stopPropagation();
     }
