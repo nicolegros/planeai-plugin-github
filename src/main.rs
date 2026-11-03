@@ -693,33 +693,6 @@ fn github_repository_slug(remote: &str) -> Option<String> {
     (segments.next().is_none()).then(|| format!("{owner}/{repository}"))
 }
 
-fn enabled_repository_merge_methods(repository: &Value) -> Vec<String> {
-    [
-        ("squash", "allow_squash_merge"),
-        ("merge", "allow_merge_commit"),
-        ("rebase", "allow_rebase_merge"),
-    ]
-    .into_iter()
-    .filter_map(|(method, field)| {
-        (repository.get(field).and_then(Value::as_bool) == Some(true)).then_some(method.to_string())
-    })
-    .collect()
-}
-
-fn repository_merge_methods(
-    context: &ExecutionContext,
-    cwd: &str,
-    slug: &str,
-) -> Result<Vec<String>, RequestError> {
-    let raw = gh_output(context, cwd, ["api", &format!("repos/{slug}")])?;
-    let repository: Value = serde_json::from_str(&raw).map_err(|error| {
-        RequestError::Message(format!(
-            "failed to parse GitHub repository settings: {error}"
-        ))
-    })?;
-    Ok(enabled_repository_merge_methods(&repository))
-}
-
 fn host_call(
     context: &ExecutionContext,
     id_prefix: &str,
@@ -1422,9 +1395,6 @@ fn target_reference(params: &Value, branch: &str) -> String {
 
 fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
-    let repository = repository_context(params, context)?;
-    let cwd = context_path(&repository)?;
-    let branch = context_string(&repository, "branch")?;
     let strategy = params
         .get("strategy")
         .and_then(Value::as_str)
@@ -1439,27 +1409,46 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
             ))
         }
     };
-    let reference = target_reference(params, &branch);
-    let url = match PrKey::from_url(&reference) {
-        Some(_) => reference.clone(),
-        None => {
-            let raw = gh_output(context, &cwd, ["pr", "view", &reference, "--json", "url"])?;
-            let view: Value = serde_json::from_str(&raw).map_err(|error| {
-                invalid_state(format!(
-                    "failed to parse pull request before merge: {error}"
-                ))
-            })?;
-            view.get("url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_state("gh pr view did not return a pull request url"))?
-                .to_string()
-        }
+    let session = github_session(params, context)?
+        .ok_or_else(|| invalid_state("The origin remote is not github.com."))?;
+    let cwd = session.cwd.as_str();
+    // The repository's merge methods come with the pull request's detail lookup.
+    let request = match params
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(PrKey::from_url)
+    {
+        Some(key) => LookupRequest::new(
+            &key.repository,
+            Lookup::Number {
+                number: key.number,
+                detail: true,
+            },
+        ),
+        None => LookupRequest::new(
+            &session.repository,
+            Lookup::Head {
+                branch: session.branch.clone(),
+                detail: true,
+            },
+        ),
     };
-    let key = PrKey::from_url(&url)
-        .ok_or_else(|| invalid_state(format!("unsupported pull request URL {url}")))?;
-    if !repository_merge_methods(context, &cwd, &key.repository)?
-        .iter()
-        .any(|method| method == strategy)
+    let mut response = fetch_graphql(context, cwd, std::slice::from_ref(&request))?;
+    let prs = response
+        .lookups
+        .remove(&request)
+        .flatten()
+        .unwrap_or_default();
+    let pr = match &request.lookup {
+        Lookup::Head { branch, .. } => refresh::branch_pull_request(&prs, branch),
+        _ => prs.first(),
+    }
+    .ok_or_else(|| invalid_state("GitHub could not find the pull request to merge"))?;
+    let (key, url) = (pr.key.clone(), pr.url.clone());
+    if !response
+        .merge_methods
+        .get(&request.repository)
+        .is_some_and(|methods| methods.iter().any(|method| method == strategy))
     {
         return Err(invalid_state(format!(
             "{strategy} merge is disabled for this GitHub repository"
@@ -1467,7 +1456,7 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
     }
     gh_output(
         context,
-        &cwd,
+        cwd,
         ["pr", "merge", &url, strategy_flag, "--delete-branch"],
     )?;
     let task = session_task_group(context, session_id)?;
@@ -2081,17 +2070,12 @@ fi
     }
 
     #[test]
-    fn projects_only_github_enabled_merge_methods() {
-        let methods = enabled_repository_merge_methods(&json!({
-            "allow_squash_merge": true,
-            "allow_merge_commit": false,
-            "allow_rebase_merge": true,
-        }));
-        assert_eq!(methods, vec!["squash", "rebase"]);
+    fn extracts_github_repository_slugs() {
         assert_eq!(
             github_repository_slug("git@github.com:o/r.git"),
             Some("o/r".to_string())
         );
+        assert_eq!(github_repository_slug("git@gitlab.com:o/r.git"), None);
     }
 
     #[test]
@@ -2698,6 +2682,52 @@ fi
         assert_eq!(
             host.lock().unwrap().settings["github"]["version"],
             STATE_VERSION
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_checks_the_strategy_with_one_graphql_lookup() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "topic");
+        let lookup = json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "OPEN", "topic", "main", "SUCCESS"),
+        } } });
+        let merge = |strategy: &str| {
+            with_host(&cli.runner, &host, |context| {
+                merge_pull_request(
+                    &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4", "strategy": strategy }),
+                    context,
+                )
+            })
+        };
+
+        cli.respond(lookup.clone());
+        assert!(
+            merge("rebase").is_err(),
+            "rebase is disabled for the repository"
+        );
+        cli.respond(lookup);
+        assert_eq!(merge("squash").unwrap(), json!({ "merged": true }));
+
+        let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
+        assert!(
+            !args.contains("repos/"),
+            "no REST repository lookup: {args}"
+        );
+        assert_eq!(
+            args.matches("api\ngraphql\n").count(),
+            2,
+            "one lookup per merge"
+        );
+        assert_eq!(args.matches("pr\nmerge\n").count(), 1);
+        assert!(
+            args.ends_with("pr\nmerge\nhttps://github.com/o/r/pull/4\n--squash\n--delete-branch\n")
+        );
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["state"],
+            "merged"
         );
     }
 

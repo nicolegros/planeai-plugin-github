@@ -192,7 +192,7 @@ fn stack_neighbor<'a>(
 }
 
 /// GitHub's pick for a branch: an open pull request first, else the most recently updated one.
-fn branch_pull_request<'a>(prs: &'a [FetchedPr], branch: &str) -> Option<&'a FetchedPr> {
+pub fn branch_pull_request<'a>(prs: &'a [FetchedPr], branch: &str) -> Option<&'a FetchedPr> {
     let same_repository = || {
         prs.iter().filter(move |pr| {
             !pr.cross_repository && pr.snapshot.head_branch.as_deref() == Some(branch)
