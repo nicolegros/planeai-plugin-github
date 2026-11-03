@@ -58,7 +58,6 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     let selectedStrategy = "squash";
     // The highlighted pull request; the header, checks, merge, and failure hand-off follow it.
     let selectedUrl: string | null = null;
-    const openForm = () => activeForm;
     const closeForm = () => { activeForm = null; };
     const openNewForm = (form: CreateForm | LinkForm) => { activeForm = form; formJustOpened = true; };
 
@@ -257,10 +256,10 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       section.className = "section";
       const title = document.createElement("div"); title.className = "section-title"; title.textContent = "Create pull request";
       const form = document.createElement("form");
-      const titleField = document.createElement("input"); titleField.name = "title"; titleField.value = saved.title; titleField.required = true;
-      const bodyField = document.createElement("textarea"); bodyField.name = "body"; bodyField.rows = 10; bodyField.value = saved.body;
-      const baseField = document.createElement("input"); baseField.name = "base_branch"; baseField.value = saved.base_branch; baseField.required = true;
-      const draft = document.createElement("input"); draft.name = "draft"; draft.type = "checkbox"; draft.checked = saved.draft;
+      const titleField = document.createElement("input"); titleField.value = saved.title; titleField.required = true;
+      const bodyField = document.createElement("textarea"); bodyField.rows = 10; bodyField.value = saved.body;
+      const baseField = document.createElement("input"); baseField.value = saved.base_branch; baseField.required = true;
+      const draft = document.createElement("input"); draft.type = "checkbox"; draft.checked = saved.draft;
       const save = () => { activeForm = { kind: "create", title: titleField.value, body: bodyField.value, base_branch: baseField.value, draft: draft.checked }; };
       form.addEventListener("input", save);
       form.addEventListener("change", save);
@@ -287,7 +286,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       section.className = "section";
       const title = document.createElement("div"); title.className = "section-title"; title.textContent = "Link pull request";
       const form = document.createElement("form");
-      const urlField = document.createElement("input"); urlField.name = "url"; urlField.type = "url"; urlField.required = true; urlField.placeholder = "https://github.com/owner/repo/pull/123";
+      const urlField = document.createElement("input"); urlField.type = "url"; urlField.required = true; urlField.placeholder = "https://github.com/owner/repo/pull/123";
       urlField.value = saved.url;
       urlField.addEventListener("input", () => { activeForm = { kind: "link", url: urlField.value }; });
       const labelled = document.createElement("label"); labelled.textContent = "Pull request URL"; labelled.append(urlField);
@@ -511,7 +510,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       if (!sourceSessionId) { renderSetup("Select a PlaneAI session before opening this panel."); return; }
       if (!snapshot) { appendHeader(null); appendStatus("Refreshing GitHub status…", error); return; }
       if (!snapshot.applicable) { renderSetup(("reason" in snapshot && snapshot.reason) || "GitHub is not applicable to this session."); return; }
-      const form = openForm();
+      const form = activeForm;
       if (form?.kind === "create") { renderCreate(form); if (error) appendStatus("The pull request could not be created.", error); return; }
       if (form?.kind === "link") { renderLink(form); if (error) appendStatus("The pull request could not be linked.", error); return; }
       // A refresh that failed behind an open form reports once the list is back.
@@ -558,7 +557,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         return;
       }
       const delta = SELECTION_KEYS[event.key];
-      if (delta && !event.shiftKey && status() && !openForm() && selectionKeysApply()) {
+      if (delta && !event.shiftKey && status() && !activeForm && selectionKeysApply()) {
         select(moveSelection(pullRequests(), selectedUrl, delta)?.url ?? null);
         event.preventDefault();
         event.stopPropagation();
