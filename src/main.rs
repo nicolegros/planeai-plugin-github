@@ -1575,25 +1575,25 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
         args.push("--delete-branch");
     }
     gh_output(context, cwd, args)?;
-    // GitHub's merge time compares with its creation times; without it, the missing-time rules
-    // of task transitions apply.
-    let merged_at = fetch_pull_request(context, cwd, &key)
-        .ok()
-        .and_then(|pr| pr.snapshot.merged_at);
+    // What GitHub says now, with its own merge time; a merge queue can keep the pull request open.
+    let fetched = fetch_pull_request(context, cwd, &key).ok();
     update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
-            let merged = links
-                .iter()
-                .find(|link| link.key == key)
-                .and_then(PullRequestLink::snapshot)
-                .map(|snapshot| PrSnapshot {
-                    state: PrState::Merged,
-                    merged_at: merged_at.clone(),
-                    refreshed_at: unix_timestamp_ms(),
-                    ..snapshot.clone()
-                });
-            if let Some(merged) = merged {
-                refresh_snapshot(links, &key, &merged);
+            let snapshot = match &fetched {
+                Some(pr) => Some(pr.snapshot.clone()),
+                // Without the lookup, gh's success is the best answer, at an unknown time.
+                None => links
+                    .iter()
+                    .find(|link| link.key == key)
+                    .and_then(PullRequestLink::snapshot)
+                    .map(|snapshot| PrSnapshot {
+                        state: PrState::Merged,
+                        refreshed_at: unix_timestamp_ms(),
+                        ..snapshot.clone()
+                    }),
+            };
+            if let Some(snapshot) = snapshot {
+                refresh_snapshot(links, &key, &snapshot);
             }
         }
         Ok(())
@@ -3014,6 +3014,53 @@ fi
             ],
             "the session's own pull request, not its branch, when no url is given"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_github_queues_stays_open_until_it_lands() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "topic");
+        let lookup = json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "OPEN", "topic", "main", ""),
+        } } });
+        cli.respond(lookup.clone());
+        cli.respond(lookup);
+        with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4", "strategy": "squash" }),
+                context,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["state"],
+            "open",
+            "the follow-up lookup is what GitHub says, even when a merge queue holds the pull request"
+        );
+        assert!(host.lock().unwrap().transitions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_whose_follow_up_lookup_fails_is_stored_as_merged_at_an_unknown_time() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "topic");
+        cli.respond(json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "OPEN", "topic", "main", ""),
+        } } }));
+        with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4", "strategy": "squash" }),
+                context,
+            )
+        })
+        .unwrap();
+        let stored = host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0].clone();
+        assert_eq!(stored["state"], "merged");
+        assert!(stored.get("merged_at").is_none());
     }
 
     #[cfg(unix)]

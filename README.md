@@ -106,7 +106,7 @@ Older documents migrate in place: version 1 and 2 gain the transition defaults, 
 A legacy mapping whose URL is not a `github.com` pull request becomes an empty list, with a log line on stderr.
 Because the host deletes keys patched to `null`, absent optional fields read as `null`.
 Malformed or unsupported documents are rejected rather than migrated implicitly.
-`github.status`, `github.create`, `github.link`, `github.unlink`, and `github.merge` update links only after their GitHub operation succeeds, and `github.summary` reads the cached links without asking GitHub; with `check_repository`, it also reports whether the session's `origin` is on github.com.
+`github.status`, `github.create`, `github.link`, `github.unlink`, and `github.merge` update links only after their GitHub operation succeeds; after a merge, the stored state is what GitHub reports next, so a pull request a merge queue holds stays open, and `github.summary` reads the cached links without asking GitHub; with `check_repository`, it also reports whether the session's `origin` is on github.com.
 
 The manifest declares `github.reconcile` as the host-managed background service. PlaneAI runs it on the configured `github_reconciliation_interval_ms` setting (two minutes by default), while it remains safe to call explicitly.
 It writes a unique fenced `running` attempt, refreshes every task with an active session through one batched `gh api graphql` query per discovery round (at most two), and then writes `idle` counts and timestamps or bounded `failed` error details, including cancellation.
