@@ -1532,6 +1532,9 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
     let cwd = session.cwd.as_str();
     let target = action_target(params, context, &session)?;
     let (pr, methods) = fetch_target_detail(context, &session, target)?;
+    // Only the session's own branch is safe to delete: another branch can be someone's work.
+    let own_branch = pr.key.repository == session.repository
+        && pr.snapshot.head_branch.as_deref() == Some(session.branch.as_str());
     let (key, url) = (pr.key, pr.url);
     if !methods.iter().any(|method| method == strategy) {
         return Err(invalid_state(format!(
@@ -1539,8 +1542,7 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
         )));
     }
     let mut args = vec!["pr", "merge", &url, strategy_flag];
-    // The session's checkout only knows its own repository's branches.
-    if key.repository == session.repository {
+    if own_branch {
         args.push("--delete-branch");
     }
     gh_output(context, cwd, args)?;
@@ -2913,6 +2915,29 @@ fi
             args,
             "pr\nready\nhttps://github.com/o/r/pull/4\npr\nready\nhttps://github.com/o/r/pull/9\n",
             "the session's own pull request, not its branch, when no url is given"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merging_a_pull_request_from_another_branch_keeps_that_branch() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([]), "topic");
+        cli.respond(json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 7, "OPEN", "someone-else", "main", ""),
+        } } }));
+        with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/7", "strategy": "squash" }),
+                context,
+            )
+        })
+        .unwrap();
+        let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
+        assert!(
+            args.ends_with("pr\nmerge\nhttps://github.com/o/r/pull/7\n--squash\n"),
+            "{args}"
         );
     }
 
