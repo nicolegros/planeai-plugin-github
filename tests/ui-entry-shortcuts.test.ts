@@ -108,4 +108,5 @@ test("GitHub session panel lists every pull request with per-row actions", () =>
   assert.match(entry, /grid-template-columns:8px 42px minmax\(0, 1fr\) 12px 52px 92px/, "fixed columns keep numbers, titles, and actions aligned across rows");
   assert.match(entry, /if \(next\.applicable && next\.changed\) void dataChanged\(\)/, "a refresh that changed stored PRs refreshes the sidebar pills");
   assert.match(entry, /appendFooter\(panelHints\(\{ prs, selected,/, "the footer hints come from panelHints");
+  assert.match(entry, /if \(disposed \|\| current !== generation\) return;/, "a stale github.status answer never renders");
 });

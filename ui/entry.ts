@@ -38,6 +38,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
   mount(root, context) {
     const sourceSessionId = context.session?.id;
     let snapshot: GithubStatus | null = null;
+    // Only the latest github.status answer may render, however the requests finish.
+    let generation = 0;
     let defaults = null;
     let creating = false;
     let linking = false;
@@ -534,15 +536,18 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
     async function load() {
       if (!sourceSessionId) { render(); return; }
+      if (disposed) return;
+      const current = ++generation;
       const previous = snapshot;
       snapshot = null; render();
       try {
         const next: GithubStatus = await call("github.status");
-        if (disposed) return;
+        if (disposed || current !== generation) return;
         snapshot = next;
         render();
         if (next.applicable && next.changed) void dataChanged();
       } catch (error) {
+        if (disposed || current !== generation) return;
         snapshot = previous?.applicable ? previous : null;
         render(String(error));
       }
