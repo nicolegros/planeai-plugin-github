@@ -1,7 +1,14 @@
+mod durable_state;
 mod github_graphql;
 mod pull_requests;
 mod refresh;
 
+use durable_state::{
+    begin_reconciliation_patch, empty_durable_state, finish_reconciliation_patch,
+    migrate_durable_state, reconciliation_from_settings_value, validate_task_transitions,
+    with_null_defaults, LEGACY_STATE_VERSION, STATE_NAMESPACE, STATE_VERSION,
+    TASK_TRANSITION_FIELDS, V2_STATE_VERSION, V3_STATE_VERSION,
+};
 use github_graphql::{FetchedPr, GraphqlResponse, Lookup, LookupRequest};
 use pull_requests::{
     aggregate, dismiss, parse_session_links, parse_sessions, record_created, record_manual,
@@ -29,16 +36,9 @@ const HOST_API_VERSION: &str = "planeai.plugin-host.v5";
 const CANCELLATION_ERROR_CODE: i64 = -32800;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const STATE_NAMESPACE: &str = "github";
-const STATE_VERSION: u64 = 4;
-const LEGACY_STATE_VERSION: u64 = 1;
-const V2_STATE_VERSION: u64 = 2;
-const V3_STATE_VERSION: u64 = 3;
 /// Lookup rounds per refresh: each round reaches one more pull request along a stack.
 const STATUS_REFRESH_ROUNDS: usize = 3;
 const RECONCILE_REFRESH_ROUNDS: usize = 2;
-const MAX_RECONCILIATION_ERROR_CHARS: usize = 500;
-const TASK_STATUSES: &[&str] = &["todo", "in_progress", "in_review", "done"];
 
 #[derive(Clone)]
 struct CommandRunner {
@@ -386,153 +386,6 @@ fn unix_timestamp_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn empty_task_transitions() -> Value {
-    json!({ "on_open": Value::Null, "on_merge": Value::Null })
-}
-
-fn empty_durable_state() -> Value {
-    json!({
-        "version": STATE_VERSION,
-        "pull_requests": {},
-        "reconciliation": {
-            "status": "idle",
-            "attempt_id": Value::Null,
-            "started_at": Value::Null,
-            "finished_at": Value::Null,
-            "checked": 0,
-            "recovered_attempt_id": Value::Null,
-            "recovered_at": Value::Null,
-            "error": Value::Null,
-        },
-        "task_transitions": empty_task_transitions(),
-    })
-}
-
-fn require_only_keys(
-    object: &serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> Result<(), RequestError> {
-    if object.keys().any(|key| !keys.contains(&key.as_str())) {
-        return Err(RequestError::Message(
-            "GitHub durable state contains unknown fields".to_string(),
-        ));
-    }
-    if keys.iter().any(|key| !object.contains_key(*key)) {
-        return Err(RequestError::Message(
-            "GitHub durable state is missing required fields".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn strict_optional_string(value: Option<&Value>, field: &str) -> Result<(), RequestError> {
-    match value {
-        Some(Value::Null) => Ok(()),
-        Some(Value::String(value)) if !value.trim().is_empty() => Ok(()),
-        _ => Err(RequestError::Message(format!(
-            "GitHub durable state has invalid {field}"
-        ))),
-    }
-}
-
-fn strict_optional_timestamp(value: Option<&Value>, field: &str) -> Result<(), RequestError> {
-    match value {
-        Some(Value::Null) => Ok(()),
-        Some(Value::Number(number)) if number.as_u64().is_some() => Ok(()),
-        _ => Err(RequestError::Message(format!(
-            "GitHub durable state has invalid {field}"
-        ))),
-    }
-}
-
-const TASK_TRANSITION_FIELDS: &[&str] = &["on_open", "on_merge"];
-const RECONCILIATION_OPTIONAL_FIELDS: &[&str] = &[
-    "attempt_id",
-    "started_at",
-    "finished_at",
-    "recovered_attempt_id",
-    "recovered_at",
-    "error",
-];
-
-/// The host's settings patch deletes keys patched to null, so absent optional fields read as null.
-fn with_null_defaults(value: &Value, fields: &[&str]) -> Value {
-    let mut value = value.clone();
-    if let Some(object) = value.as_object_mut() {
-        for field in fields {
-            object.entry(field.to_string()).or_insert(Value::Null);
-        }
-    }
-    value
-}
-
-fn validate_task_transitions(value: &Value) -> Result<(), RequestError> {
-    let value = with_null_defaults(value, TASK_TRANSITION_FIELDS);
-    let transitions = value.as_object().ok_or_else(|| {
-        RequestError::Message("GitHub durable state task_transitions must be an object".to_string())
-    })?;
-    require_only_keys(transitions, &["on_open", "on_merge"])?;
-    for field in ["on_open", "on_merge"] {
-        match transitions.get(field) {
-            Some(Value::Null) => {}
-            Some(Value::String(status)) if TASK_STATUSES.contains(&status.as_str()) => {}
-            _ => {
-                return Err(RequestError::Message(format!(
-                    "GitHub durable state has invalid {field} transition"
-                )))
-            }
-        }
-    }
-    Ok(())
-}
-
-fn add_empty_check_summaries(state: &mut Value) -> Result<(), RequestError> {
-    let mappings = state
-        .get_mut("pull_requests")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| {
-            RequestError::Message(
-                "GitHub durable state pull_requests must be an object".to_string(),
-            )
-        })?;
-    for mapping in mappings.values_mut() {
-        let mapping = mapping.as_object_mut().ok_or_else(|| {
-            RequestError::Message("GitHub durable state pull request must be an object".to_string())
-        })?;
-        mapping
-            .entry("check_summary".to_string())
-            .or_insert(Value::Null);
-    }
-    Ok(())
-}
-
-fn normalize_task_transitions(state: &mut Value) -> Result<(), RequestError> {
-    let object = state.as_object_mut().ok_or_else(|| {
-        RequestError::Message("GitHub durable state must be a JSON object".to_string())
-    })?;
-    let transitions = object
-        .entry("task_transitions".to_string())
-        .or_insert_with(empty_task_transitions)
-        .as_object_mut()
-        .ok_or_else(|| {
-            RequestError::Message(
-                "GitHub durable state task_transitions must be an object".to_string(),
-            )
-        })?;
-    if transitions
-        .keys()
-        .any(|key| !["on_open", "on_merge"].contains(&key.as_str()))
-    {
-        return Err(RequestError::Message(
-            "GitHub durable state contains unknown fields".to_string(),
-        ));
-    }
-    for key in ["on_open", "on_merge"] {
-        transitions.entry(key.to_string()).or_insert(Value::Null);
-    }
-    Ok(())
-}
-
 fn settings_value_from_host_response(response: &Value) -> Result<Value, RequestError> {
     response.get("settings").cloned().ok_or_else(|| {
         RequestError::Message("host settings response did not contain settings".to_string())
@@ -611,16 +464,6 @@ fn patch_durable_state(
     }
 }
 
-fn reconciliation_from_settings_value(value: Value) -> Result<Value, RequestError> {
-    let mut state = empty_durable_state();
-    state["reconciliation"] = value;
-    validate_durable_state(&state)?;
-    Ok(with_null_defaults(
-        &state["reconciliation"],
-        RECONCILIATION_OPTIONAL_FIELDS,
-    ))
-}
-
 fn read_reconciliation_state(
     context: &ExecutionContext,
     allow_cancelled: bool,
@@ -633,7 +476,9 @@ fn read_reconciliation_state(
         json!({ "path": [STATE_NAMESPACE, "reconciliation"] }),
         allow_cancelled,
     )?;
-    reconciliation_from_settings_value(settings_value_from_host_response(&response)?)
+    Ok(reconciliation_from_settings_value(
+        settings_value_from_host_response(&response)?,
+    )?)
 }
 
 fn apply_task_transition(
@@ -664,60 +509,6 @@ fn apply_task_transition(
         };
         eprintln!("{PLUGIN_ID} failed configured {field} task transition: {message}");
     }
-}
-
-fn begin_reconciliation_patch(
-    reconciliation: &Value,
-    attempt_id: &str,
-    started_at: u64,
-) -> Result<Value, RequestError> {
-    let reconciliation = reconciliation.as_object().ok_or_else(|| {
-        RequestError::Message("GitHub durable state reconciliation must be an object".to_string())
-    })?;
-    let mut patch = serde_json::Map::new();
-    if reconciliation.get("status").and_then(Value::as_str) == Some("running") {
-        patch.insert(
-            "recovered_attempt_id".to_string(),
-            reconciliation
-                .get("attempt_id")
-                .cloned()
-                .unwrap_or(Value::Null),
-        );
-        patch.insert("recovered_at".to_string(), json!(started_at));
-    }
-    patch.insert("status".to_string(), json!("running"));
-    patch.insert("attempt_id".to_string(), json!(attempt_id));
-    patch.insert("started_at".to_string(), json!(started_at));
-    patch.insert("finished_at".to_string(), Value::Null);
-    patch.insert("checked".to_string(), json!(0));
-    patch.insert("error".to_string(), Value::Null);
-    Ok(Value::Object(patch))
-}
-
-fn finish_reconciliation_patch(
-    reconciliation: &Value,
-    attempt_id: &str,
-    status: &str,
-    checked: u64,
-    finished_at: u64,
-    error: Option<&str>,
-) -> Result<Value, RequestError> {
-    let reconciliation = reconciliation.as_object().ok_or_else(|| {
-        RequestError::Message("GitHub durable state reconciliation must be an object".to_string())
-    })?;
-    if reconciliation.get("status").and_then(Value::as_str) != Some("running")
-        || reconciliation.get("attempt_id").and_then(Value::as_str) != Some(attempt_id)
-    {
-        return Err(RequestError::Message(
-            "reconciliation attempt was superseded".to_string(),
-        ));
-    }
-    Ok(json!({
-        "status": status,
-        "finished_at": finished_at,
-        "checked": checked,
-        "error": error.map_or(Value::Null, |error| json!(bounded_error(error))),
-    }))
 }
 
 fn begin_reconciliation(
@@ -757,10 +548,6 @@ fn finish_reconciliation(
             )?
         }),
     )
-}
-
-fn bounded_error(error: &str) -> String {
-    error.chars().take(MAX_RECONCILIATION_ERROR_CHARS).collect()
 }
 
 fn repository_context(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
@@ -1077,161 +864,6 @@ fn update_github_settings(
 
 fn invalid_state(message: impl Into<String>) -> RequestError {
     RequestError::Message(message.into())
-}
-
-fn state_object(state: &mut Value) -> Result<&mut serde_json::Map<String, Value>, RequestError> {
-    state
-        .as_object_mut()
-        .ok_or_else(|| invalid_state("GitHub durable state must be a JSON object"))
-}
-
-fn migrate_v1_durable_state(state: &mut Value) -> Result<(), RequestError> {
-    let object = state_object(state)?;
-    require_only_keys(object, &["version", "pull_requests", "reconciliation"])?;
-    object.insert("version".to_string(), json!(V2_STATE_VERSION));
-    object.insert("task_transitions".to_string(), empty_task_transitions());
-    Ok(())
-}
-
-fn migrate_v2_durable_state(state: &mut Value) -> Result<(), RequestError> {
-    let object = state_object(state)?;
-    if object.keys().any(|key| {
-        ![
-            "version",
-            "pull_requests",
-            "reconciliation",
-            "task_transitions",
-        ]
-        .contains(&key.as_str())
-    }) || !object.contains_key("pull_requests")
-        || !object.contains_key("reconciliation")
-    {
-        return Err(invalid_state("unsupported GitHub durable state version"));
-    }
-    object.insert("version".to_string(), json!(V3_STATE_VERSION));
-    normalize_task_transitions(state)?;
-    add_empty_check_summaries(state)
-}
-
-/// Version 4 tracks a list of pull requests per session instead of one mapping.
-fn migrate_v3_durable_state(state: &mut Value) -> Result<(), RequestError> {
-    let object = state_object(state)?;
-    let pull_requests = object
-        .get_mut("pull_requests")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| invalid_state("GitHub durable state pull_requests must be an object"))?;
-    for links in pull_requests.values_mut() {
-        *links = session_links_value(&parse_session_links(links).map_err(invalid_state)?);
-    }
-    object.insert("version".to_string(), json!(STATE_VERSION));
-    Ok(())
-}
-
-fn migrate_durable_state(state: &Value) -> Result<Value, RequestError> {
-    let mut migrated = state.clone();
-    loop {
-        match migrated.get("version").and_then(Value::as_u64) {
-            Some(LEGACY_STATE_VERSION) => migrate_v1_durable_state(&mut migrated)?,
-            Some(V2_STATE_VERSION) => migrate_v2_durable_state(&mut migrated)?,
-            Some(V3_STATE_VERSION) => migrate_v3_durable_state(&mut migrated)?,
-            Some(STATE_VERSION) => break,
-            _ => return Err(invalid_state("unsupported GitHub durable state version")),
-        }
-    }
-    validate_durable_state(&migrated)?;
-    Ok(migrated)
-}
-
-fn validate_durable_state(state: &Value) -> Result<(), RequestError> {
-    let object = state
-        .as_object()
-        .ok_or_else(|| invalid_state("GitHub durable state must be a JSON object"))?;
-    if object.keys().any(|key| {
-        ![
-            "version",
-            "pull_requests",
-            "reconciliation",
-            "task_transitions",
-        ]
-        .contains(&key.as_str())
-    }) {
-        return Err(invalid_state(
-            "GitHub durable state contains unknown fields",
-        ));
-    }
-    if object.get("version").and_then(Value::as_u64) != Some(STATE_VERSION) {
-        return Err(invalid_state("unsupported GitHub durable state version"));
-    }
-    let pull_requests = object
-        .get("pull_requests")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid_state("GitHub durable state pull_requests must be an object"))?;
-    for (session_id, links) in pull_requests {
-        if session_id.trim().is_empty() {
-            return Err(invalid_state(
-                "GitHub durable state has an empty session id",
-            ));
-        }
-        if !links.is_array() {
-            return Err(invalid_state("a session's pull requests must be a list"));
-        }
-        parse_session_links(links).map_err(invalid_state)?;
-    }
-    let reconciliation = with_null_defaults(
-        object.get("reconciliation").unwrap_or(&Value::Null),
-        RECONCILIATION_OPTIONAL_FIELDS,
-    );
-    let reconciliation = reconciliation
-        .as_object()
-        .ok_or_else(|| invalid_state("GitHub durable state reconciliation must be an object"))?;
-    require_only_keys(
-        reconciliation,
-        &[
-            "status",
-            "attempt_id",
-            "started_at",
-            "finished_at",
-            "checked",
-            "recovered_attempt_id",
-            "recovered_at",
-            "error",
-        ],
-    )?;
-    if !matches!(
-        reconciliation.get("status").and_then(Value::as_str),
-        Some("idle" | "running" | "failed")
-    ) || reconciliation
-        .get("checked")
-        .and_then(Value::as_u64)
-        .is_none()
-    {
-        return Err(invalid_state(
-            "GitHub durable state has invalid reconciliation status",
-        ));
-    }
-    for field in ["attempt_id", "recovered_attempt_id", "error"] {
-        strict_optional_string(reconciliation.get(field), field)?;
-    }
-    for field in ["started_at", "finished_at", "recovered_at"] {
-        strict_optional_timestamp(reconciliation.get(field), field)?;
-    }
-    validate_task_transitions(
-        object
-            .get("task_transitions")
-            .unwrap_or(&empty_task_transitions()),
-    )
-}
-
-#[cfg(test)]
-fn durable_state_from_settings(settings: &Value) -> Result<Value, RequestError> {
-    let settings = settings
-        .as_object()
-        .ok_or_else(|| invalid_state("plugin settings must be a JSON object"))?;
-    let state = settings
-        .get(STATE_NAMESPACE)
-        .cloned()
-        .unwrap_or_else(empty_durable_state);
-    migrate_durable_state(&state)
 }
 
 fn ensure_durable_state(
@@ -2231,74 +1863,6 @@ mod tests {
         thread.join().unwrap().unwrap();
     }
 
-    #[test]
-    fn durable_state_accepts_missing_settings_and_rejects_invalid_or_incompatible_documents() {
-        assert_eq!(
-            durable_state_from_settings(&json!({})).unwrap(),
-            empty_durable_state()
-        );
-        let explicit_v1 = json!({ "github": empty_durable_state() });
-        assert_eq!(
-            durable_state_from_settings(&explicit_v1).unwrap(),
-            empty_durable_state()
-        );
-        for settings in [
-            json!({ "github": Value::Null }),
-            json!({ "github": [] }),
-            json!({ "github": { "version": 2, "pull_requests": {}, "reconciliation": {} } }),
-            json!({ "github": { "version": 1, "pull_requests": { "s1": { "session_id": "other" } }, "reconciliation": {} } }),
-            json!({ "github": { "version": 4, "pull_requests": { "s1": { "session_id": "s1" } }, "reconciliation": empty_durable_state()["reconciliation"], "task_transitions": empty_task_transitions() } }),
-        ] {
-            assert!(
-                durable_state_from_settings(&settings).is_err(),
-                "{settings}"
-            );
-        }
-    }
-
-    fn merge_json_object(target: &mut Value, patch: &Value) {
-        let target = target.as_object_mut().unwrap();
-        for (key, value) in patch.as_object().unwrap() {
-            target.insert(key.clone(), value.clone());
-        }
-    }
-
-    #[test]
-    fn reconciliation_patches_recover_interruption_fence_attempts_and_bound_errors() {
-        let state = empty_durable_state();
-        let old = begin_reconciliation_patch(&state["reconciliation"], "old-attempt", 100).unwrap();
-        let mut running = state["reconciliation"].clone();
-        merge_json_object(&mut running, &old);
-        let new = begin_reconciliation_patch(&running, "new-attempt", 200).unwrap();
-        assert_eq!(new["recovered_attempt_id"], "old-attempt");
-        assert_eq!(new["recovered_at"], 200);
-        merge_json_object(&mut running, &new);
-        assert!(
-            finish_reconciliation_patch(&running, "old-attempt", "idle", 1, 300, None).is_err()
-        );
-
-        let idle =
-            finish_reconciliation_patch(&running, "new-attempt", "idle", 2, 300, None).unwrap();
-        assert_eq!(idle["status"], "idle");
-        assert_eq!(idle["checked"], 2);
-
-        let long_error = "x".repeat(MAX_RECONCILIATION_ERROR_CHARS + 10);
-        let failed = finish_reconciliation_patch(
-            &running,
-            "new-attempt",
-            "failed",
-            3,
-            500,
-            Some(&long_error),
-        )
-        .unwrap();
-        assert_eq!(failed["status"], "failed");
-        assert_eq!(
-            failed["error"].as_str().unwrap().chars().count(),
-            MAX_RECONCILIATION_ERROR_CHARS
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn sends_failure_logs_to_the_currently_focused_agent_through_host_callback() {
@@ -2842,51 +2406,6 @@ fi
         cli.respond(merged);
         with_host(&cli.runner, &host, reconcile).unwrap();
         assert_eq!(host.lock().unwrap().transitions.len(), 1);
-    }
-
-    #[test]
-    fn migration_accepts_state_whose_null_fields_the_host_deleted() {
-        let v3 = json!({
-            "version": V3_STATE_VERSION,
-            "reconciliation": { "checked": 0, "status": "idle" },
-            "task_transitions": {},
-            "pull_requests": { "s1": {
-                "branch": "topic", "check_summary": { "state": "passing", "updated_at": 2 }, "remote": "git@github.com:o/r.git",
-                "session_id": "s1", "state": "merged", "updated_at": 3, "url": "https://github.com/o/r/pull/317",
-            } },
-        });
-        let migrated = migrate_durable_state(&v3).unwrap();
-        assert_eq!(migrated["pull_requests"]["s1"][0]["checks"], "passing");
-        assert_eq!(migrated["pull_requests"]["s1"][0]["state"], "merged");
-        assert!(
-            reconciliation_from_settings_value(json!({ "checked": 0, "status": "idle" })).unwrap()
-                ["error"]
-                .is_null()
-        );
-    }
-
-    #[test]
-    fn migration_upgrades_every_version_to_lists_and_is_idempotent() {
-        let legacy = json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/1", "state": "open", "remote": "https://github.com/o/r.git", "branch": "topic", "updated_at": 7 });
-        let v1 = json!({ "version": LEGACY_STATE_VERSION, "pull_requests": { "s1": legacy }, "reconciliation": empty_durable_state()["reconciliation"] });
-        let migrated = migrate_durable_state(&v1).unwrap();
-        assert_eq!(migrated["version"], STATE_VERSION);
-        assert_eq!(migrated["task_transitions"], empty_task_transitions());
-        assert_eq!(migrated["pull_requests"]["s1"][0]["number"], 1);
-        assert_eq!(migrated["pull_requests"]["s1"][0]["source"], "manual");
-        assert_eq!(migrate_durable_state(&migrated).unwrap(), migrated);
-
-        let mut v2 = v1.clone();
-        v2["version"] = json!(V2_STATE_VERSION);
-        v2["task_transitions"] = json!({ "on_open": "in_review" });
-        v2["reconciliation"]["error"] = json!("keep");
-        let migrated = migrate_durable_state(&v2).unwrap();
-        assert_eq!(
-            migrated["task_transitions"],
-            json!({ "on_open": "in_review", "on_merge": null })
-        );
-        assert_eq!(migrated["reconciliation"]["error"], "keep");
-        assert_eq!(migrated["pull_requests"]["s1"].as_array().unwrap().len(), 1);
     }
 
     fn test_context(runner: CommandRunner) -> ExecutionContext {
