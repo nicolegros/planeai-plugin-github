@@ -52,10 +52,10 @@ The titlebar shows the same summary, or **Create PR** when the session has none;
 The panel lists every pull request of the task, each with its state, CI, title, repository when it differs from the session's, and source, and with **Unlink** or **Dismiss** and an open-on-GitHub action.
 Below the list, it details the highlighted pull request: its checks, merge, ready-for-review, and CI failure hand-off.
 
-One row is highlighted at a time, starting with the session's own pull request.
+One row is highlighted at a time, starting with the session's own pull request; the highlight is kept per session while the panel reloads.
 When the GitHub session panel has focus, use these shortcuts:
 
-- `↑`/`↓` or `j`/`k` move the highlight.
+- `↑`/`↓` or `j`/`k` move the highlight while the list, or none of the panel's controls, has focus.
 - `O` opens the highlighted pull request on GitHub.
 - `U` unlinks the highlighted pull request, or dismisses it when stack discovery added it.
 - `Shift+R` marks the highlighted draft ready for review.
@@ -78,6 +78,7 @@ The plugin invokes the host transition only after it has persisted the change, s
 
 The editable browser UI is TypeScript in `ui/entry.ts`, `ui/titlebar.ts`, `ui/settings.ts`, and `ui/meta.ts`, sharing `ui/pull-requests.ts` and `ui/pill.ts`.
 PlaneAI loads each entrypoint as one self-contained browser ESM file, so `make build-ui` type-checks with `tsc` and bundles each entrypoint with esbuild into `build/package/ui/*.js`, which `make package` stages at the manifest paths `ui/*.js`.
+`make test` also mounts the panel and titlebar in jsdom (`tests/ui-mount.test.ts`) to check their behavior.
 
 ```bash
 pnpm install --frozen-lockfile
