@@ -42,7 +42,7 @@ It adds `+N` for the other pull requests, or a layers glyph with the count when 
 Its mark shows the worst check result across open pull requests (failing, then pending, then passing), and its color follows the current pull request's state.
 Hovering it lists every pull request, and clicking it opens the pull-request panel.
 A row with no pull request shows no pill.
-The titlebar shows the same summary, or **Create PR** when the session has none.
+The titlebar shows the same summary, or **Create PR** when the session has none; like the pill, it reads only the cached pull requests and refreshes when the plugin's data changes.
 
 ## Panel keyboard shortcuts
 
@@ -89,7 +89,7 @@ Older documents migrate in place: version 1 and 2 gain the transition defaults, 
 A legacy mapping whose URL is not a `github.com` pull request becomes an empty list, with a log line on stderr.
 Because the host deletes keys patched to `null`, absent optional fields read as `null`.
 Malformed or unsupported documents are rejected rather than migrated implicitly.
-`github.status`, `github.create`, `github.link`, `github.unlink`, and `github.merge` update links only after their GitHub operation succeeds, and `github.summary` reads the cached links without asking GitHub.
+`github.status`, `github.create`, `github.link`, `github.unlink`, and `github.merge` update links only after their GitHub operation succeeds, and `github.summary` reads the cached links without asking GitHub; with `check_repository`, it also reports whether the session's `origin` is on github.com.
 
 The manifest declares `github.reconcile` as the host-managed background service. PlaneAI runs it on the configured `github_reconciliation_interval_ms` setting (two minutes by default), while it remains safe to call explicitly.
 It writes a unique fenced `running` attempt, refreshes every task with an active session through one batched `gh api graphql` query per discovery round (at most two), and then writes `idle` counts and timestamps or bounded `failed` error details, including cancellation.

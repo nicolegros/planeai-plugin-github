@@ -1,7 +1,8 @@
 import { PILL_STYLES, renderPill } from "./pill.js";
 import { tooltipLines, type PullRequest } from "./pull-requests.js";
 
-type GithubStatus = {
+/** `github.summary` with `check_repository`: the cached pull requests and whether origin is on github.com. */
+type GithubSummary = {
   applicable?: boolean;
   pull_requests?: PullRequest[];
 };
@@ -9,8 +10,9 @@ type GithubStatus = {
 type GithubTitlebarContext = {
   session?: { id?: string };
   host: {
-    call: (method: string, params?: Record<string, unknown>) => Promise<GithubStatus>;
+    call: (method: string, params?: Record<string, unknown>) => Promise<GithubSummary>;
     navigation: { open: (pluginId: string, contributionId: string) => void };
+    data?: { onChanged?: (listener: () => void) => () => void };
   };
 };
 
@@ -54,19 +56,22 @@ const githubTitlebarEntrypoint: GithubTitlebarEntrypoint = {
     const openPanel = () => context.host.navigation.open("github", "pull-request");
     button.addEventListener("click", openPanel);
 
+    let generation = 0;
     async function load() {
+      const current = ++generation;
       if (!sessionId) {
         setButton("GitHub", "unavailable", true, "GitHub");
         return;
       }
-      setButton("GitHub…", "loading", true, "Loading GitHub pull requests");
+      if (current === 1) setButton("GitHub…", "loading", true, "Loading GitHub pull requests");
       try {
-        const status = await context.host.call("github.status", { session_id: sessionId });
-        if (!status.applicable) {
+        const summary = await context.host.call("github.summary", { session_id: sessionId, check_repository: true });
+        if (current !== generation) return;
+        if (!summary.applicable) {
           setButton("GitHub", "unavailable", true, "GitHub is not available for this session");
           return;
         }
-        const prs = status.pull_requests ?? [];
+        const prs = summary.pull_requests ?? [];
         const pill = renderPill(prs);
         if (!pill) {
           setButton("＋ Create PR", "create", false, "Create a pull request");
@@ -74,13 +79,15 @@ const githubTitlebarEntrypoint: GithubTitlebarEntrypoint = {
         }
         setButton(pill, "pull-requests", false, ["Open pull requests", ...tooltipLines(prs).map((line) => line.text)].join("\n"));
       } catch (_error) {
-        setButton("GitHub", "unavailable", true, "GitHub status could not be loaded");
+        if (current === generation) setButton("GitHub", "unavailable", true, "GitHub status could not be loaded");
       }
     }
 
+    const unsubscribe = context.host.data?.onChanged?.(() => { void load(); }) ?? (() => {});
     void load();
     return () => {
       disposed = true;
+      unsubscribe();
       button.removeEventListener("click", openPanel);
       root.replaceChildren();
     };

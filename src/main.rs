@@ -1243,12 +1243,23 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
 }
 
 /// The cached pull requests of a session's task, without asking GitHub.
+/// With `check_repository`, it also says whether the session's origin is on github.com.
 fn summary(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
     let task = session_task_group(context, session_id)?;
     let group = &task.members;
     let lists = read_group_links(context, group)?;
-    Ok(json!({ "pull_requests": prs_json(&group_prs(&lists, group)) }))
+    let mut summary = json!({ "pull_requests": prs_json(&group_prs(&lists, group)) });
+    if params.get("check_repository").and_then(Value::as_bool) == Some(true) {
+        let repository = repository_context(params, context)?;
+        let remote = git_output(
+            context,
+            &context_path(&repository)?,
+            ["remote", "get-url", "origin"],
+        )?;
+        summary["applicable"] = json!(is_github_remote(&remote));
+    }
+    Ok(summary)
 }
 
 fn fetch_pull_request(
@@ -2185,9 +2196,10 @@ fi
             let directory = TestDirectory::new();
             fs::create_dir_all(directory.0.join("repo")).unwrap();
             fs::create_dir_all(directory.0.join("other-repo")).unwrap();
+            fs::create_dir_all(directory.0.join("gitlab-repo")).unwrap();
             let git = directory.script(
                 "git",
-                "#!/bin/sh\ncase \"$(pwd)\" in *other-repo) echo https://github.com/x/y.git ;; *) echo https://github.com/o/r.git ;; esac\n",
+                "#!/bin/sh\ncase \"$(pwd)\" in *other-repo) echo https://github.com/x/y.git ;; *gitlab-repo) echo https://gitlab.com/o/r.git ;; *) echo https://github.com/o/r.git ;; esac\n",
             );
             let root = directory.path().to_string();
             let gh = directory.script(
@@ -2729,6 +2741,36 @@ fi
             host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["state"],
             "merged"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn summary_says_whether_github_applies_only_when_asked() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "branch", "open")]), "topic");
+        host.lock().unwrap().contexts.insert(
+            "s2".to_string(),
+            cli.context("s2", "gitlab-repo", "topic", None),
+        );
+        let summary_of = |params: Value| {
+            with_host(&cli.runner, &host, |context| summary(&params, context)).unwrap()
+        };
+
+        let cached = summary_of(json!({ "session_id": "s1" }));
+        assert_eq!(numbers(&cached["pull_requests"]), vec![4]);
+        assert!(
+            cached.get("applicable").is_none(),
+            "the sidebar pill never runs git"
+        );
+        assert_eq!(
+            summary_of(json!({ "session_id": "s1", "check_repository": true }))["applicable"],
+            true
+        );
+        assert_eq!(
+            summary_of(json!({ "session_id": "s2", "check_repository": true }))["applicable"],
+            false
+        );
+        assert_eq!(cli.calls(), 0, "a summary never asks GitHub");
     }
 
     #[cfg(unix)]
