@@ -588,36 +588,24 @@ pub enum PrStateTransition {
     Merged,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TaskPhase {
-    /// Nothing tracked has opened yet (or everything was closed unmerged).
-    Inactive,
-    Open,
-    /// Every tracked pull request is merged or closed, and at least one merged.
-    Done,
-}
-
-pub fn task_phase(prs: &[AggregatedPr]) -> TaskPhase {
-    let states = prs.iter().map(|pr| pr.snapshot.state);
-    let any_merged = states.clone().any(|state| state == PrState::Merged);
-    if any_merged && states.clone().all(|state| !state.is_live()) {
-        TaskPhase::Done
-    } else if states
-        .into_iter()
-        .any(|state| matches!(state, PrState::Open | PrState::Merged))
-    {
-        TaskPhase::Open
-    } else {
-        TaskPhase::Inactive
+/// The task transition that a change of the task's pull requests causes.
+/// Only a pull request tracked on both sides that became merged counts as a merge, so removing
+/// links never does; an open pull request counts only when the task had none.
+pub fn task_transition(
+    before: &[AggregatedPr],
+    after: &[AggregatedPr],
+) -> Option<PrStateTransition> {
+    let newly_merged = after.iter().any(|pr| {
+        pr.snapshot.state == PrState::Merged
+            && before
+                .iter()
+                .any(|old| old.key == pr.key && old.snapshot.state != PrState::Merged)
+    });
+    if newly_merged && after.iter().all(|pr| !pr.snapshot.state.is_live()) {
+        return Some(PrStateTransition::Merged);
     }
-}
-
-pub fn task_transition(before: TaskPhase, after: TaskPhase) -> Option<PrStateTransition> {
-    match (before, after) {
-        (TaskPhase::Inactive, TaskPhase::Open) => Some(PrStateTransition::Opened),
-        (TaskPhase::Open, TaskPhase::Done) => Some(PrStateTransition::Merged),
-        _ => None,
-    }
+    let has_open = |prs: &[AggregatedPr]| prs.iter().any(|pr| pr.snapshot.state == PrState::Open);
+    (has_open(after) && !has_open(before)).then_some(PrStateTransition::Opened)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1030,12 +1018,10 @@ mod tests {
         assert_eq!(parsed[1].task_key, None);
     }
 
-    fn aggregated(states: &[PrState]) -> Vec<AggregatedPr> {
-        states
-            .iter()
-            .enumerate()
-            .map(|(index, state)| AggregatedPr {
-                key: key(index as u64 + 1),
+    fn aggregated(prs: &[(u64, PrState)]) -> Vec<AggregatedPr> {
+        prs.iter()
+            .map(|(number, state)| AggregatedPr {
+                key: key(*number),
                 url: String::new(),
                 source: TrackedSource::Manual,
                 snapshot: snapshot(*state, 1),
@@ -1044,29 +1030,59 @@ mod tests {
     }
 
     #[test]
-    fn task_phase_is_done_only_when_every_pr_is_merged_or_closed_and_one_merged() {
+    fn a_merge_transition_needs_a_tracked_pull_request_to_merge_and_nothing_left_open() {
         use PrState::*;
-        assert_eq!(task_phase(&aggregated(&[])), TaskPhase::Inactive);
-        assert_eq!(task_phase(&aggregated(&[Draft])), TaskPhase::Inactive);
-        assert_eq!(task_phase(&aggregated(&[Closed])), TaskPhase::Inactive);
-        assert_eq!(task_phase(&aggregated(&[Open, Draft])), TaskPhase::Open);
-        assert_eq!(task_phase(&aggregated(&[Merged, Open])), TaskPhase::Open);
-        assert_eq!(task_phase(&aggregated(&[Merged, Draft])), TaskPhase::Open);
-        assert_eq!(task_phase(&aggregated(&[Merged, Closed])), TaskPhase::Done);
-        assert_eq!(task_phase(&aggregated(&[Merged])), TaskPhase::Done);
+        let transition = |before: &[(u64, PrState)], after: &[(u64, PrState)]| {
+            task_transition(&aggregated(before), &aggregated(after))
+        };
+        let merged = Some(PrStateTransition::Merged);
+        assert_eq!(transition(&[(1, Open)], &[(1, Merged)]), merged);
+        assert_eq!(
+            transition(&[(1, Draft), (2, Closed)], &[(1, Merged), (2, Closed)]),
+            merged
+        );
+        assert_eq!(
+            transition(&[(1, Open), (2, Open)], &[(1, Merged), (2, Open)]),
+            None
+        );
+        assert_eq!(
+            transition(&[(1, Merged)], &[(1, Merged)]),
+            None,
+            "an unchanged merge never repeats"
+        );
+        assert_eq!(
+            transition(&[(1, Open), (2, Merged)], &[(2, Merged)]),
+            None,
+            "removing the open pull request is not a merge"
+        );
+        assert_eq!(
+            transition(&[], &[(3, Merged)]),
+            None,
+            "linking a merged pull request is not a merge"
+        );
+        assert_eq!(transition(&[(1, Open)], &[(1, Closed)]), None);
     }
 
     #[test]
-    fn task_transitions_fire_once_per_real_phase_change() {
-        use TaskPhase::*;
+    fn an_open_transition_needs_an_open_pull_request_where_there_was_none() {
+        use PrState::*;
+        let transition = |before: &[(u64, PrState)], after: &[(u64, PrState)]| {
+            task_transition(&aggregated(before), &aggregated(after))
+        };
+        let opened = Some(PrStateTransition::Opened);
+        assert_eq!(transition(&[], &[(1, Open)]), opened);
         assert_eq!(
-            task_transition(Inactive, Open),
-            Some(PrStateTransition::Opened)
+            transition(&[(1, Draft)], &[(1, Open)]),
+            opened,
+            "a draft is not open yet"
         );
-        assert_eq!(task_transition(Open, Open), None);
-        assert_eq!(task_transition(Open, Done), Some(PrStateTransition::Merged));
-        assert_eq!(task_transition(Done, Done), None);
-        assert_eq!(task_transition(Inactive, Done), None);
-        assert_eq!(task_transition(Done, Open), None);
+        assert_eq!(
+            transition(&[(1, Merged)], &[(1, Merged), (2, Open)]),
+            opened,
+            "a newly linked open pull request counts"
+        );
+        assert_eq!(transition(&[], &[(1, Draft)]), None);
+        assert_eq!(transition(&[(1, Open)], &[(1, Open), (2, Open)]), None);
+        assert_eq!(transition(&[(1, Open)], &[(1, Open)]), None);
     }
 }

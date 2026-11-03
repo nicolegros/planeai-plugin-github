@@ -12,7 +12,7 @@ use durable_state::{
 use github_graphql::{project_detail, FetchedPr, GraphqlResponse, Lookup, LookupRequest};
 use pull_requests::{
     aggregate, dismiss, own_link, parse_session_links, parse_sessions, record_created,
-    record_manual, refresh_snapshot, session_links_value, task_group, task_phase, task_transition,
+    record_manual, refresh_snapshot, session_links_value, task_group, task_transition,
     AggregatedPr, PrKey, PrSnapshot, PrState, PrStateTransition, PullRequestLink, SessionInfo,
 };
 use refresh::{BranchTarget, Plan, SessionLinks};
@@ -1020,7 +1020,7 @@ fn update_group_links(
             )?;
         }
         let prs = group_prs(&after, group);
-        let transition = task_transition(task_phase(&group_prs(&before, group)), task_phase(&prs));
+        let transition = task_transition(&group_prs(&before, group), &prs);
         (
             GroupUpdate {
                 lists: after,
@@ -2315,6 +2315,84 @@ fi
             json!({ "host": "github.com", "repository": "o/r", "number": 9, "url": "https://github.com/o/r/pull/9", "source": "stack-dismissed" })
         );
         assert_eq!(cli.calls(), 1, "unlinking never asks GitHub");
+    }
+
+    fn stored_link(number: u64, source: &str, state: &str) -> Value {
+        json!({
+            "host": "github.com", "repository": "o/r", "number": number, "url": format!("https://github.com/o/r/pull/{number}"),
+            "source": source, "state": state, "refreshed_at": 1,
+        })
+    }
+
+    fn merge_transition_host(
+        cli: &FakeGithubCli,
+        links: Value,
+        branch: &str,
+    ) -> Arc<Mutex<FakeHost>> {
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["task_transitions"]["on_merge"] = json!("done");
+        settings["github"]["pull_requests"] = json!({ "s1": links });
+        Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [{ "id": "s1", "project_id": "p", "task_key": "T-1", "status": "active" }] }),
+            contexts: HashMap::from([(
+                "s1".to_string(),
+                cli.context("s1", "repo", branch, Some("T-1")),
+            )]),
+            transitions: Vec::new(),
+        }))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlinking_the_last_open_pull_request_does_not_count_as_a_merge() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(
+            &cli,
+            json!([
+                stored_link(4, "manual", "open"),
+                stored_link(5, "manual", "merged")
+            ]),
+            "topic",
+        );
+        with_host(&cli.runner, &host, |context| {
+            unlink_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4" }),
+                context,
+            )
+        })
+        .unwrap();
+        assert!(host.lock().unwrap().transitions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_branch_that_no_longer_resolves_to_its_open_pull_request_does_not_count_as_a_merge() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(
+            &cli,
+            json!([
+                stored_link(4, "branch", "open"),
+                stored_link(5, "manual", "merged")
+            ]),
+            "other",
+        );
+        cli.respond(json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "OPEN", "topic", "main", ""),
+            "l1": graphql_pr("o/r", 5, "MERGED", "done", "main", ""),
+            "l2": { "nodes": [] },
+        } } }));
+        let result = with_host(&cli.runner, &host, |context| {
+            status(&json!({ "session_id": "s1" }), context)
+        })
+        .unwrap();
+        assert_eq!(
+            numbers(&result["pull_requests"]),
+            vec![5],
+            "the branch link followed the branch away"
+        );
+        assert!(host.lock().unwrap().transitions.is_empty());
     }
 
     #[cfg(unix)]
