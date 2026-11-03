@@ -1401,14 +1401,55 @@ fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Val
     Ok(json!({ "url": url }))
 }
 
-/// The pull request an action targets: the URL the panel sent, else the session branch's.
-fn target_reference(params: &Value, branch: &str) -> String {
-    params
-        .get("url")
-        .and_then(Value::as_str)
-        .filter(|url| PrKey::from_url(url).is_some())
-        .unwrap_or(branch)
-        .to_string()
+/// The pull request an action targets.
+enum ActionTarget {
+    PullRequest {
+        key: PrKey,
+        url: String,
+    },
+    /// Whatever the session branch resolves to on GitHub.
+    Branch(String),
+}
+
+impl ActionTarget {
+    /// What `gh pr` commands accept to name the target.
+    fn reference(&self) -> &str {
+        match self {
+            Self::PullRequest { url, .. } => url,
+            Self::Branch(branch) => branch,
+        }
+    }
+}
+
+/// The URL the panel sent, which must be a pull request; else the session's own pull request;
+/// else the session branch's.
+fn action_target(
+    params: &Value,
+    context: &ExecutionContext,
+    session: &GithubSession,
+) -> Result<ActionTarget, RequestError> {
+    if params.get("url").is_some_and(|url| !url.is_null()) {
+        let key = pull_request_key(params)?;
+        let url = required_string(params, "url")?.trim().to_string();
+        return Ok(ActionTarget::PullRequest { key, url });
+    }
+    let session_id = required_string(params, "session_id")?;
+    let links = read_group_links(context, &[session_id.to_string()])?;
+    Ok(match own_link(&links[session_id], &session.repository) {
+        Some(link) => ActionTarget::PullRequest {
+            key: link.key.clone(),
+            url: link.url.clone(),
+        },
+        None => ActionTarget::Branch(session.branch.clone()),
+    })
+}
+
+fn required_github_session(
+    params: &Value,
+    context: &ExecutionContext,
+) -> Result<GithubSession, RequestError> {
+    github_session(params, context)?
+        .ok_or_else(|| invalid_state("The origin remote is not github.com."))
 }
 
 fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
@@ -1427,26 +1468,21 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
             ))
         }
     };
-    let session = github_session(params, context)?
-        .ok_or_else(|| invalid_state("The origin remote is not github.com."))?;
+    let session = required_github_session(params, context)?;
     let cwd = session.cwd.as_str();
     // The repository's merge methods come with the pull request's detail lookup.
-    let request = match params
-        .get("url")
-        .and_then(Value::as_str)
-        .and_then(PrKey::from_url)
-    {
-        Some(key) => LookupRequest::new(
+    let request = match action_target(params, context, &session)? {
+        ActionTarget::PullRequest { key, .. } => LookupRequest::new(
             &key.repository,
             Lookup::Number {
                 number: key.number,
                 detail: true,
             },
         ),
-        None => LookupRequest::new(
+        ActionTarget::Branch(branch) => LookupRequest::new(
             &session.repository,
             Lookup::Head {
-                branch: session.branch.clone(),
+                branch,
                 detail: true,
             },
         ),
@@ -1499,38 +1535,27 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
 }
 
 fn mark_ready(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let repository = repository_context(params, context)?;
-    let cwd = context_path(&repository)?;
-    let branch = context_string(&repository, "branch")?;
-    gh_output(
-        context,
-        &cwd,
-        ["pr", "ready", &target_reference(params, &branch)],
-    )?;
+    let session = required_github_session(params, context)?;
+    let target = action_target(params, context, &session)?;
+    gh_output(context, &session.cwd, ["pr", "ready", target.reference()])?;
     Ok(json!({ "ready": true }))
 }
 
 fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<String, RequestError> {
-    let session_id = required_string(params, "session_id")?;
-    let session = github_session(params, context)?
-        .ok_or_else(|| invalid_state("The origin remote is not github.com."))?;
+    let session = required_github_session(params, context)?;
     let GithubSession {
         cwd,
         repository,
         branch,
         ..
     } = &session;
-    let reference = match params.get("url").and_then(Value::as_str) {
-        Some(_) => target_reference(params, branch),
-        None => {
-            let links = read_group_links(context, &[session_id.to_string()])?;
-            own_link(&links[session_id], repository)
-                .map(|link| link.url.clone())
-                .unwrap_or_else(|| branch.clone())
-        }
-    };
+    let action = action_target(params, context, &session)?;
+    let reference = action.reference().to_string();
     // A linked pull request can live in another repository than the session's checkout.
-    let target = PrKey::from_url(&reference);
+    let target = match action {
+        ActionTarget::PullRequest { key, .. } => Some(key),
+        ActionTarget::Branch(_) => None,
+    };
     let run_repository = target.as_ref().map_or(repository, |key| &key.repository);
     let raw = gh_output(
         context,
@@ -2826,6 +2851,26 @@ fi
         assert_eq!(
             host.lock().unwrap().transitions,
             vec![("s1".to_string(), "done".to_string())]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actions_target_the_url_else_the_sessions_own_pull_request_and_reject_bad_urls() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "draft")]), "topic");
+        let ready =
+            |params: Value| with_host(&cli.runner, &host, |context| mark_ready(&params, context));
+        assert!(
+            ready(json!({ "session_id": "s1", "url": "https://example.com/o/r/pull/4" })).is_err()
+        );
+        ready(json!({ "session_id": "s1" })).unwrap();
+        ready(json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/9" })).unwrap();
+        let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
+        assert_eq!(
+            args,
+            "pr\nready\nhttps://github.com/o/r/pull/4\npr\nready\nhttps://github.com/o/r/pull/9\n",
+            "the session's own pull request, not its branch, when no url is given"
         );
     }
 
