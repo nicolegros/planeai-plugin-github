@@ -5,13 +5,13 @@ use serde_json::{json, Map, Value};
 
 pub const STATE_NAMESPACE: &str = "github";
 pub const STATE_VERSION: u64 = 4;
-pub const LEGACY_STATE_VERSION: u64 = 1;
-pub const V2_STATE_VERSION: u64 = 2;
-pub const V3_STATE_VERSION: u64 = 3;
-pub const MAX_RECONCILIATION_ERROR_CHARS: usize = 500;
-pub const TASK_STATUSES: &[&str] = &["todo", "in_progress", "in_review", "done"];
-pub const TASK_TRANSITION_FIELDS: &[&str] = &["on_open", "on_merge"];
-pub const RECONCILIATION_OPTIONAL_FIELDS: &[&str] = &[
+const LEGACY_STATE_VERSION: u64 = 1;
+const V2_STATE_VERSION: u64 = 2;
+const V3_STATE_VERSION: u64 = 3;
+const MAX_RECONCILIATION_ERROR_CHARS: usize = 500;
+const TASK_STATUSES: &[&str] = &["todo", "in_progress", "in_review", "done"];
+const TASK_TRANSITION_FIELDS: &[&str] = &["on_open", "on_merge"];
+const RECONCILIATION_OPTIONAL_FIELDS: &[&str] = &[
     "attempt_id",
     "started_at",
     "finished_at",
@@ -26,7 +26,7 @@ const STATE_FIELDS: &[&str] = &[
     "task_transitions",
 ];
 
-pub fn empty_task_transitions() -> Value {
+fn empty_task_transitions() -> Value {
     json!({ "on_open": Value::Null, "on_merge": Value::Null })
 }
 
@@ -75,7 +75,7 @@ fn strict_optional_timestamp(value: Option<&Value>, field: &str) -> Result<(), S
 }
 
 /// The host's settings patch deletes keys patched to null, so absent optional fields read as null.
-pub fn with_null_defaults(value: &Value, fields: &[&str]) -> Value {
+fn with_null_defaults(value: &Value, fields: &[&str]) -> Value {
     let mut value = value.clone();
     if let Some(object) = value.as_object_mut() {
         for field in fields {
@@ -85,7 +85,8 @@ pub fn with_null_defaults(value: &Value, fields: &[&str]) -> Value {
     value
 }
 
-pub fn validate_task_transitions(value: &Value) -> Result<(), String> {
+/// Checks the task transitions and returns them with absent fields as null.
+pub fn validate_task_transitions(value: &Value) -> Result<Value, String> {
     let value = with_null_defaults(value, TASK_TRANSITION_FIELDS);
     let transitions = value
         .as_object()
@@ -102,7 +103,7 @@ pub fn validate_task_transitions(value: &Value) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    Ok(value)
 }
 
 fn add_empty_check_summaries(state: &mut Value) -> Result<(), String> {
@@ -270,7 +271,7 @@ pub fn migrate_durable_state(state: &Value) -> Result<Value, String> {
     Ok(migrated)
 }
 
-pub fn validate_durable_state(state: &Value) -> Result<(), String> {
+fn validate_durable_state(state: &Value) -> Result<(), String> {
     let object = state
         .as_object()
         .ok_or("GitHub durable state must be a JSON object")?;
@@ -303,19 +304,11 @@ pub fn validate_durable_state(state: &Value) -> Result<(), String> {
     let reconciliation = reconciliation
         .as_object()
         .ok_or("GitHub durable state reconciliation must be an object")?;
-    require_only_keys(
-        reconciliation,
-        &[
-            "status",
-            "attempt_id",
-            "started_at",
-            "finished_at",
-            "checked",
-            "recovered_attempt_id",
-            "recovered_at",
-            "error",
-        ],
-    )?;
+    let fields: Vec<&str> = ["status", "checked"]
+        .into_iter()
+        .chain(RECONCILIATION_OPTIONAL_FIELDS.iter().copied())
+        .collect();
+    require_only_keys(reconciliation, &fields)?;
     if !matches!(
         reconciliation.get("status").and_then(Value::as_str),
         Some("idle" | "running" | "failed")
@@ -336,7 +329,8 @@ pub fn validate_durable_state(state: &Value) -> Result<(), String> {
         object
             .get("task_transitions")
             .unwrap_or(&empty_task_transitions()),
-    )
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -360,9 +354,9 @@ mod tests {
             durable_state_from_settings(&json!({})).unwrap(),
             empty_durable_state()
         );
-        let explicit_v1 = json!({ "github": empty_durable_state() });
+        let explicit_current = json!({ "github": empty_durable_state() });
         assert_eq!(
-            durable_state_from_settings(&explicit_v1).unwrap(),
+            durable_state_from_settings(&explicit_current).unwrap(),
             empty_durable_state()
         );
         for settings in [

@@ -6,8 +6,7 @@ mod refresh;
 use durable_state::{
     begin_reconciliation_patch, empty_durable_state, finish_reconciliation_patch,
     migrate_durable_state, reconciliation_from_settings_value, validate_task_transitions,
-    with_null_defaults, LEGACY_STATE_VERSION, STATE_NAMESPACE, STATE_VERSION,
-    TASK_TRANSITION_FIELDS, V2_STATE_VERSION, V3_STATE_VERSION,
+    STATE_NAMESPACE, STATE_VERSION,
 };
 use github_graphql::{project_detail, FetchedPr, GraphqlResponse, Lookup, LookupRequest};
 use pull_requests::{
@@ -825,12 +824,9 @@ fn read_task_transitions(
         json!({ "path": [STATE_NAMESPACE, "task_transitions"] }),
         allow_cancelled,
     )?;
-    let transitions = with_null_defaults(
+    Ok(validate_task_transitions(
         &settings_value_from_host_response(&response)?,
-        TASK_TRANSITION_FIELDS,
-    );
-    validate_task_transitions(&transitions)?;
-    Ok(transitions)
+    )?)
 }
 
 fn github_settings(context: &ExecutionContext) -> Result<Value, RequestError> {
@@ -893,7 +889,8 @@ fn ensure_durable_state(
             Ok(())
         }
         Some(STATE_VERSION) => Ok(()),
-        Some(version @ (LEGACY_STATE_VERSION | V2_STATE_VERSION | V3_STATE_VERSION)) => {
+        // migrate_durable_state knows which older versions it can upgrade.
+        Some(version) => {
             let response = host_call_with_cancellation(
                 context,
                 &format!("github-settings-v{version}"),
@@ -917,7 +914,7 @@ fn ensure_durable_state(
                 ))
             }
         }
-        _ => Err(invalid_state("unsupported GitHub durable state version")),
+        None => Err(invalid_state("unsupported GitHub durable state version")),
     }
 }
 
@@ -2292,7 +2289,7 @@ fi
     fn status_migrates_legacy_mappings_unions_the_task_and_transitions_once() {
         let cli = FakeGithubCli::new();
         let mut settings = json!({ "github": empty_durable_state() });
-        settings["github"]["version"] = json!(V3_STATE_VERSION);
+        settings["github"]["version"] = json!(3);
         settings["github"]["task_transitions"]["on_open"] = json!("in_review");
         settings["github"]["pull_requests"] = json!({
             "s1": { "session_id": "s1", "url": "https://github.com/o/r/pull/3", "state": "draft", "remote": "https://github.com/o/r.git", "branch": "topic", "updated_at": 1, "check_summary": null },
@@ -2661,7 +2658,7 @@ fi
     #[test]
     fn migration_waits_for_pull_request_writes_in_flight() {
         let mut settings = json!({ "github": empty_durable_state() });
-        settings["github"]["version"] = json!(V3_STATE_VERSION);
+        settings["github"]["version"] = json!(3);
         let host = Arc::new(Mutex::new(FakeHost {
             settings,
             sessions: json!({ "sessions": [] }),
@@ -2685,7 +2682,7 @@ fi
         thread::sleep(Duration::from_millis(100));
         assert_eq!(
             host.lock().unwrap().settings["github"]["version"],
-            V3_STATE_VERSION,
+            3,
             "rewriting the namespace now would undo the write in flight"
         );
         drop(write_in_flight);
