@@ -882,10 +882,17 @@ fn read_state_version(
 }
 
 /// Initializes or migrates the namespace unless it is current.
+/// Never call it while holding the pull request lock, which it takes to rewrite the namespace.
 fn ensure_durable_state(
     context: &ExecutionContext,
     allow_cancelled: bool,
 ) -> Result<(), RequestError> {
+    if read_state_version(context, allow_cancelled)?.as_u64() == Some(STATE_VERSION) {
+        return Ok(());
+    }
+    // Rewriting the whole namespace would undo a concurrent links write, so it takes that lock
+    // and checks again in case another request migrated meanwhile.
+    let _persistence = lock_pull_requests(context)?;
     let version = read_state_version(context, allow_cancelled)?;
     match version.as_u64() {
         None if version.is_null() => {
@@ -2621,6 +2628,45 @@ fi
         .unwrap();
         let reads = count("host.settings.get");
         assert_eq!(reads, 2, "the version once, then every link at once");
+    }
+
+    #[test]
+    fn migration_waits_for_pull_request_writes_in_flight() {
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["version"] = json!(V3_STATE_VERSION);
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [] }),
+            contexts: HashMap::new(),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+        let (events, events_rx) = mpsc::channel();
+        let server = serve_host(events_rx, Arc::clone(&host));
+        let mut context = test_context(CommandRunner::default());
+        context.events = events;
+        let pull_requests = Arc::clone(&context.durable_state_locks.pull_requests);
+        let write_in_flight = pull_requests.lock().unwrap();
+        let migration = thread::spawn(move || ensure_durable_state(&context, false));
+
+        let deadline = Instant::now() + TEST_WAIT;
+        while host.lock().unwrap().calls.is_empty() {
+            assert!(Instant::now() < deadline, "the migration never started");
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["version"],
+            V3_STATE_VERSION,
+            "rewriting the namespace now would undo the write in flight"
+        );
+        drop(write_in_flight);
+        migration.join().unwrap().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["version"],
+            STATE_VERSION
+        );
     }
 
     #[cfg(unix)]
