@@ -21,11 +21,26 @@ test("manifest uses PlaneAI PluginBackgroundService schema and documented capabi
   assert.ok(manifest.capabilities.includes("tasks.read"));
 });
 
-test("manifest exposes the visual-only cached PR-check indicator", () => {
+test("manifest declares host API v5 and the session.meta pull-request pill", () => {
+  assert.equal(manifest.host_api_version, "planeai.plugin-host.v5");
   assert.deepEqual(
-    manifest.ui_contributions.find((contribution) => contribution.id === "pr-check-indicator"),
-    { id: "pr-check-indicator", label: "GitHub CI", placement: "session.indicator", entrypoint: "ui/indicator.js" },
+    manifest.ui_contributions.find((contribution) => contribution.placement === "session.meta"),
+    { id: "pull-request-meta", label: "Pull requests", placement: "session.meta", entrypoint: "ui/meta.js" },
   );
+  assert.equal(manifest.ui_contributions.filter((contribution) => contribution.placement === "session.meta").length, 1);
+  assert.ok(!manifest.ui_contributions.some((contribution) => contribution.placement === "session.indicator"), "the pill replaces the CI indicator");
+  const panels = manifest.ui_contributions.filter((contribution) => contribution.placement === "session.panel");
+  assert.equal(panels[0]?.id, "pull-request", "clicking the pill opens the first session panel");
+  assert.equal(panels[0]?.label, "Pull requests", "the panel titles every pull request of the task");
+  assert.ok(manifest.capabilities.includes("sessions.read"), "task siblings come from the session list");
+});
+
+test("manifest UI contributions have unique ids and bundled entrypoints", () => {
+  const ids = manifest.ui_contributions.map((contribution) => contribution.id);
+  assert.equal(new Set(ids).size, ids.length);
+  for (const contribution of manifest.ui_contributions) {
+    assert.ok(fs.existsSync(new URL(`../${contribution.entrypoint.replace(/\.js$/, ".ts")}`, import.meta.url)), contribution.entrypoint);
+  }
 });
 
 test("manifest exposes the GitHub transition preferences UI", () => {

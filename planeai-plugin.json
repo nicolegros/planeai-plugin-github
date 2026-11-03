@@ -3,7 +3,7 @@
   "id": "github",
   "name": "GitHub",
   "version": "0.0.0",
-  "host_api_version": "planeai.plugin-host.v2",
+  "host_api_version": "planeai.plugin-host.v5",
   "source_kind": "local",
   "backend_entrypoints": {
     "macos-arm64": "bin/macos-arm64/planeai-plugin-github",
@@ -27,7 +27,7 @@
   "ui_contributions": [
     {
       "id": "pull-request",
-      "label": "Pull Request",
+      "label": "Pull requests",
       "placement": "session.panel",
       "entrypoint": "ui/entry.js",
       "shortcut": "Mod+Shift+P"
@@ -45,10 +45,10 @@
       "entrypoint": "ui/titlebar.js"
     },
     {
-      "id": "pr-check-indicator",
-      "label": "GitHub CI",
-      "placement": "session.indicator",
-      "entrypoint": "ui/indicator.js"
+      "id": "pull-request-meta",
+      "label": "Pull requests",
+      "placement": "session.meta",
+      "entrypoint": "ui/meta.js"
     }
   ]
 }

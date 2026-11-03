@@ -1,12 +1,31 @@
-use serde_json::{json, Value};
-use std::collections::HashMap;
+mod durable_state;
+mod github_graphql;
+mod pull_requests;
+mod refresh;
+
+use durable_state::{
+    begin_reconciliation_patch, empty_durable_state, finish_reconciliation_patch,
+    migrate_durable_state, reconciliation_from_settings_value, validate_task_transitions,
+    STATE_NAMESPACE, STATE_VERSION,
+};
+use github_graphql::{
+    project_detail, CheckResult, FetchedPr, GraphqlResponse, Lookup, LookupRequest,
+};
+use pull_requests::{
+    aggregate, dismiss, own_link, parse_session_links, parse_sessions, record_created,
+    record_manual, refresh_snapshot, session_links_value, task_group, task_transition,
+    AggregatedPr, PrKey, PrSnapshot, PrState, PrStateTransition, PullRequestLink, SessionInfo,
+};
+use refresh::{BranchTarget, Plan, SessionLinks};
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, RecvTimeoutError, Sender},
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,16 +33,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const PLUGIN_ID: &str = "github";
 const PLUGIN_NAME: &str = "GitHub";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
-const HOST_API_VERSION: &str = "planeai.plugin-host.v2";
+const HOST_API_VERSION: &str = "planeai.plugin-host.v5";
 const CANCELLATION_ERROR_CODE: i64 = -32800;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const STATE_NAMESPACE: &str = "github";
-const STATE_VERSION: u64 = 3;
-const LEGACY_STATE_VERSION: u64 = 1;
-const V2_STATE_VERSION: u64 = 2;
-const MAX_RECONCILIATION_ERROR_CHARS: usize = 500;
-const TASK_STATUSES: &[&str] = &["todo", "in_progress", "in_review", "done"];
+/// Lookup rounds per refresh: each round reaches one more pull request along a stack.
+const STATUS_REFRESH_ROUNDS: usize = 3;
+const RECONCILE_REFRESH_ROUNDS: usize = 2;
 
 #[derive(Clone)]
 struct CommandRunner {
@@ -333,12 +349,13 @@ fn dispatch(
         "plugin.handshake" => handshake(&params).map_err(Into::into),
         "plugin.shutdown" => Ok(json!({ "stopping": true })),
         "github.status" => status(&params, context),
-        "github.indicator" => indicator(&params, context),
+        "github.summary" => summary(&params, context),
         "github.defaults" => defaults(&params, context),
         "github.settings" => github_settings(context),
         "github.settings.update" => update_github_settings(&params, context),
         "github.create" => create_pull_request(&params, context),
         "github.link" => link_pull_request(&params, context),
+        "github.unlink" => unlink_pull_request(&params, context),
         "github.merge" => merge_pull_request(&params, context),
         "github.markReady" => mark_ready(&params, context),
         "github.failureLogs" => failure_logs(&params, context),
@@ -368,351 +385,6 @@ fn unix_timestamp_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
-}
-
-fn empty_task_transitions() -> Value {
-    json!({ "on_open": Value::Null, "on_merge": Value::Null })
-}
-
-fn empty_durable_state() -> Value {
-    json!({
-        "version": STATE_VERSION,
-        "pull_requests": {},
-        "reconciliation": {
-            "status": "idle",
-            "attempt_id": Value::Null,
-            "started_at": Value::Null,
-            "finished_at": Value::Null,
-            "checked": 0,
-            "recovered_attempt_id": Value::Null,
-            "recovered_at": Value::Null,
-            "error": Value::Null,
-        },
-        "task_transitions": empty_task_transitions(),
-    })
-}
-
-fn require_only_keys(
-    object: &serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> Result<(), RequestError> {
-    if object.keys().any(|key| !keys.contains(&key.as_str())) {
-        return Err(RequestError::Message(
-            "GitHub durable state contains unknown fields".to_string(),
-        ));
-    }
-    if keys.iter().any(|key| !object.contains_key(*key)) {
-        return Err(RequestError::Message(
-            "GitHub durable state is missing required fields".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn strict_string(value: Option<&Value>, field: &str) -> Result<String, RequestError> {
-    value
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| RequestError::Message(format!("GitHub durable state has invalid {field}")))
-}
-
-fn strict_optional_string(value: Option<&Value>, field: &str) -> Result<(), RequestError> {
-    match value {
-        Some(Value::Null) => Ok(()),
-        Some(Value::String(value)) if !value.trim().is_empty() => Ok(()),
-        _ => Err(RequestError::Message(format!(
-            "GitHub durable state has invalid {field}"
-        ))),
-    }
-}
-
-fn strict_optional_timestamp(value: Option<&Value>, field: &str) -> Result<(), RequestError> {
-    match value {
-        Some(Value::Null) => Ok(()),
-        Some(Value::Number(number)) if number.as_u64().is_some() => Ok(()),
-        _ => Err(RequestError::Message(format!(
-            "GitHub durable state has invalid {field}"
-        ))),
-    }
-}
-
-fn validate_check_summary(value: &Value) -> Result<(), RequestError> {
-    match value {
-        Value::Null => Ok(()),
-        Value::Object(summary) => {
-            require_only_keys(summary, &["state", "updated_at"])?;
-            if !matches!(
-                summary.get("state").and_then(Value::as_str),
-                Some("passing" | "failing" | "pending")
-            ) || summary.get("updated_at").and_then(Value::as_u64).is_none()
-            {
-                return Err(RequestError::Message(
-                    "GitHub durable state has an invalid check summary".to_string(),
-                ));
-            }
-            Ok(())
-        }
-        _ => Err(RequestError::Message(
-            "GitHub durable state has an invalid check summary".to_string(),
-        )),
-    }
-}
-
-fn validate_task_transitions(value: &Value) -> Result<(), RequestError> {
-    let transitions = value.as_object().ok_or_else(|| {
-        RequestError::Message("GitHub durable state task_transitions must be an object".to_string())
-    })?;
-    require_only_keys(transitions, &["on_open", "on_merge"])?;
-    for field in ["on_open", "on_merge"] {
-        match transitions.get(field) {
-            Some(Value::Null) => {}
-            Some(Value::String(status)) if TASK_STATUSES.contains(&status.as_str()) => {}
-            _ => {
-                return Err(RequestError::Message(format!(
-                    "GitHub durable state has invalid {field} transition"
-                )))
-            }
-        }
-    }
-    Ok(())
-}
-
-fn add_empty_check_summaries(state: &mut Value) -> Result<(), RequestError> {
-    let mappings = state
-        .get_mut("pull_requests")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| {
-            RequestError::Message(
-                "GitHub durable state pull_requests must be an object".to_string(),
-            )
-        })?;
-    for mapping in mappings.values_mut() {
-        let mapping = mapping.as_object_mut().ok_or_else(|| {
-            RequestError::Message("GitHub durable state pull request must be an object".to_string())
-        })?;
-        mapping
-            .entry("check_summary".to_string())
-            .or_insert(Value::Null);
-    }
-    Ok(())
-}
-
-fn migrate_v1_durable_state(state: &Value) -> Result<Value, RequestError> {
-    let mut migrated = state.clone();
-    let object = migrated.as_object_mut().ok_or_else(|| {
-        RequestError::Message("GitHub durable state must be a JSON object".to_string())
-    })?;
-    require_only_keys(object, &["version", "pull_requests", "reconciliation"])?;
-    if object.get("version").and_then(Value::as_u64) != Some(LEGACY_STATE_VERSION) {
-        return Err(RequestError::Message(
-            "unsupported GitHub durable state version".to_string(),
-        ));
-    }
-    object.insert("version".to_string(), json!(STATE_VERSION));
-    object.insert("task_transitions".to_string(), empty_task_transitions());
-    add_empty_check_summaries(&mut migrated)?;
-    validate_durable_state(&migrated)?;
-    Ok(migrated)
-}
-
-fn normalize_task_transitions(state: &mut Value) -> Result<(), RequestError> {
-    let object = state.as_object_mut().ok_or_else(|| {
-        RequestError::Message("GitHub durable state must be a JSON object".to_string())
-    })?;
-    let transitions = object
-        .entry("task_transitions".to_string())
-        .or_insert_with(empty_task_transitions)
-        .as_object_mut()
-        .ok_or_else(|| {
-            RequestError::Message(
-                "GitHub durable state task_transitions must be an object".to_string(),
-            )
-        })?;
-    if transitions
-        .keys()
-        .any(|key| !["on_open", "on_merge"].contains(&key.as_str()))
-    {
-        return Err(RequestError::Message(
-            "GitHub durable state contains unknown fields".to_string(),
-        ));
-    }
-    for key in ["on_open", "on_merge"] {
-        transitions.entry(key.to_string()).or_insert(Value::Null);
-    }
-    Ok(())
-}
-
-fn migrate_v2_durable_state(state: &Value) -> Result<Value, RequestError> {
-    let mut migrated = state.clone();
-    let object = migrated.as_object_mut().ok_or_else(|| {
-        RequestError::Message("GitHub durable state must be a JSON object".to_string())
-    })?;
-    if object.keys().any(|key| {
-        ![
-            "version",
-            "pull_requests",
-            "reconciliation",
-            "task_transitions",
-        ]
-        .contains(&key.as_str())
-    }) || object.get("version").and_then(Value::as_u64) != Some(V2_STATE_VERSION)
-        || !object.contains_key("pull_requests")
-        || !object.contains_key("reconciliation")
-    {
-        return Err(RequestError::Message(
-            "unsupported GitHub durable state version".to_string(),
-        ));
-    }
-    object.insert("version".to_string(), json!(STATE_VERSION));
-    normalize_task_transitions(&mut migrated)?;
-    add_empty_check_summaries(&mut migrated)?;
-    validate_durable_state(&migrated)?;
-    Ok(migrated)
-}
-
-fn validate_durable_state(state: &Value) -> Result<(), RequestError> {
-    let object = state.as_object().ok_or_else(|| {
-        RequestError::Message("GitHub durable state must be a JSON object".to_string())
-    })?;
-    require_only_keys(
-        object,
-        &[
-            "version",
-            "pull_requests",
-            "reconciliation",
-            "task_transitions",
-        ],
-    )?;
-    if object.get("version").and_then(Value::as_u64) != Some(STATE_VERSION) {
-        return Err(RequestError::Message(
-            "unsupported GitHub durable state version".to_string(),
-        ));
-    }
-    let pull_requests = object
-        .get("pull_requests")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            RequestError::Message(
-                "GitHub durable state pull_requests must be an object".to_string(),
-            )
-        })?;
-    for (session_id, pull_request) in pull_requests {
-        if session_id.trim().is_empty() {
-            return Err(RequestError::Message(
-                "GitHub durable state has an empty session id".to_string(),
-            ));
-        }
-        let pull_request = pull_request.as_object().ok_or_else(|| {
-            RequestError::Message("GitHub durable state pull request must be an object".to_string())
-        })?;
-        if pull_request.keys().any(|key| {
-            ![
-                "session_id",
-                "url",
-                "state",
-                "remote",
-                "branch",
-                "updated_at",
-                "check_summary",
-            ]
-            .contains(&key.as_str())
-        }) {
-            return Err(RequestError::Message(
-                "GitHub durable state pull request contains unknown fields".to_string(),
-            ));
-        }
-        if strict_string(pull_request.get("session_id"), "pull request session_id")? != *session_id
-            || strict_string(pull_request.get("url"), "pull request url").is_err()
-            || strict_string(pull_request.get("state"), "pull request state").is_err()
-            || pull_request
-                .get("updated_at")
-                .and_then(Value::as_u64)
-                .is_none()
-        {
-            return Err(RequestError::Message(
-                "GitHub durable state has an invalid pull request mapping".to_string(),
-            ));
-        }
-        for field in ["remote", "branch"] {
-            if let Some(value) = pull_request.get(field) {
-                if value.as_str().is_none_or(|value| value.trim().is_empty()) {
-                    return Err(RequestError::Message(format!(
-                        "GitHub durable state has invalid pull request {field}"
-                    )));
-                }
-            }
-        }
-        validate_check_summary(
-            pull_request
-                .get("check_summary")
-                .expect("required check summary was validated"),
-        )?;
-    }
-    let reconciliation = object
-        .get("reconciliation")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            RequestError::Message(
-                "GitHub durable state reconciliation must be an object".to_string(),
-            )
-        })?;
-    require_only_keys(
-        reconciliation,
-        &[
-            "status",
-            "attempt_id",
-            "started_at",
-            "finished_at",
-            "checked",
-            "recovered_attempt_id",
-            "recovered_at",
-            "error",
-        ],
-    )?;
-    if !matches!(
-        reconciliation.get("status").and_then(Value::as_str),
-        Some("idle" | "running" | "failed")
-    ) || reconciliation
-        .get("checked")
-        .and_then(Value::as_u64)
-        .is_none()
-    {
-        return Err(RequestError::Message(
-            "GitHub durable state has invalid reconciliation status".to_string(),
-        ));
-    }
-    for field in ["attempt_id", "recovered_attempt_id", "error"] {
-        strict_optional_string(reconciliation.get(field), field)?;
-    }
-    for field in ["started_at", "finished_at", "recovered_at"] {
-        strict_optional_timestamp(reconciliation.get(field), field)?;
-    }
-    validate_task_transitions(
-        object
-            .get("task_transitions")
-            .expect("required task transitions were validated"),
-    )?;
-    Ok(())
-}
-
-#[cfg(test)]
-fn durable_state_from_settings(settings: &Value) -> Result<Value, RequestError> {
-    let settings = settings.as_object().ok_or_else(|| {
-        RequestError::Message("plugin settings must be a JSON object".to_string())
-    })?;
-    let state = settings
-        .get(STATE_NAMESPACE)
-        .cloned()
-        .unwrap_or_else(empty_durable_state);
-    match state.get("version").and_then(Value::as_u64) {
-        Some(LEGACY_STATE_VERSION) => migrate_v1_durable_state(&state),
-        Some(V2_STATE_VERSION) => migrate_v2_durable_state(&state),
-        _ => {
-            validate_durable_state(&state)?;
-            Ok(state)
-        }
-    }
 }
 
 fn settings_value_from_host_response(response: &Value) -> Result<Value, RequestError> {
@@ -768,70 +440,7 @@ fn durable_state_patch_request(patch: Value) -> Value {
     json!({ "patch": Value::Object(namespaces) })
 }
 
-fn ensure_durable_state(
-    context: &ExecutionContext,
-    allow_cancelled: bool,
-) -> Result<(), RequestError> {
-    let response = host_call_with_cancellation(
-        context,
-        "github-settings-version",
-        "host.settings.get",
-        json!({ "path": [STATE_NAMESPACE, "version"] }),
-        allow_cancelled,
-    )?;
-    match settings_value_from_host_response(&response)? {
-        Value::Null => {
-            host_call_with_cancellation(
-                context,
-                "github-settings-initialize",
-                "host.settings.patch",
-                durable_state_patch_request(empty_durable_state()),
-                allow_cancelled,
-            )?;
-            Ok(())
-        }
-        Value::Number(version) if version.as_u64() == Some(STATE_VERSION) => Ok(()),
-        Value::Number(version)
-            if matches!(
-                version.as_u64(),
-                Some(LEGACY_STATE_VERSION | V2_STATE_VERSION)
-            ) =>
-        {
-            let version = version.as_u64().expect("matched GitHub state version");
-            let response = host_call_with_cancellation(
-                context,
-                &format!("github-settings-v{version}"),
-                "host.settings.get",
-                json!({ "path": [STATE_NAMESPACE] }),
-                allow_cancelled,
-            )?;
-            let state = settings_value_from_host_response(&response)?;
-            let migrated = if version == LEGACY_STATE_VERSION {
-                migrate_v1_durable_state(&state)?
-            } else {
-                migrate_v2_durable_state(&state)?
-            };
-            let response = host_call_with_cancellation(
-                context,
-                &format!("github-settings-migrate-v{version}"),
-                "host.settings.patch",
-                durable_state_patch_request(migrated),
-                allow_cancelled,
-            )?;
-            if response.get("updated").and_then(Value::as_bool) == Some(true) {
-                Ok(())
-            } else {
-                Err(RequestError::Message(
-                    "host settings patch response did not confirm the migration".to_string(),
-                ))
-            }
-        }
-        _ => Err(RequestError::Message(
-            "unsupported GitHub durable state version".to_string(),
-        )),
-    }
-}
-
+/// Callers make sure the namespace is current first, with `ensure_durable_state`.
 fn patch_durable_state(
     context: &ExecutionContext,
     allow_cancelled: bool,
@@ -840,7 +449,6 @@ fn patch_durable_state(
     if !allow_cancelled {
         context.check_cancelled()?;
     }
-    ensure_durable_state(context, allow_cancelled)?;
     let response = host_call_with_cancellation(
         context,
         "github-settings-patch",
@@ -857,13 +465,6 @@ fn patch_durable_state(
     }
 }
 
-fn reconciliation_from_settings_value(value: Value) -> Result<Value, RequestError> {
-    let mut state = empty_durable_state();
-    state["reconciliation"] = value;
-    validate_durable_state(&state)?;
-    Ok(state["reconciliation"].clone())
-}
-
 fn read_reconciliation_state(
     context: &ExecutionContext,
     allow_cancelled: bool,
@@ -876,156 +477,9 @@ fn read_reconciliation_state(
         json!({ "path": [STATE_NAMESPACE, "reconciliation"] }),
         allow_cancelled,
     )?;
-    reconciliation_from_settings_value(settings_value_from_host_response(&response)?)
-}
-
-fn check_summary(checks: &Value, updated_at: u64) -> Value {
-    let checks = checks.as_array().map(Vec::as_slice).unwrap_or_default();
-    if checks.is_empty() {
-        return Value::Null;
-    }
-    let mut has_failure = false;
-    let mut has_pending = false;
-    for check in checks {
-        let value = check
-            .get("conclusion")
-            .or_else(|| check.get("status"))
-            .or_else(|| check.get("state"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        if [
-            "FAILURE",
-            "FAILED",
-            "CANCELLED",
-            "TIMED_OUT",
-            "ERROR",
-            "ACTION_REQUIRED",
-            "STARTUP_FAILURE",
-            "STALE",
-        ]
-        .contains(&value.as_str())
-        {
-            has_failure = true;
-        } else if !["SUCCESS", "PASSED", "PASS", "NEUTRAL", "SKIPPED"].contains(&value.as_str()) {
-            has_pending = true;
-        }
-    }
-    json!({
-        "state": if has_failure { "failing" } else if has_pending { "pending" } else { "passing" },
-        "updated_at": updated_at,
-    })
-}
-
-fn pr_mapping(
-    session_id: &str,
-    url: &str,
-    pr_state: &str,
-    remote: Option<&str>,
-    branch: Option<&str>,
-    updated_at: u64,
-    check_summary: Value,
-) -> Value {
-    let mut mapping = serde_json::Map::new();
-    mapping.insert("session_id".to_string(), json!(session_id));
-    mapping.insert("url".to_string(), json!(url));
-    mapping.insert("state".to_string(), json!(pr_state));
-    if let Some(remote) = remote.filter(|value| !value.trim().is_empty()) {
-        mapping.insert("remote".to_string(), json!(remote));
-    }
-    if let Some(branch) = branch.filter(|value| !value.trim().is_empty()) {
-        mapping.insert("branch".to_string(), json!(branch));
-    }
-    mapping.insert("updated_at".to_string(), json!(updated_at));
-    mapping.insert("check_summary".to_string(), check_summary);
-    Value::Object(mapping)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PrStateTransition {
-    Opened,
-    Merged,
-}
-
-fn detect_pr_state_transition(
-    old_state: Option<&str>,
-    new_state: &str,
-) -> Option<PrStateTransition> {
-    match (old_state, new_state) {
-        (None | Some("draft"), "open") => Some(PrStateTransition::Opened),
-        (Some("open"), "merged") => Some(PrStateTransition::Merged),
-        _ => None,
-    }
-}
-
-fn persisted_pr_state(value: &Value) -> Result<Option<String>, RequestError> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Object(mapping) => {
-            strict_string(mapping.get("state"), "pull request state").map(Some)
-        }
-        _ => Err(RequestError::Message(
-            "GitHub durable state pull request must be an object".to_string(),
-        )),
-    }
-}
-
-fn persist_pr_mapping(
-    context: &ExecutionContext,
-    session_id: &str,
-    url: &str,
-    pr_state: &str,
-    remote: Option<&str>,
-    branch: Option<&str>,
-    check_summary: Value,
-) -> Result<Option<PrStateTransition>, RequestError> {
-    let _persistence = context
-        .durable_state_locks
-        .pull_requests
-        .lock()
-        .map_err(|_| RequestError::Message("pull request persistence lock poisoned".to_string()))?;
-    ensure_durable_state(context, false)?;
-    let response = host_call(
-        context,
-        "github-settings-pr-mapping",
-        "host.settings.get",
-        json!({ "path": [STATE_NAMESPACE, "pull_requests", session_id] }),
-    )?;
-    let old_state = persisted_pr_state(&settings_value_from_host_response(&response)?)?;
-    let mut pull_requests = serde_json::Map::new();
-    pull_requests.insert(
-        session_id.to_string(),
-        pr_mapping(
-            session_id,
-            url,
-            pr_state,
-            remote,
-            branch,
-            unix_timestamp_ms(),
-            check_summary,
-        ),
-    );
-    patch_durable_state(
-        context,
-        false,
-        json!({ "pull_requests": Value::Object(pull_requests) }),
-    )?;
-    Ok(detect_pr_state_transition(old_state.as_deref(), pr_state))
-}
-
-fn clear_pr_mapping(context: &ExecutionContext, session_id: &str) -> Result<(), RequestError> {
-    let _persistence = context
-        .durable_state_locks
-        .pull_requests
-        .lock()
-        .map_err(|_| RequestError::Message("pull request persistence lock poisoned".to_string()))?;
-    let mut pull_requests = serde_json::Map::new();
-    pull_requests.insert(session_id.to_string(), Value::Null);
-    patch_durable_state(
-        context,
-        false,
-        json!({ "pull_requests": Value::Object(pull_requests) }),
-    )
+    Ok(reconciliation_from_settings_value(
+        settings_value_from_host_response(&response)?,
+    )?)
 }
 
 fn apply_task_transition(
@@ -1038,8 +492,13 @@ fn apply_task_transition(
         PrStateTransition::Opened => "on_open",
         PrStateTransition::Merged => "on_merge",
     };
-    let Ok(transitions) = read_task_transitions(context, false) else {
-        return;
+    // The change is already stored, so a transition that cannot be read is logged and dropped.
+    let transitions = match read_task_transitions(context, false) {
+        Ok(transitions) => transitions,
+        Err(error) => {
+            eprintln!("{PLUGIN_ID} skipped the {field} task transition: {error:?}");
+            return;
+        }
     };
     let Some(status) = transitions.get(field).and_then(Value::as_str) else {
         return;
@@ -1056,60 +515,6 @@ fn apply_task_transition(
         };
         eprintln!("{PLUGIN_ID} failed configured {field} task transition: {message}");
     }
-}
-
-fn begin_reconciliation_patch(
-    reconciliation: &Value,
-    attempt_id: &str,
-    started_at: u64,
-) -> Result<Value, RequestError> {
-    let reconciliation = reconciliation.as_object().ok_or_else(|| {
-        RequestError::Message("GitHub durable state reconciliation must be an object".to_string())
-    })?;
-    let mut patch = serde_json::Map::new();
-    if reconciliation.get("status").and_then(Value::as_str) == Some("running") {
-        patch.insert(
-            "recovered_attempt_id".to_string(),
-            reconciliation
-                .get("attempt_id")
-                .cloned()
-                .unwrap_or(Value::Null),
-        );
-        patch.insert("recovered_at".to_string(), json!(started_at));
-    }
-    patch.insert("status".to_string(), json!("running"));
-    patch.insert("attempt_id".to_string(), json!(attempt_id));
-    patch.insert("started_at".to_string(), json!(started_at));
-    patch.insert("finished_at".to_string(), Value::Null);
-    patch.insert("checked".to_string(), json!(0));
-    patch.insert("error".to_string(), Value::Null);
-    Ok(Value::Object(patch))
-}
-
-fn finish_reconciliation_patch(
-    reconciliation: &Value,
-    attempt_id: &str,
-    status: &str,
-    checked: u64,
-    finished_at: u64,
-    error: Option<&str>,
-) -> Result<Value, RequestError> {
-    let reconciliation = reconciliation.as_object().ok_or_else(|| {
-        RequestError::Message("GitHub durable state reconciliation must be an object".to_string())
-    })?;
-    if reconciliation.get("status").and_then(Value::as_str) != Some("running")
-        || reconciliation.get("attempt_id").and_then(Value::as_str) != Some(attempt_id)
-    {
-        return Err(RequestError::Message(
-            "reconciliation attempt was superseded".to_string(),
-        ));
-    }
-    Ok(json!({
-        "status": status,
-        "finished_at": finished_at,
-        "checked": checked,
-        "error": error.map_or(Value::Null, |error| json!(bounded_error(error))),
-    }))
 }
 
 fn begin_reconciliation(
@@ -1151,10 +556,6 @@ fn finish_reconciliation(
     )
 }
 
-fn bounded_error(error: &str) -> String {
-    error.chars().take(MAX_RECONCILIATION_ERROR_CHARS).collect()
-}
-
 fn repository_context(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
     host_call(
@@ -1163,113 +564,6 @@ fn repository_context(params: &Value, context: &ExecutionContext) -> Result<Valu
         "host.sessions.repositoryContext",
         json!({ "session_id": session_id }),
     )
-}
-
-fn linked_pr_mapping(context: &ExecutionContext, session_id: &str) -> Result<Value, RequestError> {
-    let response = host_call(
-        context,
-        "github-linked-pr-mapping",
-        "host.settings.get",
-        json!({ "path": [STATE_NAMESPACE, "pull_requests", session_id] }),
-    )?;
-    settings_value_from_host_response(&response)
-}
-
-fn pr_view_reference(branch: &str, mapping: &Value) -> Result<String, RequestError> {
-    match mapping {
-        Value::Null => Ok(branch.to_string()),
-        Value::Object(mapping) => strict_string(mapping.get("url"), "pull request url"),
-        _ => Err(RequestError::Message(
-            "GitHub durable state pull request must be an object".to_string(),
-        )),
-    }
-}
-
-fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let session_id = required_string(params, "session_id")?;
-    let repository = repository_context(params, context)?;
-    let cwd = context_path(&repository)?;
-    let remote = git_output(context, &cwd, ["remote", "get-url", "origin"])?;
-    if !is_github_remote(&remote) {
-        return Ok(
-            json!({ "applicable": false, "reason": "The origin remote is not github.com." }),
-        );
-    }
-    let branch = context_string(&repository, "branch")?;
-    let mapping = linked_pr_mapping(context, session_id)?;
-    let pr_reference = pr_view_reference(&branch, &mapping)?;
-    let raw = gh_output(
-        context,
-        &cwd,
-        [
-            "pr",
-            "view",
-            &pr_reference,
-            "--json",
-            "url,state,isDraft,statusCheckRollup,mergeable,mergeStateStatus,reviewDecision",
-        ],
-    );
-    match raw {
-        Ok(raw) => {
-            let pr: Value = serde_json::from_str(&raw).map_err(|error| {
-                RequestError::Message(format!("failed to parse gh pr view output: {error}"))
-            })?;
-            let merge_methods = optional_merge_methods(
-                repository_merge_methods(context, &cwd, remote.trim()),
-                session_id,
-            );
-            let projected = project_pr_status(&pr, merge_methods);
-            let url = strict_string(projected.get("url"), "pull request url")?;
-            let pr_state = strict_string(projected.get("state"), "pull request state")?;
-            let transition = persist_pr_mapping(
-                context,
-                session_id,
-                &url,
-                &pr_state,
-                Some(remote.trim()),
-                Some(&branch),
-                check_summary(
-                    projected.get("checks").unwrap_or(&Value::Null),
-                    unix_timestamp_ms(),
-                ),
-            )?;
-            apply_task_transition(context, session_id, transition);
-            Ok(json!({ "applicable": true, "remote": remote.trim(), "pr": projected }))
-        }
-        Err(RequestError::Message(error)) if is_no_pull_request(&error) => {
-            clear_pr_mapping(context, session_id)?;
-            Ok(json!({ "applicable": true, "remote": remote.trim(), "pr": Value::Null }))
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn indicator_payload(mapping: Value) -> Result<Value, RequestError> {
-    let check_summary = match mapping {
-        Value::Null => Value::Null,
-        Value::Object(mapping) => {
-            let check_summary = mapping.get("check_summary").cloned().unwrap_or(Value::Null);
-            validate_check_summary(&check_summary)?;
-            check_summary
-        }
-        _ => {
-            return Err(RequestError::Message(
-                "GitHub durable state pull request must be an object".to_string(),
-            ))
-        }
-    };
-    Ok(json!({ "check_summary": check_summary }))
-}
-
-fn indicator(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let session_id = required_string(params, "session_id")?;
-    let response = host_call(
-        context,
-        "github-indicator",
-        "host.settings.get",
-        json!({ "path": [STATE_NAMESPACE, "pull_requests", session_id] }),
-    )?;
-    indicator_payload(settings_value_from_host_response(&response)?)
 }
 
 fn session_name(context: &ExecutionContext, session_id: &str, fallback: &str) -> String {
@@ -1387,324 +681,6 @@ fn defaults(params: &Value, context: &ExecutionContext) -> Result<Value, Request
     Ok(json!({ "title": title, "body": body, "base_branch": base_branch }))
 }
 
-fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let repository = repository_context(params, context)?;
-    let cwd = context_path(&repository)?;
-    let branch = context_string(&repository, "branch")?;
-    let title = required_string(params, "title")?;
-    let body = params
-        .get("body")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let base_branch = required_string(params, "base_branch")?;
-    let draft = params
-        .get("draft")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    git_output(context, &cwd, ["push", "-u", "origin", &branch])?;
-    let mut args = vec![
-        "pr".to_string(),
-        "create".to_string(),
-        "--title".to_string(),
-        title.to_string(),
-        "--body".to_string(),
-        body.to_string(),
-        "--base".to_string(),
-        base_branch.to_string(),
-    ];
-    if draft {
-        args.push("--draft".to_string());
-    }
-    let url = command_output(
-        context,
-        &cwd,
-        &context.runner.gh,
-        args.iter().map(String::as_str),
-    )?;
-    let url = url.trim();
-    let remote = git_output(context, &cwd, ["remote", "get-url", "origin"])?;
-    let session_id = required_string(params, "session_id")?;
-    let transition = persist_pr_mapping(
-        context,
-        session_id,
-        url,
-        if draft { "draft" } else { "open" },
-        Some(remote.trim()),
-        Some(&branch),
-        Value::Null,
-    )?;
-    apply_task_transition(context, session_id, transition);
-    Ok(json!({ "url": url }))
-}
-
-fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let repository = repository_context(params, context)?;
-    let cwd = context_path(&repository)?;
-    let url = required_string(params, "url")?;
-    let raw = gh_output(
-        context,
-        &cwd,
-        ["pr", "view", url, "--json", "url,state,isDraft"],
-    )?;
-    let pr: Value = serde_json::from_str(&raw).map_err(|error| {
-        RequestError::Message(format!("failed to parse linked pull request: {error}"))
-    })?;
-    let branch = context_string(&repository, "branch").ok();
-    let remote = git_output(context, &cwd, ["remote", "get-url", "origin"]).ok();
-    let merge_methods = remote
-        .as_deref()
-        .and_then(|remote| repository_merge_methods(context, &cwd, remote.trim()).ok())
-        .unwrap_or_default();
-    let projected = project_pr_status(&pr, merge_methods);
-    let pr_url = strict_string(projected.get("url"), "pull request url")?;
-    let pr_state = strict_string(projected.get("state"), "pull request state")?;
-    let session_id = required_string(params, "session_id")?;
-    let transition = persist_pr_mapping(
-        context,
-        session_id,
-        &pr_url,
-        &pr_state,
-        remote.as_deref().map(str::trim),
-        branch.as_deref(),
-        Value::Null,
-    )?;
-    apply_task_transition(context, session_id, transition);
-    Ok(json!({ "pr": projected }))
-}
-
-fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let repository = repository_context(params, context)?;
-    let cwd = context_path(&repository)?;
-    let branch = context_string(&repository, "branch")?;
-    let strategy = params
-        .get("strategy")
-        .and_then(Value::as_str)
-        .unwrap_or("squash");
-    let strategy_flag = match strategy {
-        "squash" => "--squash",
-        "merge" => "--merge",
-        "rebase" => "--rebase",
-        _ => {
-            return Err(RequestError::Message(
-                "merge strategy must be squash, merge, or rebase".to_string(),
-            ))
-        }
-    };
-    let before_merge = gh_output(context, &cwd, ["pr", "view", &branch, "--json", "url"])?;
-    let before_merge: Value = serde_json::from_str(&before_merge).map_err(|error| {
-        RequestError::Message(format!(
-            "failed to parse pull request before merge: {error}"
-        ))
-    })?;
-    let url = strict_string(before_merge.get("url"), "pull request url")?;
-    let remote = git_output(context, &cwd, ["remote", "get-url", "origin"])?;
-    if !repository_merge_methods(context, &cwd, remote.trim())?
-        .iter()
-        .any(|method| method == strategy)
-    {
-        return Err(RequestError::Message(format!(
-            "{strategy} merge is disabled for this GitHub repository"
-        )));
-    }
-    gh_output(
-        context,
-        &cwd,
-        ["pr", "merge", &branch, strategy_flag, "--delete-branch"],
-    )?;
-    let session_id = required_string(params, "session_id")?;
-    let transition = persist_pr_mapping(
-        context,
-        session_id,
-        &url,
-        "merged",
-        Some(remote.trim()),
-        Some(&branch),
-        Value::Null,
-    )?;
-    apply_task_transition(context, session_id, transition);
-    Ok(json!({ "merged": true }))
-}
-
-fn mark_ready(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let repository = repository_context(params, context)?;
-    let cwd = context_path(&repository)?;
-    let branch = context_string(&repository, "branch")?;
-    gh_output(context, &cwd, ["pr", "ready", &branch])?;
-    Ok(json!({ "ready": true }))
-}
-
-fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<String, RequestError> {
-    let session_id = required_string(params, "session_id")?;
-    let repository = repository_context(params, context)?;
-    let cwd = context_path(&repository)?;
-    let branch = context_string(&repository, "branch")?;
-    let mapping = linked_pr_mapping(context, session_id)?;
-    let pr_reference = pr_view_reference(&branch, &mapping)?;
-    let raw = gh_output(
-        context,
-        &cwd,
-        ["pr", "view", &pr_reference, "--json", "statusCheckRollup"],
-    )?;
-    let status: Value = serde_json::from_str(&raw)
-        .map_err(|error| RequestError::Message(format!("failed to parse CI status: {error}")))?;
-    let run_id = status
-        .get("statusCheckRollup")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|check| {
-            check
-                .get("conclusion")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value.eq_ignore_ascii_case("failure"))
-        })
-        .filter_map(|check| check.get("detailsUrl").and_then(Value::as_str))
-        .find_map(action_run_id)
-        .ok_or_else(|| RequestError::Message("no failed GitHub Actions run found".to_string()))?;
-    let logs = gh_output(context, &cwd, ["run", "view", run_id, "--log-failed"])?;
-    let tail = logs
-        .lines()
-        .rev()
-        .take(200)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(format!(
-        "CI failed on branch `{branch}`. Here are the failure logs:\n\n{tail}"
-    ))
-}
-
-fn failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    Ok(json!({ "message": failure_log_message(params, context)? }))
-}
-
-fn send_failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let source_session_id = required_string(params, "session_id")?;
-    let recipient_session_id = required_string(params, "recipient_session_id")?;
-    let text = failure_log_message(&json!({ "session_id": source_session_id }), context)?;
-    let response = host_call_with_cancellation(
-        context,
-        "github-send-failure-logs",
-        "host.sessions.prompt",
-        json!({ "session_id": recipient_session_id, "text": text }),
-        false,
-    )?;
-    if response.get("delivered").and_then(Value::as_bool) != Some(true) {
-        return Err(RequestError::Message(
-            "host session prompt response did not confirm delivery".to_string(),
-        ));
-    }
-    Ok(json!({ "sent": true }))
-}
-
-fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
-    let _reconciliation = context
-        .durable_state_locks
-        .reconciliation
-        .try_lock()
-        .map_err(|_| RequestError::Message("reconciliation is already running".to_string()))?;
-    context.check_cancelled()?;
-    let started_at = unix_timestamp_ms();
-    let attempt_id = format!(
-        "reconcile-{started_at}-{}",
-        context.callback_sequence.fetch_add(1, Ordering::Relaxed)
-    );
-    begin_reconciliation(context, &attempt_id, started_at)?;
-
-    let mut checked = 0_u64;
-    let work = (|| {
-        let sessions = host_call(
-            context,
-            "github-sessions",
-            "host.sessions.list",
-            Value::Null,
-        )?;
-        for session in sessions
-            .get("sessions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            context.check_cancelled()?;
-            if session.get("status").and_then(Value::as_str) != Some("active") {
-                continue;
-            }
-            let Some(session_id) = session.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            checked += 1;
-            status(&json!({ "session_id": session_id }), context)?;
-        }
-        Ok(())
-    })();
-
-    let finished_at = unix_timestamp_ms();
-    match work {
-        Ok(()) if !context.cancelled.load(Ordering::SeqCst) => {
-            match finish_reconciliation(
-                context,
-                false,
-                &attempt_id,
-                "idle",
-                checked,
-                finished_at,
-                None,
-            ) {
-                Ok(_) => Ok(json!({ "checked": checked, "attempt_id": attempt_id })),
-                Err(error) => {
-                    let message = match &error {
-                        RequestError::Cancelled => "request cancelled".to_string(),
-                        RequestError::Message(message) => message.clone(),
-                    };
-                    finish_reconciliation(
-                        context,
-                        true,
-                        &attempt_id,
-                        "failed",
-                        checked,
-                        finished_at,
-                        Some(&message),
-                    )?;
-                    Err(error)
-                }
-            }
-        }
-        Ok(()) => {
-            let error = RequestError::Cancelled;
-            finish_reconciliation(
-                context,
-                true,
-                &attempt_id,
-                "failed",
-                checked,
-                finished_at,
-                Some("request cancelled"),
-            )?;
-            Err(error)
-        }
-        Err(error) => {
-            let message = match &error {
-                RequestError::Cancelled => "request cancelled".to_string(),
-                RequestError::Message(message) => message.clone(),
-            };
-            let terminal = finish_reconciliation(
-                context,
-                true,
-                &attempt_id,
-                "failed",
-                checked,
-                finished_at,
-                Some(&message),
-            );
-            terminal?;
-            Err(error)
-        }
-    }
-}
-
 fn github_repository_slug(remote: &str) -> Option<String> {
     let remote = remote.trim().trim_end_matches('/').trim_end_matches(".git");
     let path = [
@@ -1721,77 +697,6 @@ fn github_repository_slug(remote: &str) -> Option<String> {
     let owner = segments.next().filter(|segment| !segment.is_empty())?;
     let repository = segments.next().filter(|segment| !segment.is_empty())?;
     (segments.next().is_none()).then(|| format!("{owner}/{repository}"))
-}
-
-fn enabled_repository_merge_methods(repository: &Value) -> Vec<String> {
-    [
-        ("squash", "allow_squash_merge"),
-        ("merge", "allow_merge_commit"),
-        ("rebase", "allow_rebase_merge"),
-    ]
-    .into_iter()
-    .filter_map(|(method, field)| {
-        (repository.get(field).and_then(Value::as_bool) == Some(true)).then_some(method.to_string())
-    })
-    .collect()
-}
-
-fn repository_merge_methods(
-    context: &ExecutionContext,
-    cwd: &str,
-    remote: &str,
-) -> Result<Vec<String>, RequestError> {
-    let slug = github_repository_slug(remote).ok_or_else(|| {
-        RequestError::Message("GitHub remote does not include an owner and repository".to_string())
-    })?;
-    let raw = gh_output(context, cwd, ["api", &format!("repos/{slug}")])?;
-    let repository: Value = serde_json::from_str(&raw).map_err(|error| {
-        RequestError::Message(format!(
-            "failed to parse GitHub repository settings: {error}"
-        ))
-    })?;
-    Ok(enabled_repository_merge_methods(&repository))
-}
-
-fn optional_merge_methods(
-    result: Result<Vec<String>, RequestError>,
-    session_id: &str,
-) -> Vec<String> {
-    match result {
-        Ok(methods) => methods,
-        Err(error) => {
-            eprintln!("could not load enabled GitHub merge methods for {session_id}: {error:?}");
-            Vec::new()
-        }
-    }
-}
-
-fn project_pr_status(pr: &Value, merge_methods: Vec<String>) -> Value {
-    let state = if pr.get("isDraft").and_then(Value::as_bool) == Some(true) {
-        "draft".to_string()
-    } else {
-        pr.get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("open")
-            .to_ascii_lowercase()
-    };
-    let mergeable = pr
-        .get("mergeable")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let merge_state = pr
-        .get("mergeStateStatus")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    json!({
-        "url": pr.get("url").cloned().unwrap_or(Value::Null),
-        "state": state,
-        "checks": pr.get("statusCheckRollup").cloned().unwrap_or_else(|| json!([])),
-        "conflicting": mergeable == "CONFLICTING" || merge_state == "DIRTY",
-        "merge_blocked": merge_state == "BLOCKED",
-        "merge_methods": merge_methods,
-        "review_decision": pr.get("reviewDecision").cloned().unwrap_or(Value::Null),
-    })
 }
 
 fn host_call(
@@ -1862,79 +767,6 @@ fn capture_output<R: Read>(mut reader: R) -> io::Result<CapturedOutput> {
     Ok(CapturedOutput { bytes, truncated })
 }
 
-fn command_output<'a>(
-    context: &ExecutionContext,
-    cwd: &str,
-    program: &Path,
-    args: impl IntoIterator<Item = &'a str>,
-) -> Result<String, RequestError> {
-    context.check_cancelled()?;
-    let program_name = program.to_string_lossy();
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| RequestError::Message(format!("failed to run {program_name}: {error}")))?;
-    let stdout = child.stdout.take().expect("piped stdout is present");
-    let stderr = child.stderr.take().expect("piped stderr is present");
-    let stdout_reader = thread::spawn(move || capture_output(stdout));
-    let stderr_reader = thread::spawn(move || capture_output(stderr));
-
-    let status = loop {
-        if context.cancelled.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(RequestError::Cancelled);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(POLL_INTERVAL),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(RequestError::Message(format!(
-                    "failed waiting for {program_name}: {error}"
-                )));
-            }
-        }
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| RequestError::Message(format!("failed collecting {program_name} stdout")))?
-        .map_err(|error| {
-            RequestError::Message(format!("failed reading {program_name} stdout: {error}"))
-        })?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| RequestError::Message(format!("failed collecting {program_name} stderr")))?
-        .map_err(|error| {
-            RequestError::Message(format!("failed reading {program_name} stderr: {error}"))
-        })?;
-    if stdout.truncated {
-        return Err(RequestError::Message(format!(
-            "{program_name} stdout exceeded {MAX_COMMAND_OUTPUT_BYTES} bytes"
-        )));
-    }
-    if !status.success() {
-        let mut message = String::from_utf8_lossy(&stderr.bytes).trim().to_string();
-        if stderr.truncated {
-            message.push_str("\n[stderr truncated]");
-        }
-        return Err(RequestError::Message(if message.is_empty() {
-            format!("{program_name} exited with {status}")
-        } else {
-            message
-        }));
-    }
-    Ok(String::from_utf8_lossy(&stdout.bytes).to_string())
-}
-
 fn is_github_remote(remote: &str) -> bool {
     let remote = remote.trim().trim_end_matches('/').trim_end_matches(".git");
     [
@@ -1949,14 +781,24 @@ fn is_github_remote(remote: &str) -> bool {
     .any(|prefix| remote.starts_with(prefix))
 }
 
-fn is_no_pull_request(error: &str) -> bool {
-    error.contains("no pull requests found") || error.contains("Could not resolve to a PullRequest")
-}
-
-fn action_run_id(url: &str) -> Option<&str> {
-    let marker = "/actions/runs/";
-    let rest = url.get(url.find(marker)? + marker.len()..)?;
-    rest.split('/').next()
+/// The run id of a `https://github.com/<repository>/actions/runs/<id>` URL, only for that repository.
+fn action_run_id<'a>(url: &'a str, repository: &str) -> Option<&'a str> {
+    let path = url
+        .strip_prefix("https://github.com/")?
+        .split(['?', '#'])
+        .next()?;
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    if !format!("{owner}/{name}").eq_ignore_ascii_case(repository)
+        || segments.next()? != "actions"
+        || segments.next()? != "runs"
+    {
+        return None;
+    }
+    segments
+        .next()
+        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn success(id: Value, result: Value) -> Value {
@@ -1989,9 +831,9 @@ fn read_task_transitions(
         json!({ "path": [STATE_NAMESPACE, "task_transitions"] }),
         allow_cancelled,
     )?;
-    let transitions = settings_value_from_host_response(&response)?;
-    validate_task_transitions(&transitions)?;
-    Ok(transitions)
+    Ok(validate_task_transitions(
+        &settings_value_from_host_response(&response)?,
+    )?)
 }
 
 fn github_settings(context: &ExecutionContext) -> Result<Value, RequestError> {
@@ -2006,8 +848,1068 @@ fn update_github_settings(
         .get("task_transitions")
         .ok_or_else(|| RequestError::Message("task_transitions is required".to_string()))?;
     validate_task_transitions(transitions)?;
+    ensure_durable_state(context, false)?;
     patch_durable_state(context, false, json!({ "task_transitions": transitions }))?;
     Ok(json!({ "task_transitions": transitions }))
+}
+
+fn invalid_state(message: impl Into<String>) -> RequestError {
+    RequestError::Message(message.into())
+}
+
+fn read_state_version(
+    context: &ExecutionContext,
+    allow_cancelled: bool,
+) -> Result<Value, RequestError> {
+    let response = host_call_with_cancellation(
+        context,
+        "github-settings-version",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "version"] }),
+        allow_cancelled,
+    )?;
+    settings_value_from_host_response(&response)
+}
+
+/// Initializes or migrates the namespace unless it is current.
+/// Never call it while holding the pull request lock, which it takes to rewrite the namespace.
+fn ensure_durable_state(
+    context: &ExecutionContext,
+    allow_cancelled: bool,
+) -> Result<(), RequestError> {
+    if read_state_version(context, allow_cancelled)?.as_u64() == Some(STATE_VERSION) {
+        return Ok(());
+    }
+    // Rewriting the whole namespace would undo a concurrent links write, so it takes that lock
+    // and checks again in case another request migrated meanwhile.
+    let _persistence = lock_pull_requests(context)?;
+    let version = read_state_version(context, allow_cancelled)?;
+    match version.as_u64() {
+        None if version.is_null() => {
+            host_call_with_cancellation(
+                context,
+                "github-settings-initialize",
+                "host.settings.patch",
+                durable_state_patch_request(empty_durable_state()),
+                allow_cancelled,
+            )?;
+            Ok(())
+        }
+        Some(STATE_VERSION) => Ok(()),
+        // migrate_durable_state knows which older versions it can upgrade.
+        Some(version) => {
+            let response = host_call_with_cancellation(
+                context,
+                &format!("github-settings-v{version}"),
+                "host.settings.get",
+                json!({ "path": [STATE_NAMESPACE] }),
+                allow_cancelled,
+            )?;
+            let migrated = migrate_durable_state(&settings_value_from_host_response(&response)?)?;
+            let response = host_call_with_cancellation(
+                context,
+                &format!("github-settings-migrate-v{version}"),
+                "host.settings.patch",
+                durable_state_patch_request(migrated),
+                allow_cancelled,
+            )?;
+            if response.get("updated").and_then(Value::as_bool) == Some(true) {
+                Ok(())
+            } else {
+                Err(invalid_state(
+                    "host settings patch response did not confirm the migration",
+                ))
+            }
+        }
+        None => Err(invalid_state("unsupported GitHub durable state version")),
+    }
+}
+
+fn lock_pull_requests(context: &ExecutionContext) -> Result<MutexGuard<'_, ()>, RequestError> {
+    context
+        .durable_state_locks
+        .pull_requests
+        .lock()
+        .map_err(|_| invalid_state("pull request persistence lock poisoned"))
+}
+
+/// Every session's stored links, unparsed, in one host call; callers ensure the namespace first.
+fn read_stored_links(context: &ExecutionContext) -> Result<Map<String, Value>, RequestError> {
+    let response = host_call(
+        context,
+        "github-settings-pr-links",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "pull_requests"] }),
+    )?;
+    match settings_value_from_host_response(&response)? {
+        Value::Null => Ok(Map::new()),
+        Value::Object(stored) => Ok(stored),
+        _ => Err(invalid_state(
+            "GitHub durable state pull_requests must be an object",
+        )),
+    }
+}
+
+fn group_links(stored: &Map<String, Value>, group: &[String]) -> Result<SessionLinks, String> {
+    group
+        .iter()
+        .map(|session_id| {
+            let links = parse_session_links(stored.get(session_id).unwrap_or(&Value::Null))?;
+            Ok((session_id.clone(), links))
+        })
+        .collect()
+}
+
+fn read_group_links(
+    context: &ExecutionContext,
+    group: &[String],
+) -> Result<SessionLinks, RequestError> {
+    ensure_durable_state(context, false)?;
+    Ok(group_links(&read_stored_links(context)?, group)?)
+}
+
+fn list_sessions(context: &ExecutionContext) -> Result<Vec<SessionInfo>, RequestError> {
+    host_call(
+        context,
+        "github-sessions",
+        "host.sessions.list",
+        Value::Null,
+    )
+    .map(|response| parse_sessions(&response))
+}
+
+/// The sessions that share a task, starting with the one a request is about.
+struct TaskGroup {
+    members: Vec<String>,
+    /// False when the host could not list sessions, so the task's other sessions are unknown.
+    resolved: bool,
+}
+
+/// A session's task group; a host that cannot list sessions leaves the session on its own.
+fn session_task_group(
+    context: &ExecutionContext,
+    session_id: &str,
+) -> Result<TaskGroup, RequestError> {
+    match list_sessions(context) {
+        Ok(sessions) => Ok(TaskGroup {
+            members: task_group(&sessions, session_id),
+            resolved: true,
+        }),
+        Err(RequestError::Cancelled) => Err(RequestError::Cancelled),
+        Err(RequestError::Message(message)) => {
+            eprintln!("{PLUGIN_ID} could not list sessions for {session_id}: {message}");
+            Ok(TaskGroup {
+                members: vec![session_id.to_string()],
+                resolved: false,
+            })
+        }
+    }
+}
+
+/// The task group a change is about; without the task's other sessions the change could store a
+/// state whose task transition is then lost, so the change fails before it starts.
+fn changing_task_group(
+    context: &ExecutionContext,
+    session_id: &str,
+) -> Result<TaskGroup, RequestError> {
+    let task = session_task_group(context, session_id)?;
+    if task.resolved {
+        Ok(task)
+    } else {
+        Err(invalid_state(
+            "Could not list the task's sessions; try again.",
+        ))
+    }
+}
+
+fn group_prs(lists: &SessionLinks, group: &[String]) -> Vec<AggregatedPr> {
+    aggregate(
+        group
+            .iter()
+            .filter_map(|session_id| lists.get(session_id).map(Vec::as_slice)),
+    )
+}
+
+fn prs_json(prs: &[AggregatedPr]) -> Value {
+    Value::Array(prs.iter().map(AggregatedPr::to_json).collect())
+}
+
+struct GroupUpdate {
+    lists: SessionLinks,
+    prs: Vec<AggregatedPr>,
+    changed: bool,
+}
+
+/// Reads, changes, and persists the links of a task group, then applies the task transition
+/// that the persisted change caused, so an unchanged state never repeats a transition.
+fn update_group_links(
+    context: &ExecutionContext,
+    task: &TaskGroup,
+    mutate: impl FnOnce(&mut SessionLinks) -> Result<(), RequestError>,
+) -> Result<GroupUpdate, RequestError> {
+    let mut mutate = Some(mutate);
+    let mut updates = update_groups(context, std::slice::from_ref(task), false, |lists| {
+        mutate.take().expect("one group mutates once")(lists)
+    })?;
+    Ok(updates.remove(0))
+}
+
+/// What a change does to a task group's links: the result, the sessions to store, and the task
+/// transition it causes.
+struct GroupChange {
+    update: GroupUpdate,
+    patch: Map<String, Value>,
+    transition: Option<(String, PrStateTransition)>,
+}
+
+fn project_group(
+    before: SessionLinks,
+    task: &TaskGroup,
+    mutate: impl FnOnce(&mut SessionLinks) -> Result<(), RequestError>,
+) -> Result<GroupChange, RequestError> {
+    let group = task.members.as_slice();
+    let mut after = before.clone();
+    mutate(&mut after)?;
+    let mut patch = Map::new();
+    for (session_id, links) in &after {
+        let previous = before
+            .get(session_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if refresh::differs(previous, links) {
+            patch.insert(session_id.clone(), session_links_value(links));
+        }
+    }
+    let prs = group_prs(&after, group);
+    let transition = group
+        .first()
+        .filter(|_| task.resolved)
+        .and_then(|session_id| {
+            task_transition(&group_prs(&before, group), &prs)
+                .map(|transition| (session_id.clone(), transition))
+        });
+    Ok(GroupChange {
+        update: GroupUpdate {
+            changed: !patch.is_empty(),
+            lists: after,
+            prs,
+        },
+        patch,
+        transition,
+    })
+}
+
+/// Like `update_group_links` for several tasks at once, with one read and one write.
+/// With `skip_unreadable`, a task whose stored links cannot be parsed is left out instead of
+/// failing every other task. A task whose other sessions are unknown never transitions.
+fn update_groups(
+    context: &ExecutionContext,
+    tasks: &[TaskGroup],
+    skip_unreadable: bool,
+    mut mutate: impl FnMut(&mut SessionLinks) -> Result<(), RequestError>,
+) -> Result<Vec<GroupUpdate>, RequestError> {
+    ensure_durable_state(context, false)?;
+    let mut updates = Vec::new();
+    let mut transitions = Vec::new();
+    {
+        let _persistence = lock_pull_requests(context)?;
+        let stored = read_stored_links(context)?;
+        let mut patch = Map::new();
+        for task in tasks {
+            let group = task.members.as_slice();
+            let before = match group_links(&stored, group) {
+                Ok(before) => before,
+                Err(message) if skip_unreadable => {
+                    eprintln!("{PLUGIN_ID} skipped updating sessions {group:?}: {message}");
+                    continue;
+                }
+                Err(message) => return Err(invalid_state(message)),
+            };
+            let change = project_group(before, task, &mut mutate)?;
+            patch.extend(change.patch);
+            if let Some(transition) = change.transition {
+                transitions.push(transition);
+            }
+            updates.push(change.update);
+        }
+        if !patch.is_empty() {
+            patch_durable_state(
+                context,
+                false,
+                json!({ "pull_requests": Value::Object(patch) }),
+            )?;
+        }
+    }
+    for (session_id, transition) in transitions {
+        apply_task_transition(context, &session_id, Some(transition));
+    }
+    Ok(updates)
+}
+
+fn fetch_graphql(
+    context: &ExecutionContext,
+    cwd: &str,
+    requests: &[LookupRequest],
+) -> Result<GraphqlResponse, RequestError> {
+    let query = format!("query={}", github_graphql::build_query(requests));
+    let output = run_command(
+        context,
+        cwd,
+        &context.runner.gh,
+        ["api", "graphql", "-f", &query],
+    )?;
+    // gh exits non-zero when some lookups fail, yet still prints the data GitHub returned.
+    let body: Option<Value> = serde_json::from_str(&output.stdout).ok();
+    let Some(body) = body.filter(|body| body.get("data").is_some_and(|data| !data.is_null()))
+    else {
+        return Err(RequestError::Message(if output.success {
+            "GitHub returned no pull request data".to_string()
+        } else {
+            output.failure_message()
+        }));
+    };
+    if let Some(errors) = body.get("errors") {
+        eprintln!("{PLUGIN_ID} GitHub answered some lookups with errors: {errors}");
+    }
+    Ok(github_graphql::parse_response(
+        requests,
+        &body,
+        unix_timestamp_ms(),
+    ))
+}
+
+struct GithubSession {
+    cwd: String,
+    remote: String,
+    repository: String,
+    branch: String,
+}
+
+fn github_session(
+    params: &Value,
+    context: &ExecutionContext,
+) -> Result<Option<GithubSession>, RequestError> {
+    let repository = repository_context(params, context)?;
+    let cwd = context_path(&repository)?;
+    let remote = git_output(context, &cwd, ["remote", "get-url", "origin"])?
+        .trim()
+        .to_string();
+    if !is_github_remote(&remote) {
+        return Ok(None);
+    }
+    let slug = github_repository_slug(&remote)
+        .ok_or_else(|| invalid_state("GitHub remote does not include an owner and repository"))?;
+    Ok(Some(GithubSession {
+        branch: context_string(&repository, "branch")?,
+        repository: slug.to_ascii_lowercase(),
+        cwd,
+        remote,
+    }))
+}
+
+fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
+    let Some(session) = github_session(params, context)? else {
+        return Ok(
+            json!({ "applicable": false, "reason": "The origin remote is not github.com." }),
+        );
+    };
+    let task = session_task_group(context, session_id)?;
+    let group = &task.members;
+    let lists = read_group_links(context, group)?;
+    // The panel can highlight any of the task's pull requests, so each one gets its details.
+    let detail_keys: BTreeSet<PrKey> = lists
+        .values()
+        .flatten()
+        .filter(|link| link.source().is_some())
+        .map(|link| link.key.clone())
+        .collect();
+    let targets = [BranchTarget {
+        session_id: session_id.to_string(),
+        repository: session.repository.clone(),
+        branch: session.branch.clone(),
+        detail: true,
+    }];
+    let groups = [group.clone()];
+    let plan = Plan {
+        lists: &lists,
+        groups: &groups,
+        branch_targets: &targets,
+        detail_keys: &detail_keys,
+    };
+    let outcome = refresh::run(&plan, STATUS_REFRESH_ROUNDS, |requests| {
+        fetch_graphql(context, &session.cwd, requests)
+    })?;
+    let update = if task.resolved {
+        update_group_links(context, &task, |fresh| {
+            refresh::apply(fresh, &groups, &outcome);
+            Ok(())
+        })?
+    } else {
+        // Storing it would hide the change from the next refresh that knows the whole task,
+        // so that refresh could never apply its task transition.
+        let change = project_group(lists.clone(), &task, |fresh| {
+            refresh::apply(fresh, &groups, &outcome);
+            Ok(())
+        })?;
+        GroupUpdate {
+            changed: false,
+            ..change.update
+        }
+    };
+    let own = update
+        .lists
+        .get(session_id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let own_url = own_link(own, &session.repository).map(|link| link.url.clone());
+    let details: Vec<Value> = outcome
+        .fetched
+        .values()
+        .filter(|pr| pr.detail.is_some())
+        .map(|pr| {
+            project_detail(
+                pr,
+                outcome
+                    .merge_methods
+                    .get(&pr.key.repository)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    Ok(json!({
+        "applicable": true,
+        "remote": session.remote,
+        "repository": session.repository,
+        "branch": session.branch,
+        "pull_requests": prs_json(&update.prs),
+        "own_url": own_url,
+        "details": details,
+        "changed": update.changed,
+    }))
+}
+
+/// The cached pull requests of a session's task, without asking GitHub.
+/// With `check_repository`, it also says whether the session's origin is on github.com.
+fn summary(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
+    let task = session_task_group(context, session_id)?;
+    let group = &task.members;
+    let lists = read_group_links(context, group)?;
+    let mut summary = json!({ "pull_requests": prs_json(&group_prs(&lists, group)) });
+    if params.get("check_repository").and_then(Value::as_bool) == Some(true) {
+        let repository = repository_context(params, context)?;
+        let remote = git_output(
+            context,
+            &context_path(&repository)?,
+            ["remote", "get-url", "origin"],
+        )?;
+        summary["applicable"] = json!(is_github_remote(&remote));
+    }
+    Ok(summary)
+}
+
+fn fetch_pull_request(
+    context: &ExecutionContext,
+    cwd: &str,
+    key: &PrKey,
+) -> Result<FetchedPr, RequestError> {
+    let request = LookupRequest::new(
+        &key.repository,
+        Lookup::Number {
+            number: key.number,
+            detail: false,
+        },
+    );
+    let mut response = fetch_graphql(context, cwd, std::slice::from_ref(&request))?;
+    response
+        .lookups
+        .remove(&request)
+        .flatten()
+        .and_then(|prs| prs.into_iter().next())
+        .ok_or_else(|| {
+            invalid_state(format!(
+                "GitHub could not find pull request {}#{}",
+                key.repository, key.number
+            ))
+        })
+}
+
+fn pull_request_key(params: &Value) -> Result<PrKey, RequestError> {
+    let url = required_string(params, "url")?;
+    PrKey::from_url(url).ok_or_else(|| {
+        invalid_state(
+            "Enter a github.com pull request URL, such as https://github.com/owner/repo/pull/123.",
+        )
+    })
+}
+
+fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
+    let task = changing_task_group(context, session_id)?;
+    let key = pull_request_key(params)?;
+    let repository = repository_context(params, context)?;
+    let pr = fetch_pull_request(context, &context_path(&repository)?, &key)?;
+    let update = update_group_links(context, &task, |lists| {
+        for links in lists.values_mut() {
+            refresh_snapshot(links, &pr.key, &pr.snapshot);
+        }
+        record_manual(
+            lists.entry(session_id.to_string()).or_default(),
+            &pr.key,
+            &pr.url,
+            &pr.snapshot,
+        );
+        Ok(())
+    })?;
+    Ok(json!({ "pull_requests": prs_json(&update.prs) }))
+}
+
+/// Unlinks a pull request, or dismisses a stack pull request, from every session of the task.
+fn unlink_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
+    let task = changing_task_group(context, session_id)?;
+    let key = pull_request_key(params)?;
+    let update = update_group_links(context, &task, |lists| {
+        let mut removed = false;
+        for links in lists.values_mut() {
+            removed |= dismiss(links, &key);
+        }
+        if removed {
+            Ok(())
+        } else {
+            Err(invalid_state(
+                "This pull request follows the session branch and cannot be unlinked.",
+            ))
+        }
+    })?;
+    Ok(json!({ "pull_requests": prs_json(&update.prs) }))
+}
+
+fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
+    let task = changing_task_group(context, session_id)?;
+    let repository = repository_context(params, context)?;
+    let cwd = context_path(&repository)?;
+    let branch = context_string(&repository, "branch")?;
+    let title = required_string(params, "title")?;
+    let body = params
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let base_branch = required_string(params, "base_branch")?;
+    let draft = params
+        .get("draft")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    git_output(context, &cwd, ["push", "-u", "origin", &branch])?;
+    let mut args = vec![
+        "pr",
+        "create",
+        "--title",
+        title,
+        "--body",
+        body,
+        "--base",
+        base_branch,
+    ];
+    if draft {
+        args.push("--draft");
+    }
+    let url = gh_output(context, &cwd, args)?.trim().to_string();
+    let key = PrKey::from_url(&url)
+        .ok_or_else(|| invalid_state(format!("gh pr create returned an unexpected URL: {url}")))?;
+    let snapshot = PrSnapshot {
+        state: if draft { PrState::Draft } else { PrState::Open },
+        title: Some(title.to_string()),
+        checks: None,
+        head_branch: Some(branch),
+        base_branch: Some(base_branch.to_string()),
+        updated_at: None,
+        // The time comes from GitHub, so it compares with GitHub's merge times; without it, the
+        // missing-time rules of task transitions apply.
+        created_at: fetch_pull_request(context, &cwd, &key)
+            .ok()
+            .and_then(|pr| pr.snapshot.created_at),
+        merged_at: None,
+        refreshed_at: unix_timestamp_ms(),
+    };
+    update_group_links(context, &task, |lists| {
+        record_created(
+            lists.entry(session_id.to_string()).or_default(),
+            &key,
+            &url,
+            &snapshot,
+        );
+        Ok(())
+    })?;
+    Ok(json!({ "url": url }))
+}
+
+/// The pull request an action targets.
+enum ActionTarget {
+    PullRequest {
+        key: PrKey,
+        url: String,
+    },
+    /// Whatever the session branch resolves to on GitHub.
+    Branch(String),
+}
+
+impl ActionTarget {
+    /// What `gh pr` commands accept to name the target.
+    fn reference(&self) -> &str {
+        match self {
+            Self::PullRequest { url, .. } => url,
+            Self::Branch(branch) => branch,
+        }
+    }
+}
+
+/// The URL the panel sent, which must be a pull request; else the session's own pull request;
+/// else the session branch's.
+fn action_target(
+    params: &Value,
+    context: &ExecutionContext,
+    session: &GithubSession,
+) -> Result<ActionTarget, RequestError> {
+    if params.get("url").is_some_and(|url| !url.is_null()) {
+        let key = pull_request_key(params)?;
+        let url = required_string(params, "url")?.trim().to_string();
+        return Ok(ActionTarget::PullRequest { key, url });
+    }
+    let session_id = required_string(params, "session_id")?;
+    let links = read_group_links(context, &[session_id.to_string()])?;
+    Ok(match own_link(&links[session_id], &session.repository) {
+        Some(link) => ActionTarget::PullRequest {
+            key: link.key.clone(),
+            url: link.url.clone(),
+        },
+        None => ActionTarget::Branch(session.branch.clone()),
+    })
+}
+
+fn required_github_session(
+    params: &Value,
+    context: &ExecutionContext,
+) -> Result<GithubSession, RequestError> {
+    github_session(params, context)?
+        .ok_or_else(|| invalid_state("The origin remote is not github.com."))
+}
+
+/// The targeted pull request with its checks and mergeability, and its repository's merge methods.
+fn fetch_target_detail(
+    context: &ExecutionContext,
+    session: &GithubSession,
+    target: ActionTarget,
+) -> Result<(FetchedPr, Vec<String>), RequestError> {
+    let request = match target {
+        ActionTarget::PullRequest { key, .. } => LookupRequest::new(
+            &key.repository,
+            Lookup::Number {
+                number: key.number,
+                detail: true,
+            },
+        ),
+        ActionTarget::Branch(branch) => LookupRequest::new(
+            &session.repository,
+            Lookup::Head {
+                branch,
+                detail: true,
+            },
+        ),
+    };
+    let mut response = fetch_graphql(context, &session.cwd, std::slice::from_ref(&request))?;
+    let prs = response
+        .lookups
+        .remove(&request)
+        .flatten()
+        .unwrap_or_default();
+    let pr = match &request.lookup {
+        Lookup::Head { branch, .. } => refresh::branch_pull_request(&prs, branch),
+        _ => prs.first(),
+    }
+    .cloned()
+    .ok_or_else(|| invalid_state("GitHub could not find the pull request"))?;
+    let methods = response
+        .merge_methods
+        .remove(&request.repository)
+        .unwrap_or_default();
+    Ok((pr, methods))
+}
+
+fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = required_string(params, "session_id")?;
+    let task = changing_task_group(context, session_id)?;
+    let strategy = params
+        .get("strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("squash");
+    let strategy_flag = match strategy {
+        "squash" => "--squash",
+        "merge" => "--merge",
+        "rebase" => "--rebase",
+        _ => {
+            return Err(invalid_state(
+                "merge strategy must be squash, merge, or rebase",
+            ))
+        }
+    };
+    let session = required_github_session(params, context)?;
+    let cwd = session.cwd.as_str();
+    let target = action_target(params, context, &session)?;
+    let (pr, methods) = fetch_target_detail(context, &session, target)?;
+    // Only the session's own branch is safe to delete: another branch can be someone's work.
+    let own_branch = pr.key.repository == session.repository
+        && pr.snapshot.head_branch.as_deref() == Some(session.branch.as_str());
+    let (key, url) = (pr.key, pr.url);
+    if !methods.iter().any(|method| method == strategy) {
+        return Err(invalid_state(format!(
+            "{strategy} merge is disabled for this GitHub repository"
+        )));
+    }
+    let mut args = vec!["pr", "merge", &url, strategy_flag];
+    if own_branch {
+        args.push("--delete-branch");
+    }
+    gh_output(context, cwd, args)?;
+    // What GitHub says now, with its own merge time; a merge queue can keep the pull request open.
+    // A read lagging right after a real merge is corrected by the next refresh, which then fires on_merge.
+    let fetched = fetch_pull_request(context, cwd, &key).ok();
+    update_group_links(context, &task, |lists| {
+        for links in lists.values_mut() {
+            let snapshot = match &fetched {
+                Some(pr) => Some(pr.snapshot.clone()),
+                // Without the lookup, gh's success is the best answer, at an unknown time.
+                None => links
+                    .iter()
+                    .find(|link| link.key == key)
+                    .and_then(PullRequestLink::snapshot)
+                    .map(|snapshot| PrSnapshot {
+                        state: PrState::Merged,
+                        refreshed_at: unix_timestamp_ms(),
+                        ..snapshot.clone()
+                    }),
+            };
+            if let Some(snapshot) = snapshot {
+                refresh_snapshot(links, &key, &snapshot);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(json!({ "merged": true }))
+}
+
+fn mark_ready(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session = required_github_session(params, context)?;
+    let target = action_target(params, context, &session)?;
+    gh_output(context, &session.cwd, ["pr", "ready", target.reference()])?;
+    Ok(json!({ "ready": true }))
+}
+
+fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<String, RequestError> {
+    let session = required_github_session(params, context)?;
+    let target = action_target(params, context, &session)?;
+    let (pr, _) = fetch_target_detail(context, &session, target)?;
+    // A linked pull request can live in another repository than the session's checkout.
+    let run_repository = &pr.key.repository;
+    let run_id = pr
+        .detail
+        .iter()
+        .flat_map(|detail| &detail.checks)
+        .filter(|check| check.result == CheckResult::Fail)
+        .filter_map(|check| check.details_url.as_deref())
+        .find_map(|url| action_run_id(url, run_repository))
+        .ok_or_else(|| invalid_state("no failed GitHub Actions run found"))?;
+    let cwd = &session.cwd;
+    let logs = gh_output(
+        context,
+        cwd,
+        ["run", "view", run_id, "--log-failed", "-R", run_repository],
+    )?;
+    let tail = logs
+        .lines()
+        .rev()
+        .take(200)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let subject = format!("{}#{}", pr.key.repository, pr.key.number);
+    Ok(format!(
+        "CI failed on {subject}. Here are the failure logs:\n\n{tail}"
+    ))
+}
+
+fn failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    Ok(json!({ "message": failure_log_message(params, context)? }))
+}
+
+fn send_failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let source_session_id = required_string(params, "session_id")?;
+    let recipient_session_id = required_string(params, "recipient_session_id")?;
+    let mut source = json!({ "session_id": source_session_id });
+    if let Some(url) = params.get("url").filter(|url| url.is_string()) {
+        source["url"] = url.clone();
+    }
+    let text = failure_log_message(&source, context)?;
+    let response = host_call_with_cancellation(
+        context,
+        "github-send-failure-logs",
+        "host.sessions.prompt",
+        json!({ "session_id": recipient_session_id, "text": text }),
+        false,
+    )?;
+    if response.get("delivered").and_then(Value::as_bool) != Some(true) {
+        return Err(invalid_state(
+            "host session prompt response did not confirm delivery",
+        ));
+    }
+    Ok(json!({ "sent": true }))
+}
+
+/// Refreshes every task group with an active session using as few GitHub queries as possible;
+/// returns whether it stored any change.
+fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<bool, RequestError> {
+    let sessions = list_sessions(context)?;
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut targets = Vec::new();
+    let mut cwd = None;
+    for session in sessions
+        .iter()
+        .filter(|session| session.status.as_deref() == Some("active"))
+    {
+        context.check_cancelled()?;
+        *checked += 1;
+        let group = task_group(&sessions, &session.id);
+        let members: BTreeSet<&String> = group.iter().collect();
+        if !groups
+            .iter()
+            .any(|existing| existing.iter().collect::<BTreeSet<_>>() == members)
+        {
+            groups.push(group);
+        }
+        match github_session(&json!({ "session_id": session.id }), context) {
+            Ok(Some(github)) => {
+                targets.push(BranchTarget {
+                    session_id: session.id.clone(),
+                    repository: github.repository,
+                    branch: github.branch,
+                    detail: false,
+                });
+                cwd.get_or_insert(github.cwd);
+            }
+            Ok(None) => {}
+            Err(RequestError::Cancelled) => return Err(RequestError::Cancelled),
+            Err(RequestError::Message(message)) => {
+                eprintln!(
+                    "{PLUGIN_ID} skipped branch detection for {}: {message}",
+                    session.id
+                );
+            }
+        }
+    }
+    ensure_durable_state(context, false)?;
+    let stored = read_stored_links(context)?;
+    let mut lists = SessionLinks::new();
+    groups.retain(|group| match group_links(&stored, group) {
+        Ok(links) => {
+            lists.extend(links);
+            true
+        }
+        Err(message) => {
+            eprintln!("{PLUGIN_ID} skipped refreshing sessions {group:?}: {message}");
+            false
+        }
+    });
+    targets.retain(|target| lists.contains_key(&target.session_id));
+    let has_links = lists.values().any(|links| !links.is_empty());
+    if targets.is_empty() && !has_links {
+        return Ok(false);
+    }
+    let cwd = cwd.unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+    let detail_keys = BTreeSet::new();
+    let plan = Plan {
+        lists: &lists,
+        groups: &groups,
+        branch_targets: &targets,
+        detail_keys: &detail_keys,
+    };
+    let outcome = refresh::run(&plan, RECONCILE_REFRESH_ROUNDS, |requests| {
+        fetch_graphql(context, &cwd, requests)
+    })?;
+    context.check_cancelled()?;
+    let tasks: Vec<TaskGroup> = groups
+        .iter()
+        .map(|group| TaskGroup {
+            members: group.clone(),
+            resolved: true,
+        })
+        .collect();
+    let updates = update_groups(context, &tasks, true, |fresh| {
+        refresh::apply(fresh, &groups, &outcome);
+        Ok(())
+    })?;
+    Ok(updates.iter().any(|update| update.changed))
+}
+
+fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
+    let _reconciliation = context
+        .durable_state_locks
+        .reconciliation
+        .try_lock()
+        .map_err(|_| invalid_state("reconciliation is already running"))?;
+    context.check_cancelled()?;
+    let started_at = unix_timestamp_ms();
+    let attempt_id = format!(
+        "reconcile-{started_at}-{}",
+        context.callback_sequence.fetch_add(1, Ordering::Relaxed)
+    );
+    begin_reconciliation(context, &attempt_id, started_at)?;
+
+    let mut checked = 0_u64;
+    let work = reconcile_groups(context, &mut checked);
+
+    let finished_at = unix_timestamp_ms();
+    let error = match work {
+        Ok(changed) if !context.cancelled.load(Ordering::SeqCst) => {
+            match finish_reconciliation(
+                context,
+                false,
+                &attempt_id,
+                "idle",
+                checked,
+                finished_at,
+                None,
+            ) {
+                Ok(()) => {
+                    return Ok(
+                        json!({ "checked": checked, "attempt_id": attempt_id, "changed": changed }),
+                    )
+                }
+                Err(error) => error,
+            }
+        }
+        Ok(_) => RequestError::Cancelled,
+        Err(error) => error,
+    };
+    let message = match &error {
+        RequestError::Cancelled => "request cancelled".to_string(),
+        RequestError::Message(message) => message.clone(),
+    };
+    finish_reconciliation(
+        context,
+        true,
+        &attempt_id,
+        "failed",
+        checked,
+        finished_at,
+        Some(&message),
+    )?;
+    Err(error)
+}
+
+struct CommandResult {
+    success: bool,
+    status: String,
+    program: String,
+    stdout: String,
+    stderr: String,
+}
+
+impl CommandResult {
+    fn failure_message(&self) -> String {
+        if self.stderr.trim().is_empty() {
+            format!("{} exited with {}", self.program, self.status)
+        } else {
+            self.stderr.trim().to_string()
+        }
+    }
+}
+
+fn run_command<'a>(
+    context: &ExecutionContext,
+    cwd: &str,
+    program: &Path,
+    args: impl IntoIterator<Item = &'a str>,
+) -> Result<CommandResult, RequestError> {
+    context.check_cancelled()?;
+    let program_name = program.to_string_lossy().to_string();
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| invalid_state(format!("failed to run {program_name}: {error}")))?;
+    let stdout = child.stdout.take().expect("piped stdout is present");
+    let stderr = child.stderr.take().expect("piped stderr is present");
+    let stdout_reader = thread::spawn(move || capture_output(stdout));
+    let stderr_reader = thread::spawn(move || capture_output(stderr));
+
+    let status = loop {
+        if context.cancelled.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(RequestError::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(POLL_INTERVAL),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(invalid_state(format!(
+                    "failed waiting for {program_name}: {error}"
+                )));
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| invalid_state(format!("failed collecting {program_name} stdout")))?
+        .map_err(|error| invalid_state(format!("failed reading {program_name} stdout: {error}")))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| invalid_state(format!("failed collecting {program_name} stderr")))?
+        .map_err(|error| invalid_state(format!("failed reading {program_name} stderr: {error}")))?;
+    if stdout.truncated {
+        return Err(invalid_state(format!(
+            "{program_name} stdout exceeded {MAX_COMMAND_OUTPUT_BYTES} bytes"
+        )));
+    }
+    let mut stderr_text = String::from_utf8_lossy(&stderr.bytes).trim().to_string();
+    if stderr.truncated {
+        stderr_text.push_str("\n[stderr truncated]");
+    }
+    Ok(CommandResult {
+        success: status.success(),
+        status: status.to_string(),
+        program: program_name,
+        stdout: String::from_utf8_lossy(&stdout.bytes).to_string(),
+        stderr: stderr_text,
+    })
+}
+
+fn command_output<'a>(
+    context: &ExecutionContext,
+    cwd: &str,
+    program: &Path,
+    args: impl IntoIterator<Item = &'a str>,
+) -> Result<String, RequestError> {
+    let output = run_command(context, cwd, program, args)?;
+    if output.success {
+        Ok(output.stdout)
+    } else {
+        Err(RequestError::Message(output.failure_message()))
+    }
 }
 
 #[cfg(test)]
@@ -2015,7 +1917,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::mpsc::Receiver;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    /// Only bounds a hung test; fake subprocesses can take seconds when the suite runs in parallel.
+    const TEST_WAIT: Duration = Duration::from_secs(10);
+    use std::time::Instant;
 
     #[test]
     fn recognizes_existing_github_remote_forms_only() {
@@ -2026,49 +1931,31 @@ mod tests {
     }
 
     #[test]
-    fn extracts_actions_run_id() {
-        assert_eq!(
-            action_run_id("https://github.com/o/r/actions/runs/123/job/45"),
-            Some("123")
-        );
-        assert_eq!(action_run_id("https://github.com/o/r/pull/1"), None);
-    }
-
-    #[test]
-    fn projects_draft_and_conflict_status() {
-        let status = project_pr_status(
-            &json!({
-                "url": "https://github.com/o/r/pull/1",
-                "state": "OPEN",
-                "isDraft": true,
-                "mergeable": "CONFLICTING",
-                "mergeStateStatus": "DIRTY",
-                "statusCheckRollup": []
-            }),
-            vec!["squash".to_string()],
-        );
-        assert_eq!(status["state"], "draft");
-        assert_eq!(status["conflicting"], true);
-    }
-
-    #[test]
-    fn unavailable_merge_method_lookup_keeps_pr_status_usable() {
-        let merge_methods = optional_merge_methods(
-            Err(RequestError::Message("GitHub API unavailable".to_string())),
-            "session-1",
-        );
-        let status = project_pr_status(
-            &json!({
-                "url": "https://github.com/o/r/pull/1",
-                "state": "OPEN",
-                "statusCheckRollup": []
-            }),
-            merge_methods,
-        );
-
-        assert_eq!(status["url"], "https://github.com/o/r/pull/1");
-        assert_eq!(status["state"], "open");
-        assert_eq!(status["merge_methods"], json!([]));
+    fn extracts_actions_run_ids_of_the_pull_request_repository_only() {
+        for (url, expected) in [
+            (
+                "https://github.com/o/r/actions/runs/123/job/45",
+                Some("123"),
+            ),
+            ("https://github.com/O/R/actions/runs/123", Some("123")),
+            (
+                "https://github.com/o/r/actions/runs/123?check_suite_focus=true",
+                Some("123"),
+            ),
+            ("https://github.com/x/y/actions/runs/123", None),
+            ("https://github.com/o/r-other/actions/runs/123", None),
+            ("https://ci.example.com/o/r/actions/runs/123", None),
+            (
+                "https://evil.example/https://github.com/o/r/actions/runs/123",
+                None,
+            ),
+            ("http://github.com/o/r/actions/runs/123", None),
+            ("https://github.com/o/r/actions/runs/--help", None),
+            ("https://github.com/o/r/actions/runs/", None),
+            ("https://github.com/o/r/pull/1", None),
+        ] {
+            assert_eq!(action_run_id(url, "o/r"), expected, "{url}");
+        }
     }
 
     #[cfg(unix)]
@@ -2127,17 +2014,28 @@ mod tests {
             .unwrap();
         let callback = receive_frame(&output_rx);
         let callback_id = callback["id"].as_str().unwrap();
-        assert_eq!(callback["method"], "host.settings.get");
-        assert_eq!(
-            callback["params"],
-            json!({ "path": ["github", "pull_requests", "s1"] })
-        );
+        assert_eq!(callback["method"], "host.sessions.list");
         input_tx
             .send(
-                json!({ "jsonrpc": "2.0", "id": callback_id, "result": { "settings": null } })
+                json!({ "jsonrpc": "2.0", "id": callback_id, "result": { "sessions": [] } })
                     .to_string(),
             )
             .unwrap();
+        for (path, settings) in [
+            (json!(["github", "version"]), json!(STATE_VERSION)),
+            (json!(["github", "pull_requests"]), Value::Null),
+        ] {
+            let callback = receive_frame(&output_rx);
+            let callback_id = callback["id"].as_str().unwrap();
+            assert_eq!(callback["method"], "host.settings.get");
+            assert_eq!(callback["params"], json!({ "path": path }));
+            input_tx
+                .send(
+                    json!({ "jsonrpc": "2.0", "id": callback_id, "result": { "settings": settings } })
+                        .to_string(),
+                )
+                .unwrap();
+        }
         wait_for_file(&marker);
         input_tx
             .send(json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": "request-1" } }).to_string())
@@ -2150,223 +2048,43 @@ mod tests {
         thread.join().unwrap().unwrap();
     }
 
-    #[test]
-    fn persisting_a_pr_mapping_uses_bounded_settings_callbacks() {
-        let (events, events_rx) = mpsc::channel();
-        let context = ExecutionContext {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events,
-            runner: CommandRunner::default(),
-            request_key: "test-request".to_string(),
-            callback_sequence: Arc::new(AtomicU64::new(1)),
-            durable_state_locks: DurableStateLocks {
-                reconciliation: Arc::new(Mutex::new(())),
-                pull_requests: Arc::new(Mutex::new(())),
-            },
-        };
-        let worker = thread::spawn(move || {
-            persist_pr_mapping(
-                &context,
-                "session-1",
-                "https://github.com/example/repository/pull/1",
-                "open",
-                Some("https://github.com/example/repository.git"),
-                Some("topic"),
-                Value::Null,
-            )
-        });
-
-        let ControllerEvent::HostCall {
-            method,
-            params,
-            response,
-            ..
-        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
-        else {
-            panic!("expected a host settings version callback");
-        };
-        assert_eq!(method, "host.settings.get");
-        assert_eq!(params, json!({ "path": ["github", "version"] }));
-        response
-            .send(Ok(json!({ "settings": STATE_VERSION })))
-            .unwrap();
-
-        let ControllerEvent::HostCall {
-            method,
-            params,
-            response,
-            ..
-        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
-        else {
-            panic!("expected a host settings previous-mapping callback");
-        };
-        assert_eq!(method, "host.settings.get");
-        assert_eq!(
-            params,
-            json!({ "path": ["github", "pull_requests", "session-1"] })
-        );
-        response
-            .send(Ok(json!({ "settings": Value::Null })))
-            .unwrap();
-
-        let ControllerEvent::HostCall {
-            method,
-            params,
-            response,
-            ..
-        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
-        else {
-            panic!("expected a host settings version callback before patch");
-        };
-        assert_eq!(method, "host.settings.get");
-        assert_eq!(params, json!({ "path": ["github", "version"] }));
-        response
-            .send(Ok(json!({ "settings": STATE_VERSION })))
-            .unwrap();
-
-        let ControllerEvent::HostCall {
-            method,
-            params,
-            response,
-            ..
-        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
-        else {
-            panic!("expected a host settings patch callback");
-        };
-        assert_eq!(method, "host.settings.patch");
-        assert_eq!(
-            params["patch"]["github"]["pull_requests"]["session-1"]["url"],
-            "https://github.com/example/repository/pull/1"
-        );
-        assert!(params.to_string().len() < 2048);
-        response.send(Ok(json!({ "updated": true }))).unwrap();
-        assert_eq!(
-            worker.join().unwrap().unwrap(),
-            Some(PrStateTransition::Opened)
-        );
-    }
-    #[test]
-    fn durable_state_accepts_missing_settings_and_rejects_invalid_or_incompatible_documents() {
-        assert_eq!(
-            durable_state_from_settings(&json!({})).unwrap(),
-            empty_durable_state()
-        );
-        let explicit_v1 = json!({ "github": empty_durable_state() });
-        assert_eq!(
-            durable_state_from_settings(&explicit_v1).unwrap(),
-            empty_durable_state()
-        );
-        for settings in [
-            json!({ "github": Value::Null }),
-            json!({ "github": [] }),
-            json!({ "github": { "version": 2, "pull_requests": {}, "reconciliation": {} } }),
-            json!({ "github": { "version": 1, "pull_requests": { "s1": { "session_id": "other" } }, "reconciliation": {} } }),
-        ] {
-            assert!(
-                durable_state_from_settings(&settings).is_err(),
-                "{settings}"
-            );
-        }
-    }
-
-    #[test]
-    fn durable_state_patches_are_small_and_leave_unrelated_settings_host_owned() {
-        let mapping = pr_mapping(
-            "s1",
-            "https://github.com/o/r/pull/1",
-            "open",
-            Some("https://github.com/o/r.git"),
-            Some("topic"),
-            20,
-            Value::Null,
-        );
-        let request = durable_state_patch_request(json!({
-            "pull_requests": { "s1": mapping }
-        }));
-        assert_eq!(
-            request["patch"]["github"]["pull_requests"]["s1"]["branch"],
-            "topic"
-        );
-        assert!(request.to_string().len() < 1024);
-    }
-
-    #[test]
-    fn pull_request_mapping_patch_removes_only_the_selected_mapping() {
-        let mut removed = serde_json::Map::new();
-        removed.insert("s1".to_string(), Value::Null);
-        let request = durable_state_patch_request(json!({
-            "pull_requests": Value::Object(removed)
-        }));
-        assert!(request["patch"]["github"]["pull_requests"]["s1"].is_null());
-    }
-
-    fn merge_json_object(target: &mut Value, patch: &Value) {
-        let target = target.as_object_mut().unwrap();
-        for (key, value) in patch.as_object().unwrap() {
-            target.insert(key.clone(), value.clone());
-        }
-    }
-
-    #[test]
-    fn reconciliation_patches_recover_interruption_fence_attempts_and_bound_errors() {
-        let state = empty_durable_state();
-        let old = begin_reconciliation_patch(&state["reconciliation"], "old-attempt", 100).unwrap();
-        let mut running = state["reconciliation"].clone();
-        merge_json_object(&mut running, &old);
-        let new = begin_reconciliation_patch(&running, "new-attempt", 200).unwrap();
-        assert_eq!(new["recovered_attempt_id"], "old-attempt");
-        assert_eq!(new["recovered_at"], 200);
-        merge_json_object(&mut running, &new);
-        assert!(
-            finish_reconciliation_patch(&running, "old-attempt", "idle", 1, 300, None).is_err()
-        );
-
-        let idle =
-            finish_reconciliation_patch(&running, "new-attempt", "idle", 2, 300, None).unwrap();
-        assert_eq!(idle["status"], "idle");
-        assert_eq!(idle["checked"], 2);
-
-        let long_error = "x".repeat(MAX_RECONCILIATION_ERROR_CHARS + 10);
-        let failed = finish_reconciliation_patch(
-            &running,
-            "new-attempt",
-            "failed",
-            3,
-            500,
-            Some(&long_error),
-        )
-        .unwrap();
-        assert_eq!(failed["status"], "failed");
-        assert_eq!(
-            failed["error"].as_str().unwrap().chars().count(),
-            MAX_RECONCILIATION_ERROR_CHARS
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn sends_failure_logs_to_the_currently_focused_agent_through_host_callback() {
         let directory = TestDirectory::new();
         let gh_args = directory.0.join("gh-args");
+        let failed = |url: &str| json!({ "__typename": "CheckRun", "name": "fmt", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": url });
+        let mut pr = graphql_pr("o/r", 456, "OPEN", "topic", "main", "");
+        pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = json!({ "state": "FAILURE", "contexts": { "nodes": [
+            failed("https://github.com/x/y/actions/runs/999/job/1"),
+            failed("https://github.com/o/r/actions/runs/123/job/45"),
+        ] } });
+        fs::write(
+            directory.0.join("graphql.json"),
+            json!({ "data": { "r0": { "l0": pr } } }).to_string(),
+        )
+        .unwrap();
         let gh = directory.script(
             "gh",
             &format!(
                 r#"#!/bin/sh
-printf '%s\n' "$@" >> '{}'
-if [ "$1" = "pr" ]; then
-  printf '%s\n' '{{"statusCheckRollup":[{{"conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/123/job/45"}}]}}'
+printf '%s\n' "$@" >> '{args}'
+if [ "$1" = "api" ]; then
+  cat '{root}/graphql.json'
 else
   printf 'checkRun cargo fmt --check\nDiff in src-tauri/src/plugins.rs\n'
 fi
 "#,
-                gh_args.display()
+                args = gh_args.display(),
+                root = directory.path(),
             ),
         );
+        let git = directory.script("git", "#!/bin/sh\nprintf 'https://github.com/o/r.git\\n'\n");
         let (events, events_rx) = mpsc::channel();
         let context = ExecutionContext {
             cancelled: Arc::new(AtomicBool::new(false)),
             events,
-            runner: CommandRunner::new(&gh, &gh),
+            runner: CommandRunner::new(&git, &gh),
             request_key: "test-request".to_string(),
             callback_sequence: Arc::new(AtomicU64::new(1)),
             durable_state_locks: DurableStateLocks {
@@ -2379,6 +2097,7 @@ fi
                 &json!({
                     "session_id": "pull-request-session",
                     "recipient_session_id": "currently-focused-agent-session",
+                    "url": "https://github.com/o/r/pull/456",
                 }),
                 &context,
             )
@@ -2389,7 +2108,7 @@ fi
             params,
             response,
             ..
-        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        } = events_rx.recv_timeout(TEST_WAIT).unwrap()
         else {
             panic!("expected repository-context callback");
         };
@@ -2406,35 +2125,24 @@ fi
             params,
             response,
             ..
-        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
-        else {
-            panic!("expected linked-pr mapping callback");
-        };
-        assert_eq!(method, "host.settings.get");
-        assert_eq!(
-            params,
-            json!({ "path": ["github", "pull_requests", "pull-request-session"] })
-        );
-        response
-            .send(Ok(json!({
-                "settings": { "url": "https://github.com/o/r/pull/456" }
-            })))
-            .unwrap();
-
-        let ControllerEvent::HostCall {
-            method,
-            params,
-            response,
-            ..
-        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        } = events_rx.recv_timeout(TEST_WAIT).unwrap()
         else {
             panic!("expected session-prompt callback");
         };
         assert_eq!(method, "host.sessions.prompt");
-        assert_eq!(
-            fs::read_to_string(&gh_args).unwrap(),
-            "pr\nview\nhttps://github.com/o/r/pull/456\n--json\nstatusCheckRollup\nrun\nview\n123\n--log-failed\n"
+        let args = fs::read_to_string(&gh_args).unwrap();
+        assert!(
+            args.starts_with("api\ngraphql\n"),
+            "the checks come from one detail lookup"
         );
+        assert!(
+            args.ends_with("run\nview\n123\n--log-failed\n-R\no/r\n"),
+            "the run is read from the pull request's repository, which can differ from the checkout, and a run elsewhere is ignored"
+        );
+        assert!(params["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("CI failed on o/r#456."));
         assert_eq!(params["session_id"], "currently-focused-agent-session");
         assert!(params["text"]
             .as_str()
@@ -2472,156 +2180,12 @@ fi
     }
 
     #[test]
-    fn projects_only_github_enabled_merge_methods() {
-        let methods = enabled_repository_merge_methods(&json!({
-            "allow_squash_merge": true,
-            "allow_merge_commit": false,
-            "allow_rebase_merge": true,
-        }));
-        assert_eq!(methods, vec!["squash", "rebase"]);
-        let status = project_pr_status(
-            &json!({
-                "url": "https://github.com/o/r/pull/1",
-                "state": "OPEN",
-            }),
-            vec!["merge".to_string()],
-        );
-        assert_eq!(status["merge_methods"], json!(["merge"]));
+    fn extracts_github_repository_slugs() {
         assert_eq!(
             github_repository_slug("git@github.com:o/r.git"),
             Some("o/r".to_string())
         );
-    }
-
-    #[test]
-    fn indicator_payload_reads_only_the_cached_check_summary() {
-        assert_eq!(
-            indicator_payload(Value::Null).unwrap(),
-            json!({ "check_summary": Value::Null })
-        );
-        assert_eq!(
-            indicator_payload(json!({ "state": "open" })).unwrap(),
-            json!({ "check_summary": Value::Null })
-        );
-        let cached = json!({ "check_summary": { "state": "passing", "updated_at": 7 } });
-        assert_eq!(
-            indicator_payload(cached).unwrap(),
-            json!({ "check_summary": { "state": "passing", "updated_at": 7 } })
-        );
-        assert!(indicator_payload(
-            json!({ "check_summary": { "state": "unknown", "updated_at": 7 } })
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn check_summary_classifies_passing_failing_pending_and_absent_rollups() {
-        assert!(check_summary(&json!([]), 1).is_null());
-        assert_eq!(
-            check_summary(&json!([{ "conclusion": "SUCCESS" }]), 2)["state"],
-            "passing"
-        );
-        assert_eq!(
-            check_summary(&json!([{ "status": "IN_PROGRESS" }]), 3)["state"],
-            "pending"
-        );
-        assert_eq!(
-            check_summary(
-                &json!([{ "state": "SUCCESS" }, { "conclusion": "SKIPPED" }]),
-                4
-            )["state"],
-            "passing"
-        );
-        assert_eq!(
-            check_summary(
-                &json!([{ "state": "FAILURE" }, { "conclusion": "SUCCESS" }]),
-                5
-            )["state"],
-            "failing"
-        );
-        assert_eq!(
-            check_summary(&json!([{ "conclusion": "ACTION_REQUIRED" }]), 6)["state"],
-            "failing"
-        );
-    }
-
-    #[test]
-    fn v2_settings_migration_backfills_empty_task_transitions() {
-        let mut v2 = empty_durable_state();
-        v2["version"] = json!(V2_STATE_VERSION);
-        v2["task_transitions"] = json!({});
-
-        let migrated = migrate_v2_durable_state(&v2).unwrap();
-        assert_eq!(migrated["task_transitions"], empty_task_transitions());
-    }
-
-    #[test]
-    fn v2_settings_migration_preserves_pr_reconciliation_and_task_transition_data() {
-        let mut v2 = empty_durable_state();
-        v2["version"] = json!(V2_STATE_VERSION);
-        v2["pull_requests"]["s1"] = json!({
-            "session_id": "s1", "url": "https://github.com/o/r/pull/1", "state": "open",
-            "remote": "https://github.com/o/r.git", "branch": "topic", "updated_at": 7,
-        });
-        v2["reconciliation"]["error"] = json!("keep");
-        v2["task_transitions"]["on_open"] = json!("in_review");
-        let migrated = migrate_v2_durable_state(&v2).unwrap();
-        assert_eq!(migrated["version"], STATE_VERSION);
-        assert_eq!(
-            migrated["pull_requests"]["s1"]["url"],
-            v2["pull_requests"]["s1"]["url"]
-        );
-        assert!(migrated["pull_requests"]["s1"]["check_summary"].is_null());
-        assert_eq!(migrated["reconciliation"], v2["reconciliation"]);
-        assert_eq!(migrated["task_transitions"], v2["task_transitions"]);
-    }
-
-    #[test]
-    fn v1_settings_migration_preserves_existing_pr_and_reconciliation_data() {
-        let v1 = json!({
-            "version": LEGACY_STATE_VERSION,
-            "pull_requests": { "s1": pr_mapping("s1", "https://github.com/o/r/pull/1", "open", Some("https://github.com/o/r.git"), Some("topic"), 7, Value::Null) },
-            "reconciliation": empty_durable_state()["reconciliation"].clone(),
-        });
-        let migrated = migrate_v1_durable_state(&v1).unwrap();
-        assert_eq!(migrated["version"], STATE_VERSION);
-        assert_eq!(migrated["pull_requests"], v1["pull_requests"]);
-        assert_eq!(migrated["reconciliation"], v1["reconciliation"]);
-        assert_eq!(migrated["task_transitions"], empty_task_transitions());
-    }
-
-    #[test]
-    fn only_real_persisted_pr_state_transitions_are_eligible_for_task_actions() {
-        assert_eq!(
-            detect_pr_state_transition(None, "open"),
-            Some(PrStateTransition::Opened)
-        );
-        assert_eq!(
-            detect_pr_state_transition(Some("draft"), "open"),
-            Some(PrStateTransition::Opened)
-        );
-        assert_eq!(detect_pr_state_transition(Some("open"), "open"), None);
-        assert_eq!(
-            detect_pr_state_transition(Some("open"), "merged"),
-            Some(PrStateTransition::Merged)
-        );
-        assert_eq!(detect_pr_state_transition(Some("merged"), "merged"), None);
-    }
-
-    #[test]
-    fn linked_pr_url_overrides_the_session_branch_for_status_lookup() {
-        assert_eq!(
-            pr_view_reference(
-                "feat/plugin-discovery",
-                &json!({ "url": "https://github.com/owner/repository/pull/42" }),
-            )
-            .unwrap(),
-            "https://github.com/owner/repository/pull/42"
-        );
-        assert_eq!(
-            pr_view_reference("feat/plugin-discovery", &Value::Null).unwrap(),
-            "feat/plugin-discovery"
-        );
+        assert_eq!(github_repository_slug("git@gitlab.com:o/r.git"), None);
     }
 
     #[test]
@@ -2633,6 +2197,1027 @@ fi
         assert_eq!(response["plugin_name"], manifest["name"]);
         assert_eq!(response["plugin_version"], manifest["version"]);
         assert_eq!(response["host_api_version"], manifest["host_api_version"]);
+    }
+
+    /// An in-process PlaneAI host: deep-merged settings, a session list, and recorded task transitions.
+    struct FakeHost {
+        settings: Value,
+        sessions: Value,
+        contexts: HashMap<String, Value>,
+        transitions: Vec<(String, String)>,
+        /// Every host method called, in order.
+        calls: Vec<String>,
+    }
+
+    fn merge_settings_patch(target: &mut Value, patch: &Value) {
+        let target = target.as_object_mut().unwrap();
+        for (key, value) in patch.as_object().unwrap() {
+            if value.is_null() {
+                target.remove(key);
+            } else if value.is_object() {
+                let entry = target.entry(key.clone()).or_insert_with(|| json!({}));
+                if !entry.is_object() {
+                    *entry = json!({});
+                }
+                merge_settings_patch(entry, value);
+            } else {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    fn serve_host(
+        events: Receiver<ControllerEvent>,
+        host: Arc<Mutex<FakeHost>>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            while let Ok(ControllerEvent::HostCall {
+                method,
+                params,
+                response,
+                ..
+            }) = events.recv()
+            {
+                let mut host = host.lock().unwrap();
+                host.calls.push(method.clone());
+                let result = match method.as_str() {
+                    "host.settings.get" => {
+                        let value = params["path"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .try_fold(&host.settings, |value, key| {
+                                value.get(key.as_str().unwrap())
+                            })
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        json!({ "settings": value })
+                    }
+                    "host.settings.patch" => {
+                        merge_settings_patch(&mut host.settings, &params["patch"]);
+                        json!({ "updated": true })
+                    }
+                    "host.sessions.list" if host.sessions.is_null() => {
+                        let _ = response.send(Err(RequestError::Message(
+                            "sessions unavailable".to_string(),
+                        )));
+                        continue;
+                    }
+                    "host.sessions.list" => host.sessions.clone(),
+                    "host.sessions.repositoryContext" => {
+                        host.contexts[params["session_id"].as_str().unwrap()].clone()
+                    }
+                    "host.sessions.transitionLinkedTask" => {
+                        let transition = (
+                            params["session_id"].as_str().unwrap().to_string(),
+                            params["status"].as_str().unwrap().to_string(),
+                        );
+                        host.transitions.push(transition);
+                        json!({ "transitioned": true })
+                    }
+                    other => panic!("unexpected host call {other}"),
+                };
+                let _ = response.send(Ok(result));
+            }
+        })
+    }
+
+    /// Ends each `gh` call's arguments in the fake's argument log.
+    #[cfg(unix)]
+    const INVOCATION_END: &str = "--end-of-invocation--";
+
+    /// Fake `git` and `gh`: the remote follows the working tree. `gh api` serves the queued
+    /// `gh-response-*` answers in order, then empty data; `gh pr create` prints `gh-pr-create`;
+    /// every call's arguments go to `gh-args`, each call ending with `INVOCATION_END`.
+    #[cfg(unix)]
+    struct FakeGithubCli {
+        directory: TestDirectory,
+        runner: CommandRunner,
+    }
+
+    #[cfg(unix)]
+    impl FakeGithubCli {
+        fn new() -> Self {
+            let directory = TestDirectory::new();
+            fs::create_dir_all(directory.0.join("repo")).unwrap();
+            fs::create_dir_all(directory.0.join("other-repo")).unwrap();
+            fs::create_dir_all(directory.0.join("gitlab-repo")).unwrap();
+            let git = directory.script(
+                "git",
+                "#!/bin/sh\ncase \"$(pwd)\" in *other-repo) echo https://github.com/x/y.git ;; *gitlab-repo) echo https://gitlab.com/o/r.git ;; *) echo https://github.com/o/r.git ;; esac\n",
+            );
+            let root = directory.path().to_string();
+            let gh = directory.script(
+                "gh",
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" '{INVOCATION_END}' >> '{root}/gh-args'\nprintf x >> '{root}/gh-calls'\nif [ \"$1\" = api ]; then next=$(ls '{root}'/gh-response-* 2>/dev/null | head -n 1); if [ -n \"$next\" ]; then cat \"$next\"; rm \"$next\"; else printf '{{\"data\":{{}}}}'; fi; elif [ \"$1 $2\" = 'pr create' ]; then cat '{root}/gh-pr-create'; fi\n"
+                ),
+            );
+            Self {
+                runner: CommandRunner::new(git, gh),
+                directory,
+            }
+        }
+
+        /// Queues the answer to the next `gh api graphql` call that has none yet.
+        fn respond(&self, body: Value) {
+            let queued = fs::read_dir(&self.directory.0)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("gh-response-")
+                })
+                .count();
+            let path = self
+                .directory
+                .0
+                .join(format!("gh-response-{:04}", self.calls() + queued));
+            fs::write(path, body.to_string()).unwrap();
+        }
+
+        /// The arguments of each `gh` call, in order.
+        fn invocations(&self) -> Vec<Vec<String>> {
+            let args = fs::read_to_string(self.directory.0.join("gh-args")).unwrap_or_default();
+            let mut invocations = vec![Vec::new()];
+            for line in args.lines() {
+                if line == INVOCATION_END {
+                    invocations.push(Vec::new());
+                } else {
+                    invocations.last_mut().unwrap().push(line.to_string());
+                }
+            }
+            invocations.pop();
+            invocations
+        }
+
+        /// The calls that start with these arguments.
+        fn invocations_of(&self, command: &[&str]) -> Vec<Vec<String>> {
+            self.invocations()
+                .into_iter()
+                .filter(|args| args.len() >= command.len() && args[..command.len()] == *command)
+                .collect()
+        }
+
+        fn calls(&self) -> usize {
+            fs::read_to_string(self.directory.0.join("gh-calls"))
+                .map(|calls| calls.len())
+                .unwrap_or(0)
+        }
+
+        fn context(
+            &self,
+            session_id: &str,
+            repository: &str,
+            branch: &str,
+            task_key: Option<&str>,
+        ) -> Value {
+            json!({
+                "session_id": session_id, "project_id": "p", "branch": branch, "base_branch": "main",
+                "working_tree_path": self.directory.0.join(repository), "linked_task_key": task_key,
+            })
+        }
+    }
+
+    fn graphql_pr(
+        repository: &str,
+        number: u64,
+        state: &str,
+        head: &str,
+        base: &str,
+        rollup: &str,
+    ) -> Value {
+        json!({
+            "number": number, "url": format!("https://github.com/{repository}/pull/{number}"), "title": format!("Change {number}"),
+            "state": state, "isDraft": false, "updatedAt": format!("2026-10-{:02}T00:00:00Z", number), "headRefName": head,
+            "baseRefName": base, "isCrossRepository": false,
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": if rollup.is_empty() { Value::Null } else { json!({ "state": rollup }) } } }] },
+        })
+    }
+
+    fn with_host<T>(
+        runner: &CommandRunner,
+        host: &Arc<Mutex<FakeHost>>,
+        operation: impl FnOnce(&ExecutionContext) -> T,
+    ) -> T {
+        let (events, events_rx) = mpsc::channel();
+        let server = serve_host(events_rx, Arc::clone(host));
+        let context = ExecutionContext {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events,
+            runner: runner.clone(),
+            request_key: "test-request".to_string(),
+            callback_sequence: Arc::new(AtomicU64::new(1)),
+            durable_state_locks: DurableStateLocks {
+                reconciliation: Arc::new(Mutex::new(())),
+                pull_requests: Arc::new(Mutex::new(())),
+            },
+        };
+        let result = operation(&context);
+        drop(context);
+        server.join().unwrap();
+        result
+    }
+
+    fn numbers(value: &Value) -> Vec<u64> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pr| pr["number"].as_u64().unwrap())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_migrates_legacy_mappings_unions_the_task_and_transitions_once() {
+        let cli = FakeGithubCli::new();
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["version"] = json!(3);
+        settings["github"]["task_transitions"]["on_open"] = json!("in_review");
+        settings["github"]["pull_requests"] = json!({
+            "s1": { "session_id": "s1", "url": "https://github.com/o/r/pull/3", "state": "draft", "remote": "https://github.com/o/r.git", "branch": "topic", "updated_at": 1, "check_summary": null },
+            "s2": { "session_id": "s2", "url": "https://github.com/x/y/pull/8", "state": "closed", "updated_at": 1, "check_summary": null },
+        });
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [
+                { "id": "s1", "project_id": "p", "task_key": "T-1", "status": "active", "branch": "topic" },
+                { "id": "s2", "project_id": "p", "task_key": "T-1", "status": "archived", "branch": "other" },
+                { "id": "s3", "project_id": "p", "task_key": "T-2", "status": "active", "branch": "unrelated" },
+            ] }),
+            contexts: HashMap::from([(
+                "s1".to_string(),
+                cli.context("s1", "repo", "topic", Some("T-1")),
+            )]),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+        let round = json!({ "data": {
+            "r0": {
+                "squashMergeAllowed": true, "mergeCommitAllowed": true, "rebaseMergeAllowed": false,
+                "l0": graphql_pr("o/r", 3, "OPEN", "feature", "main", ""),
+                "l2": { "nodes": [graphql_pr("o/r", 4, "OPEN", "topic", "main", "FAILURE")] },
+            },
+            "r1": { "l1": graphql_pr("x/y", 8, "MERGED", "other", "main", "SUCCESS") },
+        } });
+
+        cli.respond(round.clone());
+        let first = with_host(&cli.runner, &host, |context| {
+            status(&json!({ "session_id": "s1" }), context)
+        })
+        .unwrap();
+        assert_eq!(
+            numbers(&first["pull_requests"]),
+            vec![3, 4, 8],
+            "the archived sibling's PR is part of the task"
+        );
+        assert_eq!(first["repository"], "o/r");
+        assert_eq!(
+            first["own_url"], "https://github.com/o/r/pull/4",
+            "the branch PR is the session's own"
+        );
+        assert_eq!(
+            numbers(&first["details"]),
+            vec![3, 4, 8],
+            "every PR of the task has details for the panel"
+        );
+        let own_detail = first["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|detail| detail["number"] == 4)
+            .unwrap();
+        assert_eq!(own_detail["merge_methods"], json!(["squash", "merge"]));
+        assert_eq!(first["changed"], true);
+        assert_eq!(
+            cli.calls(),
+            2,
+            "one batched query, then one for the stack neighbors it revealed"
+        );
+
+        let stored = host.lock().unwrap().settings["github"].clone();
+        assert_eq!(stored["version"], STATE_VERSION);
+        assert_eq!(stored["pull_requests"]["s1"][0]["source"], "manual");
+        assert_eq!(stored["pull_requests"]["s1"][0]["state"], "open");
+        assert_eq!(stored["pull_requests"]["s1"][1]["source"], "branch");
+        assert_eq!(stored["pull_requests"]["s1"][1]["checks"], "failing");
+        assert_eq!(stored["pull_requests"]["s2"][0]["state"], "merged");
+        assert_eq!(
+            host.lock().unwrap().transitions,
+            vec![("s1".to_string(), "in_review".to_string())]
+        );
+
+        cli.respond(round);
+        let second = with_host(&cli.runner, &host, |context| {
+            status(&json!({ "session_id": "s1" }), context)
+        })
+        .unwrap();
+        assert_eq!(second["changed"], false);
+        assert_eq!(second["pull_requests"], first["pull_requests"]);
+        assert_eq!(
+            host.lock().unwrap().transitions.len(),
+            1,
+            "an unchanged state never repeats a transition"
+        );
+
+        let first = &cli.invocations()[0];
+        assert_eq!(first[..3], ["api", "graphql", "-f"]);
+        assert!(first[3].starts_with("query=query { r0: repository(owner: \"o\", name: \"r\")"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_appends_and_unlink_or_dismiss_writes_task_wide_tombstones() {
+        let cli = FakeGithubCli::new();
+        let mut settings = json!({ "github": empty_durable_state() });
+        let open = |number: u64, repository: &str, source: &str| {
+            json!({
+                "host": "github.com", "repository": repository, "number": number, "url": format!("https://github.com/{repository}/pull/{number}"),
+                "source": source, "state": "open", "refreshed_at": 1,
+            })
+        };
+        settings["github"]["pull_requests"] =
+            json!({ "s1": [open(4, "o/r", "branch")], "s2": [open(9, "o/r", "stack")] });
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [
+                { "id": "s1", "project_id": "p", "task_key": "T-1", "status": "active" },
+                { "id": "s2", "project_id": "p", "task_key": "T-1", "status": "active" },
+            ] }),
+            contexts: HashMap::from([(
+                "s1".to_string(),
+                cli.context("s1", "repo", "topic", Some("T-1")),
+            )]),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+
+        cli.respond(json!({ "data": { "r0": { "l0": graphql_pr("other/repo", 12, "OPEN", "x", "main", "PENDING") } } }));
+        let linked = with_host(&cli.runner, &host, |context| {
+            link_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/Other/Repo/pull/12" }),
+                context,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            numbers(&linked["pull_requests"]),
+            vec![4, 9, 12],
+            "linking appends instead of replacing"
+        );
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][1]["source"],
+            "manual"
+        );
+
+        let unlink = |url: &str| {
+            with_host(&cli.runner, &host, |context| {
+                unlink_pull_request(&json!({ "session_id": "s1", "url": url }), context)
+            })
+        };
+        assert_eq!(
+            numbers(&unlink("https://github.com/other/repo/pull/12").unwrap()["pull_requests"]),
+            vec![4, 9]
+        );
+        assert_eq!(
+            numbers(&unlink("https://github.com/o/r/pull/9").unwrap()["pull_requests"]),
+            vec![4],
+            "a sibling's stack PR is dismissed"
+        );
+        assert!(
+            unlink("https://github.com/o/r/pull/4").is_err(),
+            "branch PRs follow the branch"
+        );
+        assert!(
+            unlink("https://github.com/o/r/pull/9").is_err(),
+            "a dismissed PR cannot be dismissed again"
+        );
+        let stored = host.lock().unwrap().settings["github"]["pull_requests"].clone();
+        assert_eq!(stored["s1"][1]["source"], "unlinked");
+        assert_eq!(
+            stored["s2"][0],
+            json!({ "host": "github.com", "repository": "o/r", "number": 9, "url": "https://github.com/o/r/pull/9", "source": "stack-dismissed" })
+        );
+        assert_eq!(cli.calls(), 1, "unlinking never asks GitHub");
+    }
+
+    fn stored_link(number: u64, source: &str, state: &str) -> Value {
+        json!({
+            "host": "github.com", "repository": "o/r", "number": number, "url": format!("https://github.com/o/r/pull/{number}"),
+            "source": source, "state": state, "refreshed_at": 1,
+        })
+    }
+
+    fn merge_transition_host(
+        cli: &FakeGithubCli,
+        links: Value,
+        branch: &str,
+    ) -> Arc<Mutex<FakeHost>> {
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["task_transitions"]["on_merge"] = json!("done");
+        settings["github"]["pull_requests"] = json!({ "s1": links });
+        Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [{ "id": "s1", "project_id": "p", "task_key": "T-1", "status": "active" }] }),
+            contexts: HashMap::from([(
+                "s1".to_string(),
+                cli.context("s1", "repo", branch, Some("T-1")),
+            )]),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlinking_the_last_open_pull_request_after_a_merge_finishes_the_task() {
+        let cli = FakeGithubCli::new();
+        let mut open = stored_link(4, "manual", "open");
+        open["created_at"] = json!("2026-10-02T00:00:00Z");
+        let mut merged = stored_link(5, "manual", "merged");
+        merged["merged_at"] = json!("2026-10-03T00:00:00Z");
+        let host = merge_transition_host(&cli, json!([open, merged]), "topic");
+        with_host(&cli.runner, &host, |context| {
+            unlink_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4" }),
+                context,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            host.lock().unwrap().transitions,
+            vec![("s1".to_string(), "done".to_string())]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_branch_moving_away_keeps_its_open_pull_request_and_the_task_open() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(
+            &cli,
+            json!([
+                stored_link(4, "branch", "open"),
+                stored_link(5, "manual", "merged")
+            ]),
+            "other",
+        );
+        cli.respond(json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "OPEN", "topic", "main", ""),
+            "l1": graphql_pr("o/r", 5, "MERGED", "done", "main", ""),
+            "l2": { "nodes": [] },
+        } } }));
+        let result = with_host(&cli.runner, &host, |context| {
+            status(&json!({ "session_id": "s1" }), context)
+        })
+        .unwrap();
+        assert_eq!(
+            numbers(&result["pull_requests"]),
+            vec![4, 5],
+            "the old branch pull request stays with the task"
+        );
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["source"],
+            "manual",
+            "and can be unlinked now that the branch no longer follows it"
+        );
+        assert!(
+            host.lock().unwrap().transitions.is_empty(),
+            "the pull request is still open on GitHub"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actions_fail_before_any_change_when_the_tasks_sessions_cannot_be_listed() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "topic");
+        host.lock().unwrap().sessions = Value::Null;
+        let before = host.lock().unwrap().settings.clone();
+        let failure = |result: Result<Value, RequestError>| match result {
+            Err(RequestError::Message(message)) => message,
+            other => panic!("expected an error, got {other:?}"),
+        };
+        let link = with_host(&cli.runner, &host, |context| {
+            link_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/12" }),
+                context,
+            )
+        });
+        assert_eq!(
+            failure(link),
+            "Could not list the task's sessions; try again."
+        );
+        let merge = with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4", "strategy": "squash" }),
+                context,
+            )
+        });
+        assert_eq!(
+            failure(merge),
+            "Could not list the task's sessions; try again."
+        );
+        let unlink = with_host(&cli.runner, &host, |context| {
+            unlink_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4" }),
+                context,
+            )
+        });
+        assert_eq!(
+            failure(unlink),
+            "Could not list the task's sessions; try again."
+        );
+        assert_eq!(cli.calls(), 0, "nothing happens on GitHub either");
+        assert_eq!(host.lock().unwrap().settings, before);
+        assert!(host.lock().unwrap().transitions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_skips_a_task_whose_stored_links_cannot_be_read() {
+        let cli = FakeGithubCli::new();
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["pull_requests"] = json!({
+            "s1": [stored_link(4, "manual", "open")],
+            "s2": [{ "host": "github.com", "repository": "o/r", "number": 5, "url": "https://github.com/o/r/pull/5", "source": "unknown" }],
+        });
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [
+                { "id": "s1", "project_id": "p", "task_key": "T-1", "status": "active" },
+                { "id": "s2", "project_id": "p", "task_key": "T-2", "status": "active" },
+            ] }),
+            contexts: HashMap::from([
+                (
+                    "s1".to_string(),
+                    cli.context("s1", "repo", "topic", Some("T-1")),
+                ),
+                (
+                    "s2".to_string(),
+                    cli.context("s2", "repo", "other", Some("T-2")),
+                ),
+            ]),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+        cli.respond(json!({ "data": { "r0": {
+            "l0": graphql_pr("o/r", 4, "MERGED", "feature", "main", ""),
+            "l1": { "nodes": [] },
+        } } }));
+
+        let result = with_host(&cli.runner, &host, reconcile).unwrap();
+        assert_eq!(result["checked"], 2);
+        let stored = host.lock().unwrap().settings["github"].clone();
+        assert_eq!(stored["reconciliation"]["status"], "idle");
+        assert_eq!(stored["pull_requests"]["s1"][0]["state"], "merged");
+        assert_eq!(
+            stored["pull_requests"]["s2"][0]["source"], "unknown",
+            "left as it was"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_task_reads_its_stored_links_once_however_many_sessions_it_has() {
+        let cli = FakeGithubCli::new();
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["pull_requests"] = json!({
+            "s1": [stored_link(4, "manual", "open")],
+            "s2": [stored_link(5, "manual", "open")],
+            "s3": [stored_link(6, "manual", "open")],
+        });
+        let session = |id: &str| json!({ "id": id, "project_id": "p", "task_key": "T-1", "status": "active" });
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [session("s1"), session("s2"), session("s3")] }),
+            contexts: HashMap::new(),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+        let count = |method: &str| {
+            let mut host = host.lock().unwrap();
+            let count = host.calls.iter().filter(|call| *call == method).count();
+            host.calls.clear();
+            count
+        };
+
+        with_host(&cli.runner, &host, |context| {
+            summary(&json!({ "session_id": "s1" }), context)
+        })
+        .unwrap();
+        assert_eq!(
+            count("host.settings.get"),
+            2,
+            "the version, then every link at once"
+        );
+
+        with_host(&cli.runner, &host, |context| {
+            unlink_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/5" }),
+                context,
+            )
+        })
+        .unwrap();
+        let reads = count("host.settings.get");
+        assert_eq!(reads, 2, "the version once, then every link at once");
+    }
+
+    #[test]
+    fn migration_waits_for_pull_request_writes_in_flight() {
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["version"] = json!(3);
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [] }),
+            contexts: HashMap::new(),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+        let (events, events_rx) = mpsc::channel();
+        let server = serve_host(events_rx, Arc::clone(&host));
+        let mut context = test_context(CommandRunner::default());
+        context.events = events;
+        let pull_requests = Arc::clone(&context.durable_state_locks.pull_requests);
+        let write_in_flight = pull_requests.lock().unwrap();
+        let migration = thread::spawn(move || ensure_durable_state(&context, false));
+
+        let deadline = Instant::now() + TEST_WAIT;
+        while host.lock().unwrap().calls.is_empty() {
+            assert!(Instant::now() < deadline, "the migration never started");
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["version"],
+            3,
+            "rewriting the namespace now would undo the write in flight"
+        );
+        drop(write_in_flight);
+        migration.join().unwrap().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["version"],
+            STATE_VERSION
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_checks_the_strategy_with_one_graphql_lookup() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "topic");
+        let lookup = json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "OPEN", "topic", "main", "SUCCESS"),
+        } } });
+        let merge = |strategy: &str| {
+            with_host(&cli.runner, &host, |context| {
+                merge_pull_request(
+                    &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4", "strategy": strategy }),
+                    context,
+                )
+            })
+        };
+
+        cli.respond(lookup.clone());
+        assert!(
+            merge("rebase").is_err(),
+            "rebase is disabled for the repository"
+        );
+        cli.respond(lookup);
+        let mut merged = graphql_pr("o/r", 4, "MERGED", "topic", "main", "SUCCESS");
+        merged["mergedAt"] = json!("2026-10-05T12:00:00Z");
+        cli.respond(json!({ "data": { "r0": { "l0": merged } } }));
+        assert_eq!(merge("squash").unwrap(), json!({ "merged": true }));
+
+        assert!(
+            cli.invocations_of(&["api", "repos/o/r"]).is_empty(),
+            "no REST repository lookup"
+        );
+        assert_eq!(
+            cli.invocations_of(&["api", "graphql"]).len(),
+            3,
+            "one lookup per merge attempt, and one for the merge time"
+        );
+        assert_eq!(
+            cli.invocations_of(&["pr", "merge"]),
+            [[
+                "pr",
+                "merge",
+                "https://github.com/o/r/pull/4",
+                "--squash",
+                "--delete-branch"
+            ]]
+        );
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["state"],
+            "merged"
+        );
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["merged_at"],
+            "2026-10-05T12:00:00Z",
+            "GitHub's merge time, not this machine's clock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn summary_says_whether_github_applies_only_when_asked() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "branch", "open")]), "topic");
+        host.lock().unwrap().contexts.insert(
+            "s2".to_string(),
+            cli.context("s2", "gitlab-repo", "topic", None),
+        );
+        let summary_of = |params: Value| {
+            with_host(&cli.runner, &host, |context| summary(&params, context)).unwrap()
+        };
+
+        let cached = summary_of(json!({ "session_id": "s1" }));
+        assert_eq!(numbers(&cached["pull_requests"]), vec![4]);
+        assert!(
+            cached.get("applicable").is_none(),
+            "the sidebar pill never runs git"
+        );
+        assert_eq!(
+            summary_of(json!({ "session_id": "s1", "check_repository": true }))["applicable"],
+            true
+        );
+        assert_eq!(
+            summary_of(json!({ "session_id": "s2", "check_repository": true }))["applicable"],
+            false
+        );
+        assert_eq!(cli.calls(), 0, "a summary never asks GitHub");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_without_the_task_keeps_the_change_for_one_that_has_it() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "other");
+        let sessions = host.lock().unwrap().sessions.clone();
+        host.lock().unwrap().sessions = Value::Null;
+        let merged = json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "MERGED", "topic", "main", ""),
+            "l1": { "nodes": [] },
+        } } });
+        let refresh = || {
+            with_host(&cli.runner, &host, |context| {
+                status(&json!({ "session_id": "s1" }), context)
+            })
+            .unwrap()
+        };
+
+        cli.respond(merged.clone());
+        let unresolved = refresh();
+        assert_eq!(
+            unresolved["pull_requests"][0]["state"], "merged",
+            "the panel still sees what GitHub said"
+        );
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["state"],
+            "open",
+            "nothing is stored while the task's other sessions are unknown"
+        );
+        assert!(host.lock().unwrap().transitions.is_empty());
+
+        host.lock().unwrap().sessions = sessions;
+        cli.respond(merged);
+        refresh();
+        assert_eq!(
+            host.lock().unwrap().transitions,
+            vec![("s1".to_string(), "done".to_string())]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actions_target_the_url_else_the_sessions_own_pull_request_and_reject_bad_urls() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "draft")]), "topic");
+        let ready =
+            |params: Value| with_host(&cli.runner, &host, |context| mark_ready(&params, context));
+        assert!(
+            ready(json!({ "session_id": "s1", "url": "https://example.com/o/r/pull/4" })).is_err()
+        );
+        ready(json!({ "session_id": "s1" })).unwrap();
+        ready(json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/9" })).unwrap();
+        assert_eq!(
+            cli.invocations(),
+            [
+                ["pr", "ready", "https://github.com/o/r/pull/4"],
+                ["pr", "ready", "https://github.com/o/r/pull/9"],
+            ],
+            "the session's own pull request, not its branch, when no url is given"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_github_queues_stays_open_until_it_lands() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "topic");
+        let lookup = json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "OPEN", "topic", "main", ""),
+        } } });
+        cli.respond(lookup.clone());
+        cli.respond(lookup);
+        with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4", "strategy": "squash" }),
+                context,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["state"],
+            "open",
+            "the follow-up lookup is what GitHub says, even when a merge queue holds the pull request"
+        );
+        assert!(host.lock().unwrap().transitions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_whose_follow_up_lookup_fails_is_stored_as_merged_at_an_unknown_time() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "topic");
+        cli.respond(json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "OPEN", "topic", "main", ""),
+        } } }));
+        with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4", "strategy": "squash" }),
+                context,
+            )
+        })
+        .unwrap();
+        let stored = host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0].clone();
+        assert_eq!(stored["state"], "merged");
+        assert!(stored.get("merged_at").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merging_a_pull_request_from_another_branch_keeps_that_branch() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([]), "topic");
+        cli.respond(json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 7, "OPEN", "someone-else", "main", ""),
+        } } }));
+        with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/7", "strategy": "squash" }),
+                context,
+            )
+        })
+        .unwrap();
+        let calls = cli.invocations();
+        assert_eq!(
+            cli.invocations_of(&["pr", "merge"]),
+            [["pr", "merge", "https://github.com/o/r/pull/7", "--squash"]]
+        );
+        assert_eq!(
+            cli.invocations_of(&["api", "graphql"]).len(),
+            2,
+            "the detail lookup, then one for the merge time"
+        );
+        assert_eq!(calls.last().unwrap()[..2], ["api", "graphql"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_stores_githubs_creation_time_when_it_can_read_it() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([]), "topic");
+        fs::write(
+            cli.directory.0.join("gh-pr-create"),
+            "https://github.com/o/r/pull/7\n",
+        )
+        .unwrap();
+        let create = || {
+            with_host(&cli.runner, &host, |context| {
+                create_pull_request(
+                    &json!({ "session_id": "s1", "title": "Change", "base_branch": "main" }),
+                    context,
+                )
+            })
+        };
+        let mut created = graphql_pr("o/r", 7, "OPEN", "topic", "main", "");
+        created["createdAt"] = json!("2026-10-04T08:00:00Z");
+        cli.respond(json!({ "data": { "r0": { "l0": created } } }));
+        create().unwrap();
+        let stored = || host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0].clone();
+        assert_eq!(stored()["created_at"], "2026-10-04T08:00:00Z");
+
+        host.lock().unwrap().settings["github"]["pull_requests"]["s1"] = json!([]);
+        create().expect("a failed follow-up lookup does not fail the creation");
+        assert_eq!(stored()["number"], 7);
+        assert!(
+            stored().get("created_at").is_none(),
+            "an unknown time stays unknown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merging_another_repositorys_pull_request_keeps_its_branch() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([]), "topic");
+        cli.respond(json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("x/y", 7, "OPEN", "feature", "main", ""),
+        } } }));
+        with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/x/y/pull/7", "strategy": "squash" }),
+                context,
+            )
+        })
+        .unwrap();
+        let calls = cli.invocations();
+        assert_eq!(
+            cli.invocations_of(&["pr", "merge"]),
+            [["pr", "merge", "https://github.com/x/y/pull/7", "--squash"]]
+        );
+        assert_eq!(
+            cli.invocations_of(&["api", "graphql"]).len(),
+            2,
+            "the detail lookup, then one for the merge time"
+        );
+        assert_eq!(calls.last().unwrap()[..2], ["api", "graphql"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_refreshes_every_task_in_one_query_and_transitions_when_all_merge() {
+        let cli = FakeGithubCli::new();
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["task_transitions"]["on_merge"] = json!("done");
+        settings["github"]["pull_requests"] = json!({
+            "s1": [{ "host": "github.com", "repository": "o/r", "number": 4, "url": "https://github.com/o/r/pull/4", "source": "branch", "state": "open", "head_branch": "topic", "base_branch": "main", "refreshed_at": 1 }],
+            "s2": [{ "host": "github.com", "repository": "x/y", "number": 8, "url": "https://github.com/x/y/pull/8", "source": "manual", "state": "open", "refreshed_at": 1 }],
+        });
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [
+                { "id": "s1", "project_id": "p", "task_key": "T-1", "status": "active" },
+                { "id": "s2", "project_id": "p", "task_key": "T-1", "status": "active" },
+                { "id": "s3", "project_id": "p", "status": "archived" },
+            ] }),
+            contexts: HashMap::from([
+                (
+                    "s1".to_string(),
+                    cli.context("s1", "repo", "topic", Some("T-1")),
+                ),
+                (
+                    "s2".to_string(),
+                    cli.context("s2", "other-repo", "other", Some("T-1")),
+                ),
+            ]),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+        let merged = json!({ "data": {
+            "r0": {
+                "l0": graphql_pr("o/r", 4, "MERGED", "topic", "main", "SUCCESS"),
+                "l2": { "nodes": [graphql_pr("o/r", 4, "MERGED", "topic", "main", "SUCCESS")] },
+                "l4": { "nodes": [] }, "l5": { "nodes": [] },
+            },
+            "r1": { "l1": graphql_pr("x/y", 8, "MERGED", "feature", "main", ""), "l3": { "nodes": [] } },
+        } });
+
+        cli.respond(merged.clone());
+        let result = with_host(&cli.runner, &host, reconcile).unwrap();
+        assert_eq!(result["checked"], 2);
+        assert_eq!(result["changed"], true);
+        assert_eq!(cli.calls(), 1, "both repositories share one query");
+        let stored = host.lock().unwrap().settings["github"].clone();
+        assert_eq!(stored["reconciliation"]["status"], "idle");
+        assert_eq!(stored["pull_requests"]["s1"][0]["state"], "merged");
+        assert_eq!(stored["pull_requests"]["s2"][0]["state"], "merged");
+        assert_eq!(
+            host.lock().unwrap().transitions,
+            vec![("s1".to_string(), "done".to_string())]
+        );
+
+        cli.respond(merged);
+        let unchanged = with_host(&cli.runner, &host, reconcile).unwrap();
+        assert_eq!(
+            unchanged["changed"], false,
+            "the host skips its data refresh after an idle reconcile"
+        );
+        assert_eq!(host.lock().unwrap().transitions.len(), 1);
     }
 
     fn test_context(runner: CommandRunner) -> ExecutionContext {
@@ -2654,15 +3239,38 @@ fi
     struct TestDirectory(PathBuf);
 
     #[cfg(unix)]
+    #[test]
+    fn test_directories_never_share_a_path() {
+        let start = Arc::new(std::sync::Barrier::new(16));
+        let directories: Vec<TestDirectory> = (0..16)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    TestDirectory::new()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let paths: BTreeSet<&PathBuf> = directories.iter().map(|directory| &directory.0).collect();
+        assert_eq!(
+            paths.len(),
+            directories.len(),
+            "tests starting together get their own directory"
+        );
+    }
+
+    #[cfg(unix)]
     impl TestDirectory {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            // The clock alone is not unique: macOS reports microseconds, so parallel tests collided.
+            static NEXT: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "planeai-plugin-github-test-{}-{nonce}",
-                std::process::id()
+                "planeai-plugin-github-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&path).unwrap();
             Self(path)
@@ -2764,14 +3372,14 @@ fi
     #[cfg(unix)]
     fn receive_frame(receiver: &Receiver<String>) -> Value {
         let line = receiver
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(TEST_WAIT)
             .expect("expected JSON-RPC frame");
         serde_json::from_str(&line).unwrap()
     }
 
     #[cfg(unix)]
     fn wait_for_file(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + TEST_WAIT;
         while !path.exists() {
             assert!(Instant::now() < deadline, "fake gh did not start");
             thread::sleep(Duration::from_millis(10));

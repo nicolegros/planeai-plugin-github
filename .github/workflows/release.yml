@@ -135,7 +135,7 @@ jobs:
           ROOT="dist/planeai-plugin-github"
           mkdir -p "$ROOT/bin/${{ matrix.platform }}" "$ROOT/ui"
           cp planeai-plugin.json "$ROOT/"
-          cp build/ui/entry.js build/ui/titlebar.js build/ui/settings.js build/ui/indicator.js "$ROOT/ui/"
+          cp build/package/ui/entry.js build/package/ui/titlebar.js build/package/ui/settings.js build/package/ui/meta.js "$ROOT/ui/"
           cp "target/release/${{ matrix.binary }}" "$ROOT/bin/${{ matrix.platform }}/${{ matrix.binary }}"
           chmod +x "$ROOT/bin/${{ matrix.platform }}/${{ matrix.binary }}"
       - name: Stage package (Windows)
@@ -145,10 +145,10 @@ jobs:
           $root = 'dist/planeai-plugin-github'
           New-Item -ItemType Directory -Force -Path "$root/bin/${{ matrix.platform }}", "$root/ui" | Out-Null
           Copy-Item planeai-plugin.json "$root/planeai-plugin.json"
-          Copy-Item build/ui/entry.js "$root/ui/entry.js"
-          Copy-Item build/ui/titlebar.js "$root/ui/titlebar.js"
-          Copy-Item build/ui/settings.js "$root/ui/settings.js"
-          Copy-Item build/ui/indicator.js "$root/ui/indicator.js"
+          Copy-Item build/package/ui/entry.js "$root/ui/entry.js"
+          Copy-Item build/package/ui/titlebar.js "$root/ui/titlebar.js"
+          Copy-Item build/package/ui/settings.js "$root/ui/settings.js"
+          Copy-Item build/package/ui/meta.js "$root/ui/meta.js"
           Copy-Item "target/release/${{ matrix.binary }}" "$root/bin/${{ matrix.platform }}/${{ matrix.binary }}"
       - name: Verify staged package handshake
         run: node scripts/verify-package-handshake.mjs dist/planeai-plugin-github ${{ matrix.platform }}

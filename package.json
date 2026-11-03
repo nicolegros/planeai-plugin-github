@@ -4,16 +4,24 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:ui": "tsc",
-    "test:ui": "tsc && node --test build/tests/ui-entry-shortcuts.test.js"
+    "build:ui": "make build-ui",
+    "test:ui": "make build-ui && node --test build/tests/*.test.js"
   },
   "devDependencies": {
     "@auto-it/conventional-commits": "11.3.6",
     "@auto-it/git-tag": "11.3.6",
     "@auto-it/upload-assets": "11.3.6",
+    "@types/jsdom": "30.0.0",
     "@types/node": "25.9.1",
     "auto": "11.3.6",
+    "esbuild": "0.25.12",
+    "jsdom": "30.1.3",
     "typescript": "7.0.2"
   },
-  "packageManager": "pnpm@10.28.2"
+  "packageManager": "pnpm@10.28.2",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
 }
