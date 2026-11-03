@@ -36,12 +36,13 @@ function mountPanel(sessionId = "s1", { listens = true, echoes = true, changedFa
       },
       navigation: { openExternal: () => {} },
       recipient: { getFocusedAgentSession: async () => ({ id: "agent" }) },
-      // Like the host, data.changed notifies every view of the plugin, this one included.
+      // Like the host, data.changed notifies every view of the plugin, this one included, later
+      // on, as a Tauri event does.
       data: {
         changed: async () => {
           changed += 1;
           if (changedFails) throw new Error("the host could not refresh plugin views");
-          if (echoes) listeners.forEach((listener) => listener());
+          if (echoes) setTimeout(() => listeners.forEach((listener) => listener()), 0);
         },
         ...(listens ? { onChanged: (listener: () => void) => { listeners.add(listener); return () => listeners.delete(listener); } } : {}),
         notify: () => {},
@@ -91,24 +92,47 @@ test("only the latest status refresh renders, whatever order the answers come in
   assert.match(panel.root.querySelector(".pr-title").textContent, /^Third/);
 });
 
-test("a change tells the host once and reloads the panel itself, whatever the echo does", async () => {
-  const panel = mountPanel();
+/** Unlinks #2 and waits for the host's echo, returning the panel's own reload and the echo's. */
+async function unlinkAndEcho(panel: ReturnType<typeof mountPanel>) {
   await panel.answer("github.status", status());
   panel.root.querySelector<HTMLButtonElement>('button[aria-label="Unlink #2"]').click();
   await panel.answer("github.unlink", { pull_requests: [] });
-  assert.equal(panel.changes(), 1);
-  const [, echoed, own] = panel.pending("github.status");
-  own.reply.resolve(status("Fresh"));
   await settle();
-  assert.match(panel.root.querySelector(".pr-title").textContent, /^Fresh/);
-  assert.equal(panel.root.querySelector<HTMLButtonElement>("button.refresh").disabled, false);
+  assert.equal(panel.changes(), 1);
+  const [, own, echoed] = panel.pending("github.status");
+  assert.ok(own && echoed, "the panel reloads itself, and the echo reloads it once more");
+  return { own, echoed };
+}
+
+const title = (root: Element) => root.querySelector(".pr-title").textContent;
+const idle = (root: Element) => root.querySelector<HTMLButtonElement>("button.refresh").disabled === false;
+
+test("after a change, an echo answer landing first shows the newest list and ends the wait", async () => {
+  const panel = mountPanel();
+  const { own, echoed } = await unlinkAndEcho(panel);
   echoed.reply.resolve(status("Echo"));
   await settle();
-  assert.match(panel.root.querySelector(".pr-title").textContent, /^Fresh/, "the older echo answer is dropped");
+  assert.match(title(panel.root), /^Echo/);
+  assert.ok(idle(panel.root));
+  own.reply.resolve(status("Own"));
+  await settle();
+  assert.match(title(panel.root), /^Echo/, "the older answer is dropped");
+  assert.ok(idle(panel.root));
+});
+
+test("after a change, its own answer landing first waits for the newer echo answer", async () => {
+  const panel = mountPanel();
+  const { own, echoed } = await unlinkAndEcho(panel);
+  own.reply.resolve(status("Own"));
+  await settle();
+  assert.ok(!idle(panel.root), "a newer reload is still on its way");
+  echoed.reply.resolve(status("Echo"));
+  await settle();
+  assert.match(title(panel.root), /^Echo/);
+  assert.ok(idle(panel.root));
   panel.dataChangedElsewhere();
   assert.equal(panel.pending("github.status").length, 4, "a change elsewhere right after still reloads");
 });
-
 test("a host whose echo never arrives still sees the panel return to idle with the fresh list", async () => {
   const panel = mountPanel("s1", { echoes: false });
   await panel.answer("github.status", status());
@@ -256,6 +280,7 @@ test("the footer hints the shortcuts for the highlighted pull request", async ()
 test("a refresh that changed stored pull requests tells the host, and the echo settles", async () => {
   const panel = mountPanel();
   await panel.answer("github.status", { ...status(), changed: true });
+  await settle();
   assert.equal(panel.changes(), 1);
   assert.equal(panel.pending("github.status").length, 2, "the host's echo reloads once");
   await panel.answer("github.status", status());
