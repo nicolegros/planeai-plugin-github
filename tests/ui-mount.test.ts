@@ -148,6 +148,29 @@ test("the titlebar reloads its summary when the plugin's data changes", async ()
   assert.equal(root.querySelector("button").dataset.state, "pull-requests");
 });
 
+test("an open link form, its value, and the merge strategy survive a remount until the form closes", async () => {
+  const first = mountPanel();
+  await first.answer("github.status", status());
+  first.root.querySelector<HTMLButtonElement>('button[data-merge-strategy="merge"]').click();
+  press("l", document.body);
+  const field = first.root.querySelector<HTMLInputElement>('input[type="url"]');
+  field.value = "https://github.com/o/r/pull/9";
+  field.dispatchEvent(new window.Event("input", { bubbles: true }));
+  first.dispose();
+
+  const second = mountPanel();
+  await second.answer("github.status", status());
+  assert.equal(second.root.querySelector<HTMLInputElement>('input[type="url"]')?.value, "https://github.com/o/r/pull/9");
+  press("Escape", second.root.querySelector('input[type="url"]'));
+  assert.equal(second.root.querySelector('input[type="url"]'), null);
+  assert.equal(second.root.querySelector('button[data-merge-strategy="merge"]')?.getAttribute("aria-pressed"), "true");
+  second.dispose();
+
+  const third = mountPanel();
+  await third.answer("github.status", status());
+  assert.equal(third.root.querySelector('input[type="url"]'), null, "a closed form stays closed");
+});
+
 test("the merge section offers the repository's strategies only for an open pull request", async () => {
   const panel = mountPanel();
   const draft = status();

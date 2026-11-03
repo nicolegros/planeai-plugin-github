@@ -53,7 +53,8 @@ The titlebar shows the same summary, or **Create PR** when the session has none;
 The panel lists every pull request of the task, each with its state, CI, title, repository when it differs from the session's, and source, and with **Unlink** or **Dismiss** and an open-on-GitHub action.
 Below the list, it details the highlighted pull request: its checks, merge, ready-for-review, and CI failure hand-off.
 
-One row is highlighted at a time, starting with the session's own pull request; the highlight is kept per session while the panel reloads.
+One row is highlighted at a time, starting with the session's own pull request.
+The highlight, the chosen merge strategy, and an open Create PR or Link form with its values are kept per session while the panel reloads, until the form is submitted or closed.
 When the GitHub session panel has focus, use these shortcuts:
 
 - `↑`/`↓` or `j`/`k` move the highlight while the list, or none of the panel's controls, has focus.

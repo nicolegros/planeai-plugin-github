@@ -32,6 +32,11 @@ type GithubPluginContext = {
   };
 };
 
+type CreateForm = { kind: "create"; title: string; body: string; base_branch: string; draft: boolean };
+type LinkForm = { kind: "link"; url: string };
+/** What a panel keeps for its session across remounts. */
+type PanelMemory = { highlight?: string | null; strategy?: string; form?: CreateForm | LinkForm | null };
+
 type GithubPluginEntrypoint = {
   mount: (root: HTMLElement, context: GithubPluginContext) => () => void;
 };
@@ -42,18 +47,24 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     let snapshot: GithubStatus | null = null;
     // Only the latest github.status answer may render, however the requests finish.
     let generation = 0;
-    let defaults = null;
-    let creating = false;
-    let linking = false;
+    // The host remounts the panel on every data change, so what the user is doing outlives a mount.
+    const memoryKey = `planeai-plugin-github:panel:${sourceSessionId}`;
+    const recall = (): PanelMemory => { try { return JSON.parse(sessionStorage.getItem(memoryKey) ?? "{}") ?? {}; } catch { return {}; } };
+    let memory: PanelMemory = sourceSessionId ? recall() : {};
+    const remember = (change: PanelMemory) => {
+      memory = { ...memory, ...change };
+      try { sessionStorage.setItem(memoryKey, JSON.stringify(memory)); } catch { /* best effort */ }
+    };
+    const savedCreate = () => (memory.form?.kind === "create" ? (memory.form as CreateForm) : null);
+    const savedLink = () => (memory.form?.kind === "link" ? (memory.form as LinkForm) : null);
+    let creating = savedCreate() !== null;
+    let linking = savedLink() !== null;
     let busy = false;
     let disposed = false;
-    let selectedStrategy = "squash";
+    let selectedStrategy = memory.strategy ?? "squash";
     // The highlighted pull request; the header, checks, merge, and failure hand-off follow it.
-    // The host remounts the panel on every data change, so the highlight outlives a mount.
-    const highlightKey = `planeai-plugin-github:highlight:${sourceSessionId}`;
-    const storedHighlight = () => { try { return sessionStorage.getItem(highlightKey); } catch { return null; } };
-    const storeHighlight = (url: string) => { try { sessionStorage.setItem(highlightKey, url); } catch { /* best effort */ } };
-    let selectedUrl: string | null = sourceSessionId ? storedHighlight() : null;
+    let selectedUrl: string | null = memory.highlight ?? null;
+    const closeForm = () => { creating = false; linking = false; remember({ form: null }); };
 
     const page = document.createElement("main");
     page.innerHTML = `
@@ -245,21 +256,25 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       section.className = "section";
       const title = document.createElement("div"); title.className = "section-title"; title.textContent = "Create pull request";
       const form = document.createElement("form");
-      const titleField = document.createElement("input"); titleField.value = defaults?.title || ""; titleField.required = true;
-      const bodyField = document.createElement("textarea"); bodyField.rows = 10; bodyField.value = defaults?.body || "";
-      const baseField = document.createElement("input"); baseField.value = defaults?.base_branch || "main"; baseField.required = true;
-      const draft = document.createElement("input"); draft.type = "checkbox";
+      const saved = savedCreate();
+      const titleField = document.createElement("input"); titleField.value = saved?.title ?? ""; titleField.required = true;
+      const bodyField = document.createElement("textarea"); bodyField.rows = 10; bodyField.value = saved?.body ?? "";
+      const baseField = document.createElement("input"); baseField.value = saved?.base_branch || "main"; baseField.required = true;
+      const draft = document.createElement("input"); draft.type = "checkbox"; draft.checked = saved?.draft ?? false;
+      const save = () => remember({ form: { kind: "create", title: titleField.value, body: bodyField.value, base_branch: baseField.value, draft: draft.checked } });
+      form.addEventListener("input", save);
+      form.addEventListener("change", save);
       const labelled = (label, field) => { const wrapper = document.createElement("label"); wrapper.textContent = label; wrapper.append(field); return wrapper; };
       const draftLabel = document.createElement("label"); draftLabel.className = "row"; draftLabel.append(draft, document.createTextNode("Draft pull request"));
       const actions = document.createElement("div"); actions.className = "form-actions";
       actions.append(
-        button("Cancel", () => { creating = false; render(); }),
+        button("Cancel", () => { closeForm(); render(); }),
         button("Create", () => {
-          void mutate(async () => { await call("github.create", { title: titleField.value, body: bodyField.value, base_branch: baseField.value, draft: draft.checked }); creating = false; });
+          void mutate(async () => { await call("github.create", { title: titleField.value, body: bodyField.value, base_branch: baseField.value, draft: draft.checked }); closeForm(); });
         }, { shortcut: "c" }),
       );
       form.addEventListener("submit", (event) => { event.preventDefault(); actions.querySelectorAll("button")[1]?.click(); });
-      installFormKeyboard(form, titleField, () => { creating = false; render(); });
+      installFormKeyboard(form, titleField, () => { closeForm(); render(); });
       form.append(labelled("Title", titleField), labelled("Body", bodyField), labelled("Base branch", baseField), draftLabel, actions);
       section.append(title, form);
       content.append(section);
@@ -273,16 +288,18 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const title = document.createElement("div"); title.className = "section-title"; title.textContent = "Link pull request";
       const form = document.createElement("form");
       const urlField = document.createElement("input"); urlField.type = "url"; urlField.required = true; urlField.placeholder = "https://github.com/owner/repo/pull/123";
+      urlField.value = savedLink()?.url ?? "";
+      urlField.addEventListener("input", () => remember({ form: { kind: "link", url: urlField.value } }));
       const labelled = document.createElement("label"); labelled.textContent = "Pull request URL"; labelled.append(urlField);
       const actions = document.createElement("div"); actions.className = "form-actions";
       actions.append(
-        button("Cancel", () => { linking = false; render(); }),
+        button("Cancel", () => { closeForm(); render(); }),
         button("Link pull request", () => {
-          void mutate(async () => { await call("github.link", { url: urlField.value }); linking = false; }, "Pull request linked");
+          void mutate(async () => { await call("github.link", { url: urlField.value }); closeForm(); }, "Pull request linked");
         }, { shortcut: "l" }),
       );
       form.addEventListener("submit", (event) => { event.preventDefault(); actions.querySelectorAll("button")[1]?.click(); });
-      installFormKeyboard(form, urlField, () => { linking = false; render(); });
+      installFormKeyboard(form, urlField, () => { closeForm(); render(); });
       form.append(labelled, actions); section.append(title, form); content.append(section);
       appendFooter([["L", "link"], ["Esc", "close"]]);
     }
@@ -363,9 +380,9 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const section = document.createElement("section"); section.className = "section";
       const actions = document.createElement("div"); actions.className = "form-actions";
       if (!branchHasPullRequest(pullRequests(), status()?.branch)) {
-        actions.append(button("Create PR", async () => { try { defaults = await call("github.defaults"); creating = true; render(); } catch (loadError) { render(String(loadError)); } }, { shortcut: "c" }));
+        actions.append(button("Create PR", async () => { try { const defaults = await call("github.defaults"); creating = true; remember({ form: { kind: "create", title: defaults?.title || "", body: defaults?.body || "", base_branch: defaults?.base_branch || "main", draft: false } }); render(); } catch (loadError) { render(String(loadError)); } }, { shortcut: "c" }));
       }
-      actions.append(button("Link pull request", () => { linking = true; render(); }, { shortcut: "l" }));
+      actions.append(button("Link pull request", () => { linking = true; remember({ form: { kind: "link", url: "" } }); render(); }, { shortcut: "l" }));
       section.append(actions);
       content.append(section);
     }
@@ -405,6 +422,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
     function selectMergeStrategy(strategy) {
       selectedStrategy = strategy;
+      remember({ strategy });
       for (const button of content.querySelectorAll<HTMLButtonElement>("button[data-merge-strategy]")) {
         button.setAttribute("aria-pressed", String(button.dataset.mergeStrategy === strategy));
       }
@@ -510,7 +528,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     function select(url: string | null) {
       if (!url || url === selectedUrl) return;
       selectedUrl = url;
-      storeHighlight(url);
+      remember({ highlight: url });
       render();
     }
 
