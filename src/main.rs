@@ -57,7 +57,7 @@ impl Default for CommandRunner {
 }
 
 impl CommandRunner {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn new(git: impl Into<PathBuf>, gh: impl Into<PathBuf>) -> Self {
         Self {
             git: git.into(),
@@ -1915,6 +1915,7 @@ fn command_output<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
     use std::sync::mpsc::Receiver;
 
@@ -2382,6 +2383,7 @@ fi
         }
     }
 
+    #[cfg(unix)]
     fn graphql_pr(
         repository: &str,
         number: u64,
@@ -2398,6 +2400,7 @@ fi
         })
     }
 
+    #[cfg(unix)]
     fn with_host<T>(
         runner: &CommandRunner,
         host: &Arc<Mutex<FakeHost>>,
@@ -2422,6 +2425,7 @@ fi
         result
     }
 
+    #[cfg(unix)]
     fn numbers(value: &Value) -> Vec<u64> {
         value
             .as_array()
@@ -2605,6 +2609,7 @@ fi
         assert_eq!(cli.calls(), 1, "unlinking never asks GitHub");
     }
 
+    #[cfg(unix)]
     fn stored_link(number: u64, source: &str, state: &str) -> Value {
         json!({
             "host": "github.com", "repository": "o/r", "number": number, "url": format!("https://github.com/o/r/pull/{number}"),
@@ -2612,6 +2617,7 @@ fi
         })
     }
 
+    #[cfg(unix)]
     fn merge_transition_host(
         cli: &FakeGithubCli,
         links: Value,
