@@ -264,9 +264,11 @@ pub fn run<E>(
         }
     }
     let mut default_branches = BTreeMap::new();
-    let mut neighbors = neighbor_lookups(&working, plan.groups, &default_branches);
     let mut queried: BTreeSet<LookupRequest> = BTreeSet::new();
-    requests.extend(neighbors.keys().cloned());
+    // Neighbor answers are kept, since another task can reach the same branch in a later round.
+    let mut answered: BTreeMap<LookupRequest, Vec<FetchedPr>> = BTreeMap::new();
+    let mut served: BTreeSet<(LookupRequest, String)> = BTreeSet::new();
+    requests.extend(neighbor_lookups(&working, plan.groups, &default_branches).into_keys());
 
     for _ in 0..max_rounds {
         if requests.is_empty() {
@@ -308,31 +310,72 @@ pub fn run<E>(
                             .insert(target.session_id.clone(), detected.map(|pr| pr.key.clone()));
                     }
                 }
-                Lookup::OpenHead(branch) | Lookup::OpenBase(branch) => {
-                    let owners = neighbors.get(request).cloned().unwrap_or_default();
-                    let default_branch = default_branches.get(&request.repository);
-                    if let Some(pr) = stack_neighbor(prs, branch, default_branch) {
-                        for owner in &owners {
-                            let group = group_of(plan.groups, owner);
-                            if known_keys(group_lists(&working, group)).contains(&pr.key)
-                                || stack_count(&working, group) >= MAX_STACK_LINKS
-                            {
-                                continue;
-                            }
-                            let links = working.entry(owner.clone()).or_default();
-                            record_stack(links, &pr.key, &pr.url, &pr.snapshot);
-                            outcome.fetched.insert(pr.key.clone(), pr.clone());
-                            outcome.discovered.push((owner.clone(), pr.key.clone()));
-                        }
-                    }
+                Lookup::OpenHead(_) | Lookup::OpenBase(_) => {
+                    answered.insert(request.clone(), prs.clone());
                 }
             }
         }
-        neighbors = neighbor_lookups(&working, plan.groups, &default_branches);
-        neighbors.retain(|request, _| !queried.contains(request));
-        requests = neighbors.keys().cloned().collect();
+        // Recording a neighbor can reveal lookups that are already answered, so replay until none.
+        let neighbors = loop {
+            let neighbors = neighbor_lookups(&working, plan.groups, &default_branches);
+            let mut progressed = false;
+            for (request, owners) in &neighbors {
+                let Some(prs) = answered.get(request) else {
+                    continue;
+                };
+                for owner in owners {
+                    if served.insert((request.clone(), owner.clone())) {
+                        record_neighbor(
+                            &mut working,
+                            &mut outcome,
+                            plan.groups,
+                            owner,
+                            request,
+                            prs,
+                            &default_branches,
+                        );
+                        progressed = true;
+                    }
+                }
+            }
+            if !progressed {
+                break neighbors;
+            }
+        };
+        requests = neighbors
+            .into_keys()
+            .filter(|request| !queried.contains(request))
+            .collect();
     }
     Ok(outcome)
+}
+
+/// Adds the stack neighbor a lookup found to the owner's task, within its bound.
+fn record_neighbor(
+    working: &mut SessionLinks,
+    outcome: &mut Outcome,
+    groups: &[Vec<String>],
+    owner: &str,
+    request: &LookupRequest,
+    prs: &[FetchedPr],
+    default_branches: &BTreeMap<String, String>,
+) {
+    let (Lookup::OpenHead(branch) | Lookup::OpenBase(branch)) = &request.lookup else {
+        return;
+    };
+    let Some(pr) = stack_neighbor(prs, branch, default_branches.get(&request.repository)) else {
+        return;
+    };
+    let group = group_of(groups, owner);
+    if known_keys(group_lists(working, group)).contains(&pr.key)
+        || stack_count(working, group) >= MAX_STACK_LINKS
+    {
+        return;
+    }
+    let links = working.entry(owner.to_string()).or_default();
+    record_stack(links, &pr.key, &pr.url, &pr.snapshot);
+    outcome.fetched.insert(pr.key.clone(), pr.clone());
+    outcome.discovered.push((owner.to_string(), pr.key.clone()));
 }
 
 /// Applies an outcome to freshly read lists, so writes made while GitHub answered are kept.
@@ -685,6 +728,50 @@ mod tests {
             3,
         );
         assert_eq!(tracked_numbers(&fresh), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_lookup_answered_for_one_task_still_grows_another_tasks_stack() {
+        let first = fetched(1, PrState::Open, "f", "release");
+        let second = fetched(2, PrState::Open, "e", "main");
+        let github = github(vec![
+            first.clone(),
+            second.clone(),
+            fetched(3, PrState::Open, "f", "e"),
+            fetched(4, PrState::Open, "h", "f"),
+        ]);
+        let lists = SessionLinks::from([
+            (
+                "s1".to_string(),
+                vec![tracked(&first, TrackedSource::Manual)],
+            ),
+            (
+                "s2".to_string(),
+                vec![tracked(&second, TrackedSource::Manual)],
+            ),
+        ]);
+        let groups = vec![vec!["s1".to_string()], vec!["s2".to_string()]];
+        let detail = BTreeSet::new();
+        let plan = Plan {
+            lists: &lists,
+            groups: &groups,
+            branch_targets: &[],
+            detail_keys: &detail,
+        };
+        let outcome = run(&plan, 3, |requests| github.fetch(requests)).unwrap();
+        let mut fresh = lists.clone();
+        apply(&mut fresh, &groups, &outcome);
+        let numbers = |session: &str| {
+            let mut numbers: Vec<u64> = fresh[session].iter().map(|link| link.key.number).collect();
+            numbers.sort();
+            numbers
+        };
+        assert_eq!(numbers("s1"), vec![1, 4]);
+        assert_eq!(
+            numbers("s2"),
+            vec![2, 3, 4],
+            "the first task's answer for branch f also serves the second"
+        );
     }
 
     #[test]
