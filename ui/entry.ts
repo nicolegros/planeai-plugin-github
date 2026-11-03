@@ -11,6 +11,7 @@ import {
   mergeStrategies,
   moveSelection,
   panelHints,
+  REMOVAL_LABELS,
   removalAction,
   resolveSelection,
   stateTone,
@@ -322,9 +323,10 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       open.setAttribute("aria-label", `Open #${pr.number} on GitHub`); open.title = "Open on GitHub";
       const removal = removalAction(pr);
       if (removal) {
-        const remove = button(removal.label, () => { void mutate(() => call("github.unlink", { url: pr.url })); });
+        const label = REMOVAL_LABELS[removal];
+        const remove = button(label, () => { void mutate(() => call("github.unlink", { url: pr.url })); });
         remove.tabIndex = -1;
-        remove.setAttribute("aria-label", `${removal.label} #${pr.number}`);
+        remove.setAttribute("aria-label", `${label} #${pr.number}`);
         // U acts on the highlighted row; the footer hints it, so the row stays uncluttered.
         if (isSelected) remove.dataset.shortcut = "u";
         actions.append(remove);

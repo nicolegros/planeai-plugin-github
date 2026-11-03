@@ -176,10 +176,14 @@ export function branchHasPullRequest(prs: readonly PullRequest[], branch: string
   return prs.some((pr) => isLive(pr) && (pr.source === "branch" || (pr.source === "created" && !!branch && pr.head_branch === branch)));
 }
 
+export type RemovalAction = "unlink" | "dismiss";
+
+export const REMOVAL_LABELS: Record<RemovalAction, string> = { unlink: "Unlink", dismiss: "Dismiss" };
+
 /** How a pull request leaves the task; a branch pull request follows the branch and cannot. */
-export function removalAction(pr: PullRequest): { label: string; hint: string } | null {
+export function removalAction(pr: PullRequest): RemovalAction | null {
   if (pr.source === "branch") return null;
-  return pr.source === "stack" ? { label: "Dismiss", hint: "dismiss" } : { label: "Unlink", hint: "unlink" };
+  return pr.source === "stack" ? "dismiss" : "unlink";
 }
 
 const MERGE_STRATEGIES = ["squash", "merge", "rebase"];
@@ -196,7 +200,7 @@ export function panelHints({ prs, selected, mergeable, branch }: { prs: readonly
   if (prs.length > 1) hints.push(["↑↓", "select"]);
   if (selected) hints.push(["O", "open"]);
   const removal = selected && removalAction(selected);
-  if (removal) hints.push(["U", removal.hint]);
+  if (removal) hints.push(["U", removal]);
   if (mergeable) hints.push(["S", "strategy"]);
   hints.push(["R", "refresh"]);
   if (!branchHasPullRequest(prs, branch)) hints.push(["C", "create"]);

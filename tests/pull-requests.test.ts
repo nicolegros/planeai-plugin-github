@@ -8,6 +8,7 @@ import {
   mergeStrategies,
   moveSelection,
   panelHints,
+  REMOVAL_LABELS,
   removalAction,
   resolveSelection,
   stackOrder,
@@ -146,9 +147,10 @@ test("the footer hints the shortcuts that act on the panel right now", () => {
 
 test("a branch pull request cannot be removed, a stack one is dismissed, others are unlinked", () => {
   assert.equal(removalAction(pr(1, { source: "branch" })), null);
-  assert.deepEqual(removalAction(pr(1, { source: "stack" })), { label: "Dismiss", hint: "dismiss" });
-  assert.deepEqual(removalAction(pr(1, { source: "created" })), { label: "Unlink", hint: "unlink" });
-  assert.deepEqual(removalAction(pr(1, { source: "manual" })), { label: "Unlink", hint: "unlink" });
+  assert.equal(removalAction(pr(1, { source: "stack" })), "dismiss");
+  assert.equal(removalAction(pr(1, { source: "created" })), "unlink");
+  assert.equal(removalAction(pr(1, { source: "manual" })), "unlink");
+  assert.equal(REMOVAL_LABELS.dismiss, "Dismiss");
 });
 
 test("only an open pull request offers its repository's known merge strategies", () => {
