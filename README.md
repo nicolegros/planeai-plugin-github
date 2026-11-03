@@ -49,9 +49,9 @@ The titlebar shows the same summary, or **Create PR** when the session has none;
 `Cmd+Shift+P` on macOS (`Ctrl+Shift+P` elsewhere) opens the GitHub pull-request session panel whenever the plugin is running for the selected session. PlaneAI falls back to its legacy pull-request panel only when this plugin contribution is unavailable.
 
 The panel lists every pull request of the task, each with its state, CI, title, repository when it differs from the session's, and source, and with **Unlink** or **Dismiss** and an open-on-GitHub action.
-Below the list, it details the session's own pull request: its checks, merge, ready-for-review, and CI failure hand-off.
+Below the list, it details the highlighted pull request: its checks, merge, ready-for-review, and CI failure hand-off.
 
-One row is highlighted at a time, starting with the session's own pull request; the details below the list follow it.
+One row is highlighted at a time, starting with the session's own pull request.
 When the GitHub session panel has focus, use these shortcuts:
 
 - `↑`/`↓` or `j`/`k` move the highlight.
