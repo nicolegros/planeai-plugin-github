@@ -109,4 +109,5 @@ test("GitHub session panel lists every pull request with per-row actions", () =>
   assert.match(entry, /if \(next\.applicable && next\.changed\) void dataChanged\(\)/, "a refresh that changed stored PRs refreshes the sidebar pills");
   assert.match(entry, /appendFooter\(panelHints\(\{ prs, selected,/, "the footer hints come from panelHints");
   assert.match(entry, /if \(disposed \|\| current !== generation\) return;/, "a stale github.status answer never renders");
+  assert.match(entry, /if \(context\.host\.data\.changed\) await dataChanged\(\);\s*else await load\(\);/, "a mutation refreshes once: the host remounts the panel on data changes");
 });

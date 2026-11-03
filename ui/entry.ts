@@ -130,7 +130,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     contentObserver.observe(content, { childList: true, subtree: true, characterData: true });
     const call = (method, params = {}) => context.host.call(method, { session_id: sourceSessionId, ...params });
     const editableTarget = (target) => target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']");
-    // Refreshes every sidebar pill; the host also remounts this panel.
+    // Refreshes every sidebar pill; the host also remounts this panel, which then loads afresh.
     const dataChanged = () => context.host.data.changed?.();
 
     const canMerge = (pr: PullRequestDetail) => !busy && !pr.conflicting && !pr.merge_blocked && pr.state === "open";
@@ -168,8 +168,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         await action();
         busy = false;
         if (success) context.host.data.notify(success, "success");
-        void dataChanged();
-        await load();
+        if (context.host.data.changed) await dataChanged();
+        else await load();
       } catch (error) { busy = false; render(String(error)); }
     }
 
