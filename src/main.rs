@@ -2548,14 +2548,11 @@ fi
     #[test]
     fn unlinking_the_last_open_pull_request_after_a_merge_finishes_the_task() {
         let cli = FakeGithubCli::new();
-        let host = merge_transition_host(
-            &cli,
-            json!([
-                stored_link(4, "manual", "open"),
-                stored_link(5, "manual", "merged")
-            ]),
-            "topic",
-        );
+        let mut open = stored_link(4, "manual", "open");
+        open["updated_at"] = json!("2026-10-02T00:00:00Z");
+        let mut merged = stored_link(5, "manual", "merged");
+        merged["updated_at"] = json!("2026-10-03T00:00:00Z");
+        let host = merge_transition_host(&cli, json!([open, merged]), "topic");
         with_host(&cli.runner, &host, |context| {
             unlink_pull_request(
                 &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4" }),

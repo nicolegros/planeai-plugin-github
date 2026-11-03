@@ -602,8 +602,8 @@ pub enum PrStateTransition {
 
 /// The task transition that a change of the task's pull requests causes.
 /// The task is merged when nothing is left open and either a tracked pull request just merged,
-/// or the last open one was closed or removed after an earlier merge; adding a merged link alone
-/// never counts. An open pull request counts only when the task had none.
+/// or the last open one was closed or removed after a merge newer than every open one; adding a
+/// merged link alone never counts. An open pull request counts only when the task had none.
 pub fn task_transition(
     before: &[AggregatedPr],
     after: &[AggregatedPr],
@@ -615,8 +615,15 @@ pub fn task_transition(
                 .any(|old| old.key == pr.key && old.snapshot.state != PrState::Merged)
     });
     let any_live = |prs: &[AggregatedPr]| prs.iter().any(|pr| pr.snapshot.state.is_live());
-    let last_live_gone =
-        any_live(before) && after.iter().any(|pr| pr.snapshot.state == PrState::Merged);
+    // A merge older than the pull requests that were open belongs to work finished before them.
+    let last_live_gone = any_live(before)
+        && after.iter().any(|merged| {
+            merged.snapshot.state == PrState::Merged
+                && before
+                    .iter()
+                    .filter(|pr| pr.snapshot.state.is_live())
+                    .all(|live| merged.snapshot.updated_at > live.snapshot.updated_at)
+        });
     if (newly_merged || last_live_gone) && !any_live(after) {
         return Some(PrStateTransition::Merged);
     }
@@ -1089,16 +1096,6 @@ mod tests {
             "an unchanged merge never repeats"
         );
         assert_eq!(
-            transition(&[(1, Open), (2, Merged)], &[(2, Merged)]),
-            merged,
-            "dismissing the last open pull request after a merge finishes the task"
-        );
-        assert_eq!(
-            transition(&[(1, Open), (2, Merged)], &[(1, Closed), (2, Merged)]),
-            merged,
-            "closing the last open pull request after a merge finishes the task"
-        );
-        assert_eq!(
             transition(&[(1, Open), (2, Closed)], &[(2, Closed)]),
             None,
             "nothing merged"
@@ -1114,6 +1111,49 @@ mod tests {
             "linking a merged pull request is not a merge"
         );
         assert_eq!(transition(&[(1, Open)], &[(1, Closed)]), None);
+    }
+
+    fn timed(prs: &[(u64, PrState, &str)]) -> Vec<AggregatedPr> {
+        prs.iter()
+            .map(|(number, state, day)| {
+                let mut pr = aggregated(&[(*number, *state)]).remove(0);
+                pr.snapshot.updated_at = Some(format!("2026-10-{day}T00:00:00Z"));
+                pr
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_last_open_pull_request_going_finishes_the_task_only_after_a_newer_merge() {
+        use PrState::*;
+        let merged = Some(PrStateTransition::Merged);
+        let transition = |before, after| task_transition(&timed(before), &timed(after));
+        assert_eq!(
+            transition(
+                &[(2, Open, "02"), (1, Merged, "03")],
+                &[(2, Closed, "04"), (1, Merged, "03")]
+            ),
+            merged,
+            "closing the last open pull request after a merge finishes the task"
+        );
+        assert_eq!(
+            transition(&[(2, Open, "02"), (1, Merged, "03")], &[(1, Merged, "03")]),
+            merged,
+            "dismissing the last open pull request after a merge finishes the task"
+        );
+        assert_eq!(
+            transition(
+                &[(1, Merged, "01"), (2, Open, "02")],
+                &[(1, Merged, "01"), (2, Closed, "03")]
+            ),
+            None,
+            "an older merge belongs to work the task finished before the newer pull request opened"
+        );
+        assert_eq!(
+            transition(&[(1, Merged, "01"), (2, Open, "02")], &[(1, Merged, "01")]),
+            None,
+            "unlinking the newer pull request does not finish the task on an old merge"
+        );
     }
 
     #[test]
