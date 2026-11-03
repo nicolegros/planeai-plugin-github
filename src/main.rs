@@ -1603,8 +1603,9 @@ fn send_failure_logs(params: &Value, context: &ExecutionContext) -> Result<Value
     Ok(json!({ "sent": true }))
 }
 
-/// Refreshes every task group with an active session using as few GitHub queries as possible.
-fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<(), RequestError> {
+/// Refreshes every task group with an active session using as few GitHub queries as possible;
+/// returns whether it stored any change.
+fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<bool, RequestError> {
     let sessions = list_sessions(context)?;
     let mut groups: Vec<Vec<String>> = Vec::new();
     let mut targets = Vec::new();
@@ -1658,7 +1659,7 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<(),
     targets.retain(|target| lists.contains_key(&target.session_id));
     let has_links = lists.values().any(|links| !links.is_empty());
     if targets.is_empty() && !has_links {
-        return Ok(());
+        return Ok(false);
     }
     let cwd = cwd.unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
     let detail_keys = BTreeSet::new();
@@ -1679,11 +1680,11 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<(),
             resolved: true,
         })
         .collect();
-    update_groups(context, &tasks, true, |fresh| {
+    let updates = update_groups(context, &tasks, true, |fresh| {
         refresh::apply(fresh, &groups, &outcome);
         Ok(())
     })?;
-    Ok(())
+    Ok(updates.iter().any(|update| update.changed))
 }
 
 fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
@@ -1705,7 +1706,7 @@ fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
 
     let finished_at = unix_timestamp_ms();
     let error = match work {
-        Ok(()) if !context.cancelled.load(Ordering::SeqCst) => {
+        Ok(changed) if !context.cancelled.load(Ordering::SeqCst) => {
             match finish_reconciliation(
                 context,
                 false,
@@ -1715,11 +1716,15 @@ fn reconcile(context: &ExecutionContext) -> Result<Value, RequestError> {
                 finished_at,
                 None,
             ) {
-                Ok(()) => return Ok(json!({ "checked": checked, "attempt_id": attempt_id })),
+                Ok(()) => {
+                    return Ok(
+                        json!({ "checked": checked, "attempt_id": attempt_id, "changed": changed }),
+                    )
+                }
                 Err(error) => error,
             }
         }
-        Ok(()) => RequestError::Cancelled,
+        Ok(_) => RequestError::Cancelled,
         Err(error) => error,
     };
     let message = match &error {
@@ -2866,6 +2871,7 @@ fi
         cli.respond(merged.clone());
         let result = with_host(&cli.runner, &host, reconcile).unwrap();
         assert_eq!(result["checked"], 2);
+        assert_eq!(result["changed"], true);
         assert_eq!(cli.calls(), 1, "both repositories share one query");
         let stored = host.lock().unwrap().settings["github"].clone();
         assert_eq!(stored["reconciliation"]["status"], "idle");
@@ -2877,7 +2883,11 @@ fi
         );
 
         cli.respond(merged);
-        with_host(&cli.runner, &host, reconcile).unwrap();
+        let unchanged = with_host(&cli.runner, &host, reconcile).unwrap();
+        assert_eq!(
+            unchanged["changed"], false,
+            "the host skips its data refresh after an idle reconcile"
+        );
         assert_eq!(host.lock().unwrap().transitions.len(), 1);
     }
 

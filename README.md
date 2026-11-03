@@ -104,6 +104,7 @@ Malformed or unsupported documents are rejected rather than migrated implicitly.
 
 The manifest declares `github.reconcile` as the host-managed background service. PlaneAI runs it on the configured `github_reconciliation_interval_ms` setting (two minutes by default), while it remains safe to call explicitly.
 It writes a unique fenced `running` attempt, refreshes every task with an active session through one batched `gh api graphql` query per discovery round (at most two), and then writes `idle` counts and timestamps or bounded `failed` error details, including cancellation.
+Its result says whether it `changed` any stored link, so the host refreshes plugin views only after a reconcile that changed something.
 
 ## Release artifacts
 
