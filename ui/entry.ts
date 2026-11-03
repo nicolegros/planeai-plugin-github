@@ -52,6 +52,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     let activeForm: CreateForm | LinkForm | null = null;
     // Only a form just opened takes focus; re-rendering it otherwise leaves focus where the user is.
     let formJustOpened = false;
+    let refreshError = "";
     let busy = false;
     let disposed = false;
     let selectedStrategy = "squash";
@@ -513,7 +514,9 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const form = openForm();
       if (form?.kind === "create") { renderCreate(form); if (error) appendStatus("The pull request could not be created.", error); return; }
       if (form?.kind === "link") { renderLink(form); if (error) appendStatus("The pull request could not be linked.", error); return; }
-      renderPullRequests(error);
+      // A refresh that failed behind an open form reports once the list is back.
+      renderPullRequests(error || refreshError);
+      refreshError = "";
     }
 
     function render(error = "") {
@@ -578,13 +581,15 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         if (disposed || current !== generation) return;
         snapshot = next;
         // An open form does not show the status, and rebuilding it would move focus mid-typing.
+        refreshError = "";
         if (!activeForm) render();
         // The host's echo reloads once more; that refresh changes nothing, so it stops there.
         if (next.applicable && next.changed) void dataChanged();
       } catch (error) {
         if (disposed || current !== generation) return;
         if (!snapshot?.applicable) snapshot = null;
-        if (!activeForm) render(String(error));
+        if (activeForm) refreshError = String(error);
+        else render(String(error));
       }
     }
 

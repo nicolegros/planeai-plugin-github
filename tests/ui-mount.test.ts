@@ -51,6 +51,12 @@ function mountPanel(sessionId = "s1", { listens = true } = {}) {
     /** Another view of the plugin changed its data. */
     dataChangedElsewhere: () => listeners.forEach((listener) => listener()),
     listening: () => listeners.size,
+    async fail(method: string, error: string) {
+      const call = pending(method).find((candidate) => !candidate.answered);
+      call.answered = true;
+      call.reply.reject(new Error(error));
+      await settle();
+    },
     async answer(method: string, value: unknown) {
       const call = pending(method).find((candidate) => !candidate.answered);
       call.answered = true;
@@ -251,3 +257,14 @@ test("Cmd or Ctrl+Enter submits a form", async () => {
   }
 });
 
+
+test("a refresh that fails while a form is open shows its error once the list is back", async () => {
+  const panel = mountPanel();
+  await panel.answer("github.status", status());
+  press("l", document.body);
+  panel.dataChangedElsewhere();
+  await panel.fail("github.status", "GitHub is down");
+  assert.ok(panel.root.querySelector('input[type="url"]'), "the form stays");
+  press("Escape", panel.root.querySelector('input[type="url"]'));
+  assert.match(panel.root.querySelector('[role="alert"]')?.textContent ?? "", /GitHub is down/);
+});
