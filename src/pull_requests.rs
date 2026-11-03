@@ -594,8 +594,9 @@ pub enum PrStateTransition {
 }
 
 /// The task transition that a change of the task's pull requests causes.
-/// Only a pull request tracked on both sides that became merged counts as a merge, so removing
-/// links never does; an open pull request counts only when the task had none.
+/// The task is merged when nothing is left open and either a tracked pull request just merged,
+/// or the last open one was closed or removed after an earlier merge; adding a merged link alone
+/// never counts. An open pull request counts only when the task had none.
 pub fn task_transition(
     before: &[AggregatedPr],
     after: &[AggregatedPr],
@@ -606,7 +607,10 @@ pub fn task_transition(
                 .iter()
                 .any(|old| old.key == pr.key && old.snapshot.state != PrState::Merged)
     });
-    if newly_merged && after.iter().all(|pr| !pr.snapshot.state.is_live()) {
+    let any_live = |prs: &[AggregatedPr]| prs.iter().any(|pr| pr.snapshot.state.is_live());
+    let last_live_gone =
+        any_live(before) && after.iter().any(|pr| pr.snapshot.state == PrState::Merged);
+    if (newly_merged || last_live_gone) && !any_live(after) {
         return Some(PrStateTransition::Merged);
     }
     let has_open = |prs: &[AggregatedPr]| prs.iter().any(|pr| pr.snapshot.state == PrState::Open);
@@ -1045,8 +1049,23 @@ mod tests {
         );
         assert_eq!(
             transition(&[(1, Open), (2, Merged)], &[(2, Merged)]),
+            merged,
+            "dismissing the last open pull request after a merge finishes the task"
+        );
+        assert_eq!(
+            transition(&[(1, Open), (2, Merged)], &[(1, Closed), (2, Merged)]),
+            merged,
+            "closing the last open pull request after a merge finishes the task"
+        );
+        assert_eq!(
+            transition(&[(1, Open), (2, Closed)], &[(2, Closed)]),
             None,
-            "removing the open pull request is not a merge"
+            "nothing merged"
+        );
+        assert_eq!(
+            transition(&[(1, Open)], &[]),
+            None,
+            "removing everything is not a merge"
         );
         assert_eq!(
             transition(&[], &[(3, Merged)]),

@@ -68,8 +68,8 @@ When the GitHub session panel has focus, use these shortcuts:
 The **Preferences → GitHub** page can automatically transition a session's linked PlaneAI task when its pull requests open or merge.
 Each action is optional and can move the task to `todo`, `in_progress`, `in_review`, or `done`.
 The opened action runs when the task gains an open, non-draft pull request while it had none.
-The merged action runs when a tracked pull request merges and every remaining tracked pull request of the task is merged or closed.
-Removing links, such as unlinking a pull request or a branch moving to another one, never counts as a merge.
+The merged action runs once nothing of the task is left open, either because a tracked pull request just merged or because its last open pull request was closed, unlinked, or dismissed after an earlier merge.
+Linking an already merged pull request alone never counts as a merge.
 Dismissed pull requests do not count.
 The plugin invokes the host transition only after it has persisted the change, so repeated reconciliation of an unchanged state never repeats the task action.
 

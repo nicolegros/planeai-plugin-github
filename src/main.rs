@@ -2478,7 +2478,7 @@ fi
 
     #[cfg(unix)]
     #[test]
-    fn unlinking_the_last_open_pull_request_does_not_count_as_a_merge() {
+    fn unlinking_the_last_open_pull_request_after_a_merge_finishes_the_task() {
         let cli = FakeGithubCli::new();
         let host = merge_transition_host(
             &cli,
@@ -2495,12 +2495,15 @@ fi
             )
         })
         .unwrap();
-        assert!(host.lock().unwrap().transitions.is_empty());
+        assert_eq!(
+            host.lock().unwrap().transitions,
+            vec![("s1".to_string(), "done".to_string())]
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_branch_that_no_longer_resolves_to_its_open_pull_request_does_not_count_as_a_merge() {
+    fn a_branch_leaving_the_last_open_pull_request_after_a_merge_finishes_the_task() {
         let cli = FakeGithubCli::new();
         let host = merge_transition_host(
             &cli,
@@ -2525,7 +2528,10 @@ fi
             vec![5],
             "the branch link followed the branch away"
         );
-        assert!(host.lock().unwrap().transitions.is_empty());
+        assert_eq!(
+            host.lock().unwrap().transitions,
+            vec![("s1".to_string(), "done".to_string())]
+        );
     }
 
     #[cfg(unix)]
