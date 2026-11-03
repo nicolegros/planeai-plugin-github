@@ -9,11 +9,11 @@ use durable_state::{
     with_null_defaults, LEGACY_STATE_VERSION, STATE_NAMESPACE, STATE_VERSION,
     TASK_TRANSITION_FIELDS, V2_STATE_VERSION, V3_STATE_VERSION,
 };
-use github_graphql::{FetchedPr, GraphqlResponse, Lookup, LookupRequest};
+use github_graphql::{project_detail, FetchedPr, GraphqlResponse, Lookup, LookupRequest};
 use pull_requests::{
-    aggregate, dismiss, parse_session_links, parse_sessions, record_created, record_manual,
-    refresh_snapshot, session_links_value, task_group, task_phase, task_transition, AggregatedPr,
-    PrKey, PrSnapshot, PrState, PrStateTransition, PullRequestLink, SessionInfo, TrackedSource,
+    aggregate, dismiss, own_link, parse_session_links, parse_sessions, record_created,
+    record_manual, refresh_snapshot, session_links_value, task_group, task_phase, task_transition,
+    AggregatedPr, PrKey, PrSnapshot, PrState, PrStateTransition, PullRequestLink, SessionInfo,
 };
 use refresh::{BranchTarget, Plan, SessionLinks};
 use serde_json::{json, Value};
@@ -1068,41 +1068,6 @@ fn fetch_graphql(
     ))
 }
 
-/// The session's own pull request that the panel details and merges: its branch's, else one it created or linked.
-fn detail_link<'a>(links: &'a [PullRequestLink], repository: &str) -> Option<&'a PullRequestLink> {
-    [
-        TrackedSource::Branch,
-        TrackedSource::Created,
-        TrackedSource::Manual,
-    ]
-    .into_iter()
-    .find_map(|source| {
-        links
-            .iter()
-            .filter(|link| link.source() == Some(source) && link.key.repository == repository)
-            .max_by_key(|link| {
-                link.snapshot()
-                    .and_then(|snapshot| snapshot.updated_at.clone())
-            })
-    })
-}
-
-fn project_detail(pr: &FetchedPr, merge_methods: Vec<String>) -> Value {
-    let detail = pr.detail.as_ref();
-    json!({
-        "url": pr.url,
-        "number": pr.key.number,
-        "repository": pr.key.repository,
-        "title": pr.snapshot.title,
-        "state": pr.snapshot.state,
-        "checks": detail.map_or_else(Vec::new, |detail| detail.checks.clone()),
-        "conflicting": detail.is_some_and(|detail| detail.conflicting),
-        "merge_blocked": detail.is_some_and(|detail| detail.merge_blocked),
-        "merge_methods": merge_methods,
-        "review_decision": detail.map_or(Value::Null, |detail| detail.review_decision.clone()),
-    })
-}
-
 struct GithubSession {
     cwd: String,
     remote: String,
@@ -1173,7 +1138,7 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
         .get(session_id)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let own_url = detail_link(own, &session.repository).map(|link| link.url.clone());
+    let own_url = own_link(own, &session.repository).map(|link| link.url.clone());
     let details: Vec<Value> = outcome
         .fetched
         .values()
@@ -1448,7 +1413,7 @@ fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<Str
                 .and_then(|remote| github_repository_slug(&remote))
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            detail_link(&links, &repository)
+            own_link(&links, &repository)
                 .map(|link| link.url.clone())
                 .unwrap_or_else(|| branch.clone())
         }

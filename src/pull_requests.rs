@@ -476,6 +476,26 @@ pub fn dismiss(links: &mut [PullRequestLink], key: &PrKey) -> bool {
     }
 }
 
+/// The session's own pull request that the panel details and merges: its branch's, else one it
+/// created, else one it linked, in the session's repository; the most recently updated wins a tie.
+pub fn own_link<'a>(links: &'a [PullRequestLink], repository: &str) -> Option<&'a PullRequestLink> {
+    [
+        TrackedSource::Branch,
+        TrackedSource::Created,
+        TrackedSource::Manual,
+    ]
+    .into_iter()
+    .find_map(|source| {
+        links
+            .iter()
+            .filter(|link| link.source() == Some(source) && link.key.repository == repository)
+            .max_by_key(|link| {
+                link.snapshot()
+                    .and_then(|snapshot| snapshot.updated_at.clone())
+            })
+    })
+}
+
 /// One pull request as a task sees it across all of its sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AggregatedPr {
@@ -866,6 +886,62 @@ mod tests {
         assert!(links[1..]
             .iter()
             .all(|link| link.status == LinkStatus::Dismissed));
+    }
+
+    fn updated(mut link: PullRequestLink, updated_at: &str) -> PullRequestLink {
+        if let LinkStatus::Tracked { snapshot, .. } = &mut link.status {
+            snapshot.updated_at = Some(updated_at.into());
+        }
+        link
+    }
+
+    #[test]
+    fn own_link_prefers_branch_then_created_then_manual() {
+        let links = vec![
+            link(1, TrackedSource::Stack, PrState::Open),
+            link(2, TrackedSource::Manual, PrState::Open),
+            link(3, TrackedSource::Created, PrState::Open),
+            link(4, TrackedSource::Branch, PrState::Merged),
+        ];
+        assert_eq!(own_link(&links, "o/r").unwrap().key, key(4));
+        assert_eq!(own_link(&links[..3], "o/r").unwrap().key, key(3));
+        assert_eq!(own_link(&links[..2], "o/r").unwrap().key, key(2));
+        assert_eq!(
+            own_link(&links[..1], "o/r"),
+            None,
+            "a stack pull request is never the session's own"
+        );
+        assert_eq!(own_link(&[tombstone(5)], "o/r"), None);
+    }
+
+    #[test]
+    fn own_link_only_considers_the_session_repository() {
+        let foreign = PullRequestLink::tracked(
+            PrKey::new(GITHUB_HOST, "x/y", 9).unwrap(),
+            "https://github.com/x/y/pull/9",
+            TrackedSource::Branch,
+            snapshot(PrState::Open, 1),
+        );
+        let links = vec![foreign, link(2, TrackedSource::Manual, PrState::Open)];
+        assert_eq!(own_link(&links, "o/r").unwrap().key, key(2));
+        assert_eq!(own_link(&links, "x/y").unwrap().key.number, 9);
+        assert_eq!(own_link(&links, "a/b"), None);
+    }
+
+    #[test]
+    fn own_link_breaks_a_tie_with_the_most_recently_updated() {
+        let links = vec![
+            updated(
+                link(1, TrackedSource::Manual, PrState::Open),
+                "2026-10-03T00:00:00Z",
+            ),
+            updated(
+                link(2, TrackedSource::Manual, PrState::Open),
+                "2026-10-05T00:00:00Z",
+            ),
+            link(3, TrackedSource::Manual, PrState::Open),
+        ];
+        assert_eq!(own_link(&links, "o/r").unwrap().key, key(2));
     }
 
     #[test]

@@ -60,6 +60,23 @@ pub struct FetchedPr {
     pub detail: Option<PrDetail>,
 }
 
+/// The panel's view of a pull request fetched with details.
+pub fn project_detail(pr: &FetchedPr, merge_methods: Vec<String>) -> Value {
+    let detail = pr.detail.as_ref();
+    json!({
+        "url": pr.url,
+        "number": pr.key.number,
+        "repository": pr.key.repository,
+        "title": pr.snapshot.title,
+        "state": pr.snapshot.state,
+        "checks": detail.map_or_else(Vec::new, |detail| detail.checks.clone()),
+        "conflicting": detail.is_some_and(|detail| detail.conflicting),
+        "merge_blocked": detail.is_some_and(|detail| detail.merge_blocked),
+        "merge_methods": merge_methods,
+        "review_decision": detail.map_or(Value::Null, |detail| detail.review_decision.clone()),
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct GraphqlResponse {
     /// `None` when GitHub could not answer that lookup, so cached state must be kept.
