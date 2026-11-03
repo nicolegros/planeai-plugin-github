@@ -155,6 +155,9 @@ fn stack_reach<'a>(
                 && merged_bottom(&link.key.repository)
         })
         .collect();
+    for index in &detached {
+        reach[*index] = Some(Reach::Down);
+    }
     walk(&mut reach, Reach::Down, detached);
     entries
         .into_iter()
@@ -792,6 +795,26 @@ mod tests {
             vec![2, 3, 4],
             "the first task's answer for branch f also serves the second"
         );
+    }
+
+    #[test]
+    fn a_retargeted_pull_request_finds_its_own_new_child() {
+        let own = fetched(1, PrState::Merged, "a", "main");
+        let retargeted = fetched(2, PrState::Open, "b", "main");
+        let github = github(vec![
+            own.clone(),
+            retargeted.clone(),
+            fetched(3, PrState::Open, "c", "b"),
+        ]);
+        let fresh = refresh_one(
+            &github,
+            vec![
+                tracked(&own, TrackedSource::Manual),
+                tracked(&retargeted, TrackedSource::Stack),
+            ],
+            3,
+        );
+        assert_eq!(tracked_numbers(&fresh), vec![1, 2, 3]);
     }
 
     #[test]
