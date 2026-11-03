@@ -48,7 +48,11 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     let disposed = false;
     let selectedStrategy = "squash";
     // The highlighted pull request; the header, checks, merge, and failure hand-off follow it.
-    let selectedUrl: string | null = null;
+    // The host remounts the panel on every data change, so the highlight outlives a mount.
+    const highlightKey = `planeai-plugin-github:highlight:${sourceSessionId}`;
+    const storedHighlight = () => { try { return sessionStorage.getItem(highlightKey); } catch { return null; } };
+    const storeHighlight = (url: string) => { try { sessionStorage.setItem(highlightKey, url); } catch { /* best effort */ } };
+    let selectedUrl: string | null = sourceSessionId ? storedHighlight() : null;
 
     const page = document.createElement("main");
     page.innerHTML = `
@@ -295,7 +299,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         if (event.target instanceof Element && event.target.closest("button")) return;
         select(pr.url);
       });
-      const dot = document.createElement("span"); dot.className = "pr-dot"; dot.dataset.state = pr.state;
+      const dot = document.createElement("span"); dot.className = "pr-dot"; dot.dataset.state = pr.state; dot.id = `${row.id}-state`;
       dot.setAttribute("aria-label", STATE_LABELS[pr.state] ?? pr.state);
       const number = document.createElement("span"); number.className = "pr-number"; number.textContent = `#${pr.number}`;
       const text = document.createElement("span"); text.className = "pr-text";
@@ -312,11 +316,14 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       }
       const source = document.createElement("span"); source.className = "pr-source"; source.textContent = SOURCE_LABELS[pr.source] ?? pr.source;
       const actions = document.createElement("span"); actions.className = "pr-actions";
+      // Row buttons stay out of the tab order: the grid takes focus, and U, O, or a click reach them.
       const open = button("↗", () => context.host.navigation.openExternal(pr.url));
+      open.tabIndex = -1;
       open.setAttribute("aria-label", `Open #${pr.number} on GitHub`); open.title = "Open on GitHub";
       const removal = removalAction(pr);
       if (removal) {
         const remove = button(removal.label, () => { void mutate(() => call("github.unlink", { url: pr.url })); });
+        remove.tabIndex = -1;
         remove.setAttribute("aria-label", `${removal.label} #${pr.number}`);
         // U acts on the highlighted row; the footer hints it, so the row stays uncluttered.
         if (isSelected) remove.dataset.shortcut = "u";
@@ -340,7 +347,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         const list = document.createElement("div"); list.className = "pr-list";
         list.setAttribute("role", "grid"); list.setAttribute("aria-label", "Pull requests"); list.tabIndex = 0;
         for (const pr of displayOrder(prs)) list.append(pullRequestRow(pr, current, selected));
-        const active = list.querySelector('[aria-selected="true"]');
+        const active = list.querySelector('[aria-selected="true"] [role="gridcell"]');
         if (active) list.setAttribute("aria-activedescendant", active.id);
         section.append(list);
       } else {
@@ -501,7 +508,14 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     function select(url: string | null) {
       if (!url || url === selectedUrl) return;
       selectedUrl = url;
+      storeHighlight(url);
       render();
+    }
+
+    /** Arrows belong to the list, or to the panel when none of its controls has focus. */
+    function selectionKeysApply() {
+      const focused = document.activeElement;
+      return !focused || focused === document.body || focused.closest(".pr-list") !== null || !page.contains(focused);
     }
 
     const SELECTION_KEYS: Record<string, 1 | -1> = { ArrowDown: 1, j: 1, ArrowUp: -1, k: -1 };
@@ -523,7 +537,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         return;
       }
       const delta = SELECTION_KEYS[event.key];
-      if (delta && !event.shiftKey && status() && !creating && !linking) {
+      if (delta && !event.shiftKey && status() && !creating && !linking && selectionKeysApply()) {
         select(moveSelection(pullRequests(), selectedUrl, delta)?.url ?? null);
         event.preventDefault();
         event.stopPropagation();
@@ -539,17 +553,18 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       if (!sourceSessionId) { render(); return; }
       if (disposed) return;
       const current = ++generation;
-      const previous = snapshot;
-      snapshot = null; render();
+      // The current list stays while refreshing, so its focus and highlight do too.
+      if (!snapshot) render();
       try {
         const next: GithubStatus = await call("github.status");
         if (disposed || current !== generation) return;
         snapshot = next;
         render();
+        // Known cost: the host remounts this panel on data.changed, which fetches status once more.
         if (next.applicable && next.changed) void dataChanged();
       } catch (error) {
         if (disposed || current !== generation) return;
-        snapshot = previous?.applicable ? previous : null;
+        if (!snapshot?.applicable) snapshot = null;
         render(String(error));
       }
     }

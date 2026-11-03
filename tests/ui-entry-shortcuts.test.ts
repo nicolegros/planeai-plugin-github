@@ -91,13 +91,6 @@ test("GitHub UI links existing PRs and configures automatic task transitions", (
 
 test("GitHub session panel lists every pull request with per-row actions", () => {
   assert.match(entry, /for \(const pr of displayOrder\(prs\)\) list\.append\(pullRequestRow\(pr, current, selected\)\)/);
-  assert.match(entry, /list\.setAttribute\("role", "grid"\)/, "the rows are one grid, since they hold buttons");
-  assert.match(entry, /row\.setAttribute\("role", "row"\)/);
-  assert.match(entry, /cell\.setAttribute\("role", "gridcell"\)/);
-  assert.doesNotMatch(entry, /"listbox"|"option"/, "options cannot hold buttons");
-  assert.match(entry, /row\.setAttribute\("aria-selected", String\(isSelected\)\)/);
-  assert.match(entry, /if \(listFocused\) content\.querySelector<HTMLElement>\("\.pr-list"\)\?\.focus\(\)/, "every render keeps focus in the list");
-  assert.match(entry, /const SELECTION_KEYS: Record<string, 1 \| -1> = \{ ArrowDown: 1, j: 1, ArrowUp: -1, k: -1 \}/, "arrows and j/k move the highlight");
   assert.match(entry, /if \(isSelected\) remove\.dataset\.shortcut = "u"/, "U unlinks or dismisses the highlighted row");
   assert.match(entry, /const detail = detailOf\(selected\);/, "the details follow the highlight");
   assert.match(entry, /call\("github\.unlink", \{ url: pr\.url \}\)/);
@@ -109,5 +102,4 @@ test("GitHub session panel lists every pull request with per-row actions", () =>
   assert.match(entry, /grid-template-columns:8px 42px minmax\(0, 1fr\) 12px 52px 92px/, "fixed columns keep numbers, titles, and actions aligned across rows");
   assert.match(entry, /if \(next\.applicable && next\.changed\) void dataChanged\(\)/, "a refresh that changed stored PRs refreshes the sidebar pills");
   assert.match(entry, /appendFooter\(panelHints\(\{ prs, selected,/, "the footer hints come from panelHints");
-  assert.match(entry, /if \(disposed \|\| current !== generation\) return;/, "a stale github.status answer never renders");
 });

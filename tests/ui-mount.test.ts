@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
-import { deferred, installDom, settle, type Deferred } from "./ui-harness.js";
+import { deferred, installDom, press, settle, type Deferred } from "./ui-harness.js";
 import githubEntrypoint from "../ui/entry.js";
 import githubTitlebarEntrypoint from "../ui/titlebar.js";
 import type { PullRequest, PullRequestSource } from "../ui/pull-requests.js";
@@ -49,7 +49,23 @@ function mountPanel(sessionId = "s1") {
   };
 }
 
+const list = (root: Element) => root.querySelector<HTMLElement>(".pr-list");
+const selectedNumber = (root: Element) => root.querySelector('.pr-row[aria-selected="true"] .pr-number')?.textContent;
+
 beforeEach(() => { installDom(); });
+
+test("only the latest status refresh renders, whatever order the answers come in", async () => {
+  const panel = mountPanel();
+  await panel.answer("github.status", status("First"));
+  panel.root.querySelector<HTMLButtonElement>("button.refresh").click();
+  panel.root.querySelector<HTMLButtonElement>("button.refresh").click();
+  const [, second, third] = panel.pending("github.status");
+  third.reply.resolve(status("Third"));
+  await settle();
+  second.reply.resolve(status("Second"));
+  await settle();
+  assert.match(panel.root.querySelector(".pr-title").textContent, /^Third/);
+});
 
 test("a change refreshes through the host once, without another status call", async () => {
   const panel = mountPanel();
@@ -58,6 +74,56 @@ test("a change refreshes through the host once, without another status call", as
   await panel.answer("github.unlink", { pull_requests: [] });
   assert.equal(panel.changes(), 1);
   assert.equal(panel.pending("github.status").length, 1, "the host remount loads the panel again");
+});
+
+test("the list is a grid whose focus survives re-renders and refreshes", async () => {
+  const panel = mountPanel();
+  await panel.answer("github.status", status());
+  const grid = list(panel.root);
+  assert.equal(grid.getAttribute("role"), "grid");
+  assert.ok([...grid.querySelectorAll(".pr-row")].every((row) => row.getAttribute("role") === "row"));
+  assert.ok([...grid.querySelectorAll(".pr-row > *")].every((cell) => cell.getAttribute("role") === "gridcell"));
+  assert.ok([...grid.querySelectorAll("button")].every((button) => button.tabIndex === -1), "row buttons stay out of the tab order");
+
+  grid.focus();
+  press("j");
+  assert.equal(selectedNumber(panel.root), "#2");
+  assert.equal(document.activeElement, list(panel.root), "focus moves to the re-rendered list");
+  const active = document.getElementById(list(panel.root).getAttribute("aria-activedescendant"));
+  assert.equal(active?.getAttribute("role"), "gridcell");
+  assert.equal(active?.closest(".pr-row")?.getAttribute("aria-selected"), "true");
+
+  press("r");
+  assert.equal(document.activeElement, list(panel.root), "the list stays while refreshing");
+  await panel.answer("github.status", status());
+  assert.equal(document.activeElement, list(panel.root));
+  assert.equal(selectedNumber(panel.root), "#2");
+});
+
+test("arrows on another control leave the highlight alone", async () => {
+  const panel = mountPanel();
+  await panel.answer("github.status", status());
+  const strategy = panel.root.querySelector<HTMLButtonElement>("button[data-merge-strategy]");
+  strategy.focus();
+  press("ArrowDown");
+  assert.equal(selectedNumber(panel.root), "#1");
+  strategy.blur();
+  press("ArrowDown", document.body);
+  assert.equal(selectedNumber(panel.root), "#2", "with nothing focused, arrows move the highlight");
+});
+
+test("the highlight survives the host remounting the panel", async () => {
+  const first = mountPanel();
+  await first.answer("github.status", status());
+  list(first.root).focus();
+  press("j");
+  first.dispose();
+  const second = mountPanel();
+  await second.answer("github.status", status());
+  assert.equal(selectedNumber(second.root), "#2");
+  const other = mountPanel("s2");
+  await other.answer("github.status", status());
+  assert.equal(selectedNumber(other.root), "#1", "each session keeps its own highlight");
 });
 
 test("the titlebar reloads its summary when the plugin's data changes", async () => {
