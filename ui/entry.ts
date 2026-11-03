@@ -80,7 +80,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         .pr-number { color:var(--tone); font:500 11.5px var(--planeai-font-mono); }
         .pr-text { display:flex; align-items:baseline; gap:6px; min-width:0; }
         .pr-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--planeai-text); font-size:12px; }
-        .pr-repo { flex:none; color:var(--planeai-text-subtle); font:10.5px var(--planeai-font-mono); }
+        .pr-repo { flex:0 1000 auto; min-width:4ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--planeai-text-subtle); font:10.5px var(--planeai-font-mono); }
         .pr-source { color:var(--planeai-text-subtle); font:10px var(--planeai-font-mono); white-space:nowrap; }
         .pr-ci { min-width:12px; color:var(--tone); font-size:11px; line-height:1; text-align:center; }
         .pr-actions { display:flex; align-items:center; justify-content:flex-end; gap:2px; }
@@ -305,7 +305,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const title = document.createElement("span"); title.className = "pr-title"; title.textContent = pr.title || pr.url; title.title = pr.title || pr.url;
       text.append(title);
       const repository = foreignRepository(pr, snapshot?.repository);
-      if (repository) { const repo = document.createElement("span"); repo.className = "pr-repo"; repo.textContent = repository; text.append(repo); }
+      if (repository) { const repo = document.createElement("span"); repo.className = "pr-repo"; repo.textContent = repository; repo.title = repository; text.append(repo); }
       const ci = document.createElement("span"); ci.className = "pr-ci";
       const ciTone = isLive(pr) ? checkTone(pr.checks) : null;
       if (ciTone) {

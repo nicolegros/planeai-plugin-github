@@ -27,7 +27,7 @@
   "ui_contributions": [
     {
       "id": "pull-request",
-      "label": "Pull Request",
+      "label": "Pull requests",
       "placement": "session.panel",
       "entrypoint": "ui/entry.js",
       "shortcut": "Mod+Shift+P"

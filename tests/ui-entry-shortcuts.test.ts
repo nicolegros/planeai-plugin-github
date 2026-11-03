@@ -100,6 +100,8 @@ test("GitHub session panel lists every pull request with per-row actions", () =>
   assert.match(entry, /if \(pr\.source !== "branch"\)/, "branch rows cannot be unlinked");
   assert.match(entry, /call\("github\.unlink", \{ url: pr\.url \}\)/);
   assert.match(entry, /foreignRepository\(pr, snapshot\?\.repository\)/, "rows name a repository only when it differs");
+  assert.match(entry, /\.pr-repo \{ flex:0 1000 auto; min-width:4ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;/, "the repository name shrinks before the title does");
+  assert.match(entry, /repo\.title = repository/, "a shortened repository name stays readable on hover");
   assert.match(entry, /SOURCE_LABELS\[pr\.source\]/);
   assert.match(entry, /button\("↗", \(\) => context\.host\.navigation\.openExternal\(pr\.url\)\)/);
   assert.match(entry, /grid-template-columns:8px 42px minmax\(0, 1fr\) 12px 52px 92px/, "fixed columns keep numbers, titles, and actions aligned across rows");

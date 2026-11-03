@@ -31,6 +31,7 @@ test("manifest declares host API v5 and the session.meta pull-request pill", () 
   assert.ok(!manifest.ui_contributions.some((contribution) => contribution.placement === "session.indicator"), "the pill replaces the CI indicator");
   const panels = manifest.ui_contributions.filter((contribution) => contribution.placement === "session.panel");
   assert.equal(panels[0]?.id, "pull-request", "clicking the pill opens the first session panel");
+  assert.equal(panels[0]?.label, "Pull requests", "the panel titles every pull request of the task");
   assert.ok(manifest.capabilities.includes("sessions.read"), "task siblings come from the session list");
 });
 
