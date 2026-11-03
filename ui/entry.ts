@@ -53,6 +53,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     // Only a form just opened takes focus; re-rendering it otherwise leaves focus where the user is.
     let formJustOpened = false;
     let refreshError = "";
+    // A change succeeded and the panel waits for the reload it causes.
+    let reloading = false;
     let busy = false;
     let disposed = false;
     let selectedStrategy = "squash";
@@ -144,8 +146,16 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     const editableTarget = (target) => target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']");
     // The host tells every view of the plugin about a data change, this panel included, so its
     // own changes reload it through that echo.
-    const dataChanged = () => context.host.data.changed?.();
-    const listensForChanges = typeof context.host.data.onChanged === "function";
+    const listensForChanges = typeof context.host.data.changed === "function" && typeof context.host.data.onChanged === "function";
+    /** Tells the host, whose echo reloads this panel; without that echo, the panel reloads itself. */
+    async function announceChange() {
+      if (listensForChanges) {
+        try { await context.host.data.changed(); } catch { await load(); }
+        return;
+      }
+      void context.host.data.changed?.()?.catch(() => {});
+      await load();
+    }
 
     const canMerge = (pr: PullRequestDetail) => !busy && !pr.conflicting && !pr.merge_blocked && pr.state === "open";
     const status = () => (snapshot?.applicable ? snapshot : null);
@@ -174,12 +184,12 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       busy = true; render();
       try {
         await action();
-        busy = false;
-        if (success) context.host.data.notify(success, "success");
-        render();
-        void dataChanged();
-        if (!listensForChanges) await load();
-      } catch (error) { busy = false; render(String(error)); }
+      } catch (error) { busy = false; render(String(error)); return; }
+      if (success) context.host.data.notify(success, "success");
+      // The list is stale until the reload lands, so it stays busy and no action starts from it.
+      reloading = true;
+      render();
+      await announceChange();
     }
 
     function installFormKeyboard(form: HTMLFormElement, focusField: HTMLElement, cancel: () => void) {
@@ -202,7 +212,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       header.className = "header";
       const name = context.session?.name || "Pull requests";
       const open = button(current ? `${name} · #${current.number} ↗` : name, () => context.host.navigation.openExternal(current.url), { shortcut: "o", className: "pr-link" });
-      open.disabled = !current;
+      open.disabled = !current || busy;
       header.append(open);
       if (current) {
         const state = document.createElement("span");
@@ -502,6 +512,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const detail = detailOf(selected);
       if (detail) appendDetail(detail);
       appendActions();
+      if (reloading) appendStatus("Refreshing GitHub status…");
       if (error) appendStatus("GitHub could not complete that action.", error);
       appendFooter(panelHints({ prs, selected, mergeable: mergeStrategies(detail).length > 0, branch: status()?.branch }));
     }
@@ -569,6 +580,12 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       event.stopPropagation();
     }
 
+    function settleReload() {
+      if (!reloading) return;
+      reloading = false;
+      busy = false;
+    }
+
     async function load() {
       if (!sourceSessionId) { render(); return; }
       if (disposed) return;
@@ -579,13 +596,15 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         const next: GithubStatus = await call("github.status");
         if (disposed || current !== generation) return;
         snapshot = next;
-        // An open form does not show the status, and rebuilding it would move focus mid-typing.
         refreshError = "";
+        settleReload();
+        // An open form does not show the status, and rebuilding it would move focus mid-typing.
         if (!activeForm) render();
         // The host's echo reloads once more; that refresh changes nothing, so it stops there.
-        if (next.applicable && next.changed) void dataChanged();
+        if (next.applicable && next.changed) void announceChange();
       } catch (error) {
         if (disposed || current !== generation) return;
+        settleReload();
         if (!snapshot?.applicable) snapshot = null;
         if (activeForm) refreshError = String(error);
         else render(String(error));
