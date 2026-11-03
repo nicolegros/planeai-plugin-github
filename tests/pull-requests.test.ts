@@ -120,7 +120,7 @@ test("moving the highlight follows display order and stops at the ends", () => {
   assert.equal(moveSelection([], null, 1), null);
 });
 
-test("only a live pull request detected from the branch counts as the branch's", () => {
+test("a live pull request detected from the branch, or created from it, counts as the branch's", () => {
   assert.equal(branchHasPullRequest([pr(1, { source: "branch" })], "topic"), true);
   assert.equal(branchHasPullRequest([pr(1, { source: "branch", state: "draft" })], "topic"), true);
   assert.equal(branchHasPullRequest([pr(1, { source: "branch", state: "merged" })], "topic"), false, "a merged branch pull request leaves room for a new one");
