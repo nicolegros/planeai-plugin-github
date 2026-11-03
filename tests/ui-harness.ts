@@ -4,7 +4,7 @@ import { JSDOM } from "jsdom";
 export function installDom(): JSDOM {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "https://plugin.test/", pretendToBeVisual: true });
   const browser = dom.window as unknown as Record<string, unknown>;
-  for (const name of ["window", "document", "Element", "HTMLElement", "HTMLButtonElement", "MutationObserver", "KeyboardEvent", "requestAnimationFrame", "sessionStorage"]) {
+  for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLButtonElement", "HTMLInputElement", "HTMLTextAreaElement", "MutationObserver", "KeyboardEvent", "requestAnimationFrame", "sessionStorage"]) {
     Object.defineProperty(globalThis, name, { value: name === "window" ? dom.window : browser[name], configurable: true, writable: true });
   }
   return dom;
