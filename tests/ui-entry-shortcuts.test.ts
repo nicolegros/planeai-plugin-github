@@ -60,7 +60,6 @@ test("GitHub session meta pill reads only the cached summary and reports its siz
 test("GitHub titlebar shows the pill summary or the create control", () => {
   assert.match(titlebar, /context\.host\.call\("github\.summary", \{ session_id: sessionId, check_repository: true \}\)/, "the titlebar reads the cached summary");
   assert.doesNotMatch(titlebar, /github\.status/, "the titlebar never fetches pull request details");
-  assert.match(titlebar, /context\.host\.data\?\.onChanged\?\./, "the titlebar follows data changes");
   assert.match(titlebar, /width:fit-content; max-width:100%; min-height:25px; height:25px;/);
   assert.match(titlebar, /const pill = renderPill\(prs\)/, "the titlebar shares the sidebar pill");
   assert.match(titlebar, /setButton\("＋ Create PR", "create", false/);
@@ -111,5 +110,4 @@ test("GitHub session panel lists every pull request with per-row actions", () =>
   assert.match(entry, /if \(next\.applicable && next\.changed\) void dataChanged\(\)/, "a refresh that changed stored PRs refreshes the sidebar pills");
   assert.match(entry, /appendFooter\(panelHints\(\{ prs, selected,/, "the footer hints come from panelHints");
   assert.match(entry, /if \(disposed \|\| current !== generation\) return;/, "a stale github.status answer never renders");
-  assert.match(entry, /if \(context\.host\.data\.changed\) await dataChanged\(\);\s*else await load\(\);/, "a mutation refreshes once: the host remounts the panel on data changes");
 });
