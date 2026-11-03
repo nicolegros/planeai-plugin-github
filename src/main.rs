@@ -1576,6 +1576,7 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
     }
     gh_output(context, cwd, args)?;
     // What GitHub says now, with its own merge time; a merge queue can keep the pull request open.
+    // A read lagging right after a real merge is corrected by the next refresh, which then fires on_merge.
     let fetched = fetch_pull_request(context, cwd, &key).ok();
     update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
