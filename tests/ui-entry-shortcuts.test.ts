@@ -29,7 +29,7 @@ test("GitHub session panel uses the compact PR layout and capture-phase shortcut
   assert.match(entry, /const contentObserver = new MutationObserver/);
   assert.match(entry, /contentObserver\.disconnect\(\)/);
   assert.match(entry, /call\("github\.merge", \{ strategy: selectedStrategy, url: pr\.url \}\)/);
-  assert.match(entry, /function renderLink\(\)/);
+  assert.match(entry, /function renderLink\(saved: LinkForm\)/);
   assert.match(entry, /Link pull request/);
   assert.match(entry, /await call\("github\.link", \{ url: urlField\.value \}\)/);
   assert.match(entry, /const recipient = await context\.host\.recipient\.getFocusedAgentSession\(\)/);
@@ -69,7 +69,7 @@ test("GitHub titlebar shows the pill summary or the create control", () => {
 });
 
 test("GitHub UI links existing PRs and configures automatic task transitions", () => {
-  assert.match(entry, /function renderLink\(\)/);
+  assert.match(entry, /function renderLink\(saved: LinkForm\)/);
   assert.match(entry, /call\("github\.link", \{ url: urlField\.value \}\)/);
   assert.match(entry, /appendFooter\(\[\["L", "link"\], \["Esc", "close"\]\]\)/, "the link form documents its keyboard flow");
   assert.match(entry, /if \(!branchHasPullRequest\(pullRequests\(\), status\(\)\?\.branch\)\) \{\s*actions\.append\(button\("Create PR"[\s\S]*?\{ shortcut: "c" \}\)\);\s*\}\s*actions\.append\(button\("Link pull request"/, "Create PR shows only while the branch has no pull request, beside Link");
