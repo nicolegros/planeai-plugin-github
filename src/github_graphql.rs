@@ -116,8 +116,8 @@ pub struct GraphqlResponse {
     pub default_branches: BTreeMap<String, String>,
 }
 
-const PR_FIELDS: &str = "number url title state isDraft updatedAt headRefName baseRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
-const PR_DETAIL_FIELDS: &str = "number url title state isDraft updatedAt headRefName baseRefName isCrossRepository mergeable mergeStateStatus commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } }";
+const PR_FIELDS: &str = "number url title state isDraft updatedAt createdAt mergedAt headRefName baseRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
+const PR_DETAIL_FIELDS: &str = "number url title state isDraft updatedAt createdAt mergedAt headRefName baseRefName isCrossRepository mergeable mergeStateStatus commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } }";
 const LIST_SIZE: u32 = 10;
 
 fn literal(value: &str) -> String {
@@ -275,6 +275,8 @@ fn parse_pr(node: &Value, detail: bool, now: u64) -> Option<FetchedPr> {
             head_branch: string(node, "headRefName"),
             base_branch: string(node, "baseRefName"),
             updated_at: string(node, "updatedAt"),
+            created_at: string(node, "createdAt"),
+            merged_at: string(node, "mergedAt"),
             refreshed_at: now,
         },
         cross_repository: node.get("isCrossRepository").and_then(Value::as_bool) == Some(true),
@@ -371,10 +373,10 @@ mod tests {
         assert!(query
             .starts_with("query { r0: repository(owner: \"o\", name: \"r\") { squashMergeAllowed"));
         assert!(query.contains("l0: pullRequest(number: 4) { number url"));
-        assert!(query.contains("l2: pullRequests(headRefName: \"topic\", first: 10, orderBy: { field: UPDATED_AT, direction: DESC }) { nodes { number url title state isDraft updatedAt headRefName baseRefName isCrossRepository mergeable"));
+        assert!(query.contains("l2: pullRequests(headRefName: \"topic\", first: 10, orderBy: { field: UPDATED_AT, direction: DESC }) { nodes { number url title state isDraft updatedAt createdAt mergedAt headRefName baseRefName isCrossRepository mergeable"));
         assert!(query.contains("l3: pullRequests(headRefName: \"base\", states: OPEN, first: 10)"));
         assert!(query.contains("r1: repository(owner: \"x\", name: \"y\") { l1: pullRequests(baseRefName: \"feat/\\\"quoted\\\"\", states: OPEN"));
-        assert!(query.contains("states: OPEN, first: 10) { nodes { number url title state isDraft updatedAt headRefName baseRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } } defaultBranchRef { name } }"));
+        assert!(query.contains("states: OPEN, first: 10) { nodes { number url title state isDraft updatedAt createdAt mergedAt headRefName baseRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } } defaultBranchRef { name } }"));
         assert_eq!(query.matches("defaultBranchRef { name }").count(), 2);
         assert_eq!(query.matches('{').count(), query.matches('}').count());
     }

@@ -121,6 +121,10 @@ pub struct PrSnapshot {
     pub base_branch: Option<String>,
     /// GitHub's `updatedAt` (RFC 3339, UTC), so it orders lexicographically.
     pub updated_at: Option<String>,
+    /// GitHub's `createdAt` (RFC 3339, UTC).
+    pub created_at: Option<String>,
+    /// GitHub's `mergedAt` (RFC 3339, UTC), once merged.
+    pub merged_at: Option<String>,
     /// When the plugin last stored this snapshot, in Unix milliseconds.
     pub refreshed_at: u64,
 }
@@ -202,6 +206,10 @@ struct LinkRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merged_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     refreshed_at: Option<u64>,
 }
 
@@ -225,6 +233,8 @@ impl TryFrom<LinkRecord> for PullRequestLink {
                     || record.head_branch.is_some()
                     || record.base_branch.is_some()
                     || record.updated_at.is_some()
+                    || record.created_at.is_some()
+                    || record.merged_at.is_some()
                     || record.refreshed_at.is_some();
                 if has_snapshot {
                     return Err("a dismissed pull request link carries no status".into());
@@ -253,6 +263,8 @@ impl TryFrom<LinkRecord> for PullRequestLink {
                 head_branch: non_empty(record.head_branch),
                 base_branch: non_empty(record.base_branch),
                 updated_at: non_empty(record.updated_at),
+                created_at: non_empty(record.created_at),
+                merged_at: non_empty(record.merged_at),
                 refreshed_at,
             },
         ))
@@ -276,6 +288,8 @@ impl From<&PullRequestLink> for LinkRecord {
             head_branch: None,
             base_branch: None,
             updated_at: None,
+            created_at: None,
+            merged_at: None,
             refreshed_at: None,
         };
         if let LinkStatus::Tracked { source, snapshot } = &link.status {
@@ -291,6 +305,8 @@ impl From<&PullRequestLink> for LinkRecord {
             record.head_branch = snapshot.head_branch.clone();
             record.base_branch = snapshot.base_branch.clone();
             record.updated_at = snapshot.updated_at.clone();
+            record.created_at = snapshot.created_at.clone();
+            record.merged_at = snapshot.merged_at.clone();
             record.refreshed_at = Some(snapshot.refreshed_at);
         }
         record
@@ -362,6 +378,8 @@ pub fn parse_legacy_mapping(value: &Value) -> Result<Option<PullRequestLink>, St
             head_branch: None,
             base_branch: None,
             updated_at: None,
+            created_at: None,
+            merged_at: None,
             refreshed_at: legacy.updated_at,
         },
     )))
@@ -602,8 +620,8 @@ pub enum PrStateTransition {
 
 /// The task transition that a change of the task's pull requests causes.
 /// The task is merged when nothing is left open and either a tracked pull request just merged,
-/// or the last open one was closed or removed after a merge newer than every open one; adding a
-/// merged link alone never counts. An open pull request counts only when the task had none.
+/// or the last open one was closed or removed after a merge later than the creation of every open
+/// one; adding a merged link alone never counts. An open pull request counts only when the task had none.
 pub fn task_transition(
     before: &[AggregatedPr],
     after: &[AggregatedPr],
@@ -615,14 +633,24 @@ pub fn task_transition(
                 .any(|old| old.key == pr.key && old.snapshot.state != PrState::Merged)
     });
     let any_live = |prs: &[AggregatedPr]| prs.iter().any(|pr| pr.snapshot.state.is_live());
-    // A merge older than the pull requests that were open belongs to work finished before them.
+    // A merge from before the open pull requests were created belongs to work finished before
+    // them. A merge of unknown time is never later; a pull request of unknown creation is older
+    // than any merge.
+    let merged_after_created = |merged: &AggregatedPr, live: &AggregatedPr| match (
+        &merged.snapshot.merged_at,
+        &live.snapshot.created_at,
+    ) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(merged_at), Some(created_at)) => merged_at > created_at,
+    };
     let last_live_gone = any_live(before)
         && after.iter().any(|merged| {
             merged.snapshot.state == PrState::Merged
                 && before
                     .iter()
                     .filter(|pr| pr.snapshot.state.is_live())
-                    .all(|live| merged.snapshot.updated_at > live.snapshot.updated_at)
+                    .all(|live| merged_after_created(merged, live))
         });
     if (newly_merged || last_live_gone) && !any_live(after) {
         return Some(PrStateTransition::Merged);
@@ -704,6 +732,8 @@ mod tests {
             head_branch: None,
             base_branch: None,
             updated_at: None,
+            created_at: None,
+            merged_at: None,
             refreshed_at,
         }
     }
@@ -1113,46 +1143,68 @@ mod tests {
         assert_eq!(transition(&[(1, Open)], &[(1, Closed)]), None);
     }
 
-    fn timed(prs: &[(u64, PrState, &str)]) -> Vec<AggregatedPr> {
+    /// Pull requests with the days they were created, merged (empty when unknown), and last updated.
+    fn timed(prs: &[(u64, PrState, &str, &str, &str)]) -> Vec<AggregatedPr> {
+        let day = |day: &str| (!day.is_empty()).then(|| format!("2026-10-{day}T00:00:00Z"));
         prs.iter()
-            .map(|(number, state, day)| {
+            .map(|(number, state, created, merged, updated)| {
                 let mut pr = aggregated(&[(*number, *state)]).remove(0);
-                pr.snapshot.updated_at = Some(format!("2026-10-{day}T00:00:00Z"));
+                pr.snapshot.created_at = day(created);
+                pr.snapshot.merged_at = day(merged);
+                pr.snapshot.updated_at = day(updated);
                 pr
             })
             .collect()
     }
 
     #[test]
-    fn the_last_open_pull_request_going_finishes_the_task_only_after_a_newer_merge() {
+    fn the_last_open_pull_request_going_finishes_the_task_only_after_a_later_merge() {
         use PrState::*;
         let merged = Some(PrStateTransition::Merged);
-        let transition = |before, after| task_transition(&timed(before), &timed(after));
+        type Timed<'a> = [(u64, PrState, &'a str, &'a str, &'a str)];
+        fn transition(before: &Timed, after: &Timed) -> Option<PrStateTransition> {
+            task_transition(&timed(before), &timed(after))
+        }
+        let bottom = (1, Merged, "01", "03", "03");
         assert_eq!(
             transition(
-                &[(2, Open, "02"), (1, Merged, "03")],
-                &[(2, Closed, "04"), (1, Merged, "03")]
+                &[(2, Open, "02", "", "05"), bottom],
+                &[(2, Closed, "02", "", "06"), bottom]
             ),
             merged,
-            "closing the last open pull request after a merge finishes the task"
+            "a child retargeted or commented on after the merge was still opened before it"
         );
         assert_eq!(
-            transition(&[(2, Open, "02"), (1, Merged, "03")], &[(1, Merged, "03")]),
+            transition(&[(2, Open, "02", "", "05"), bottom], &[bottom]),
             merged,
             "dismissing the last open pull request after a merge finishes the task"
         );
         assert_eq!(
             transition(
-                &[(1, Merged, "01"), (2, Open, "02")],
-                &[(1, Merged, "01"), (2, Closed, "03")]
+                &[bottom, (2, Open, "04", "", "04")],
+                &[bottom, (2, Closed, "04", "", "05")]
             ),
             None,
-            "an older merge belongs to work the task finished before the newer pull request opened"
+            "a pull request opened after the merge and abandoned does not finish the task"
         );
         assert_eq!(
-            transition(&[(1, Merged, "01"), (2, Open, "02")], &[(1, Merged, "01")]),
+            transition(&[bottom, (2, Open, "04", "", "04")], &[bottom]),
             None,
-            "unlinking the newer pull request does not finish the task on an old merge"
+            "unlinking a pull request opened after the merge does not finish the task"
+        );
+        let unknown_merge = (1, Merged, "01", "", "03");
+        assert_eq!(
+            transition(
+                &[(2, Open, "02", "", "02"), unknown_merge],
+                &[unknown_merge]
+            ),
+            None,
+            "a merge of unknown time is never later"
+        );
+        assert_eq!(
+            transition(&[(2, Open, "", "", "05"), bottom], &[bottom]),
+            merged,
+            "a pull request of unknown creation counts as older than any merge"
         );
     }
 

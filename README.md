@@ -71,7 +71,8 @@ When the GitHub session panel has focus, use these shortcuts:
 The **Preferences → GitHub** page can automatically transition a session's linked PlaneAI task when its pull requests open or merge.
 Each action is optional and can move the task to `todo`, `in_progress`, `in_review`, or `done`.
 The opened action runs when the task gains an open, non-draft pull request while it had none.
-The merged action runs once nothing of the task is left open, either because a tracked pull request just merged or because its last open pull request was closed, unlinked, or dismissed after a merge more recent than every pull request that was open.
+The merged action runs once nothing of the task is left open, either because a tracked pull request just merged or because its last open pull request was closed, unlinked, or dismissed after a merge that happened after every open pull request was created.
+A merge whose time is unknown never counts as later, and a pull request whose creation time is unknown counts as created before any merge.
 Linking an already merged pull request alone never counts as a merge.
 Creating, linking, unlinking, and merging fail before changing anything when PlaneAI cannot list the task's sessions, and a refresh in that state is shown but not stored, so no transition is ever lost.
 Dismissed pull requests do not count.
@@ -99,7 +100,7 @@ The sidecar speaks newline-delimited JSON-RPC on stdin/stdout. Stdout is protoco
 
 With the manifest-granted `settings` capability, the sidecar persists only its `github` namespace through `host.settings.get` and `host.settings.patch`; host deep-merge semantics preserve unrelated plugin settings.
 The namespace is a strict version-4 JSON document containing `pull_requests` keyed by session ID, a reconciliation ledger, and optional `task_transitions`.
-Each session holds a list of links keyed by `host`, `repository` (`owner/name`), and `number`, each with its `url`, `source` (`branch`, `created`, `manual`, `stack`, or a tombstone: `stack-dismissed` for a dismissed stack link, `unlinked` for an unlinked created or manual one), and, except for tombstones, the cached `state`, `title`, `checks`, `head_branch`, `base_branch`, GitHub `updated_at`, and `refreshed_at`.
+Each session holds a list of links keyed by `host`, `repository` (`owner/name`), and `number`, each with its `url`, `source` (`branch`, `created`, `manual`, `stack`, or a tombstone: `stack-dismissed` for a dismissed stack link, `unlinked` for an unlinked created or manual one), and, except for tombstones, the cached `state`, `title`, `checks`, `head_branch`, `base_branch`, GitHub `updated_at`, `created_at`, and `merged_at` (absent in links stored before they existed), and `refreshed_at`.
 Older documents migrate in place: version 1 and 2 gain the transition defaults, and version 3 turns each session's single mapping into a one-element list of `manual` links.
 A legacy mapping whose URL is not a `github.com` pull request becomes an empty list, with a log line on stderr.
 Because the host deletes keys patched to `null`, absent optional fields read as `null`.

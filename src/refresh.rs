@@ -471,6 +471,8 @@ mod tests {
                 head_branch: Some(head.into()),
                 base_branch: Some(base.into()),
                 updated_at: Some(format!("2026-10-0{}T00:00:00Z", number % 10)),
+                created_at: None,
+                merged_at: None,
                 refreshed_at: 100,
             },
             cross_repository: false,
