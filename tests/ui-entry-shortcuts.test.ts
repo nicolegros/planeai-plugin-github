@@ -70,8 +70,6 @@ test("GitHub titlebar shows the pill summary or the create control", () => {
 test("GitHub UI links existing PRs and configures automatic task transitions", () => {
   assert.match(entry, /call\("github\.link", \{ url: urlField\.value \}\)/);
   assert.match(entry, /appendFooter\(\[\["L", "link"\], \["Esc", "close"\]\]\)/, "the link form documents its keyboard flow");
-  assert.match(entry, /function installFormKeyboard\(form, focusField, cancel\)/, "forms share keyboard behavior");
-  assert.match(entry, /requestAnimationFrame\(\(\) => focusField\.focus\(\)\)/, "both forms autofocus their supplied first field");
   assert.match(settings, /context\.host\.call\("github\.settings"\)/);
   assert.match(settings, /context\.host\.call\("github\.settings\.update"/);
   assert.match(settings, /When a pull request opens/);

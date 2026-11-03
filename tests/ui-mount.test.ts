@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
-import { deferred, installDom, press, settle, type Deferred } from "./ui-harness.js";
+import { deferred, installDom, nextFrame, press, settle, type Deferred } from "./ui-harness.js";
 import githubEntrypoint from "../ui/entry.js";
 import githubTitlebarEntrypoint from "../ui/titlebar.js";
 import type { PullRequest, PullRequestSource } from "../ui/pull-requests.js";
@@ -241,4 +241,25 @@ test("Cmd or Ctrl+Enter submits a form", async () => {
     press("Enter", field, modifier);
     assert.deepEqual(panel.pending("github.link").map((call) => call.params.url), ["https://github.com/o/r/pull/9"]);
   }
+});
+
+test("a restored form keeps the field and selection that had focus", async () => {
+  const first = mountPanel();
+  await first.answer("github.status", withoutBranchPullRequest());
+  press("c", document.body);
+  await first.answer("github.defaults", { title: "Title", body: "Some body", base_branch: "main" });
+  await nextFrame();
+  assert.equal((document.activeElement as HTMLInputElement)?.value, "Title", "a form just opened focuses its first field");
+  const body = first.root.querySelector("textarea");
+  body.focus();
+  body.setSelectionRange(2, 6);
+  body.dispatchEvent(new window.Event("select", { bubbles: true }));
+  first.dispose();
+
+  const second = mountPanel();
+  await second.answer("github.status", withoutBranchPullRequest());
+  await nextFrame();
+  const restored = document.activeElement as HTMLTextAreaElement;
+  assert.equal(restored?.tagName, "TEXTAREA", "the body keeps focus, not the first field");
+  assert.deepEqual([restored.selectionStart, restored.selectionEnd], [2, 6]);
 });

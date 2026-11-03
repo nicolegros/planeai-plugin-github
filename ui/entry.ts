@@ -35,7 +35,9 @@ type GithubPluginContext = {
 type CreateForm = { kind: "create"; title: string; body: string; base_branch: string; draft: boolean };
 type LinkForm = { kind: "link"; url: string };
 /** What a panel keeps for its session across remounts. */
-type PanelMemory = { highlight?: string | null; strategy?: string; form?: CreateForm | LinkForm | null };
+/** The form field that had focus, by name, with its selection. */
+type FormFocus = { field: string; start: number | null; end: number | null };
+type PanelMemory = { highlight?: string | null; strategy?: string; form?: CreateForm | LinkForm | null; focus?: FormFocus | null };
 
 type GithubPluginEntrypoint = {
   mount: (root: HTMLElement, context: GithubPluginContext) => () => void;
@@ -61,7 +63,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     let selectedStrategy = memory.strategy ?? "squash";
     // The highlighted pull request; the header, checks, merge, and failure hand-off follow it.
     let selectedUrl: string | null = memory.highlight ?? null;
-    const closeForm = () => remember({ form: null });
+    const closeForm = () => remember({ form: null, focus: null });
+    const openNewForm = (form: CreateForm | LinkForm) => remember({ form, focus: null });
 
     const page = document.createElement("main");
     page.innerHTML = `
@@ -181,7 +184,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       } catch (error) { busy = false; render(String(error)); }
     }
 
-    function installFormKeyboard(form, focusField, cancel) {
+    function installFormKeyboard(form: HTMLFormElement, focusField: HTMLElement, cancel: () => void) {
       form.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
           event.preventDefault();
@@ -191,7 +194,30 @@ const githubEntrypoint: GithubPluginEntrypoint = {
           form.requestSubmit();
         }
       });
-      requestAnimationFrame(() => focusField.focus());
+      const saveFocus = (event: Event) => {
+        const field = event.target;
+        if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) || !field.name) return;
+        let start: number | null = null;
+        let end: number | null = null;
+        try { start = field.selectionStart; end = field.selectionEnd; } catch { /* checkboxes have no selection */ }
+        remember({ focus: { field: field.name, start, end } });
+      };
+      for (const type of ["focusin", "select", "keyup", "mouseup", "input"]) form.addEventListener(type, saveFocus);
+      form.addEventListener("focusout", (event: FocusEvent) => {
+        // A field removed by a re-render loses focus to nothing; only a move elsewhere forgets it.
+        if (event.relatedTarget instanceof Node && !form.contains(event.relatedTarget)) remember({ focus: null });
+      });
+      const saved = memory.focus;
+      requestAnimationFrame(() => {
+        if (disposed || !form.isConnected) return;
+        const field = saved ? form.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[name="${saved.field}"]`) : null;
+        if (field) {
+          field.focus();
+          if (saved.start !== null) { try { field.setSelectionRange(saved.start, saved.end ?? saved.start); } catch { /* checkboxes have no selection */ } }
+        } else if (!saved) {
+          focusField.focus();
+        }
+      });
     }
 
     function appendHeader(current: PullRequest | null) {
@@ -253,10 +279,10 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       section.className = "section";
       const title = document.createElement("div"); title.className = "section-title"; title.textContent = "Create pull request";
       const form = document.createElement("form");
-      const titleField = document.createElement("input"); titleField.value = saved.title; titleField.required = true;
-      const bodyField = document.createElement("textarea"); bodyField.rows = 10; bodyField.value = saved.body;
-      const baseField = document.createElement("input"); baseField.value = saved.base_branch; baseField.required = true;
-      const draft = document.createElement("input"); draft.type = "checkbox"; draft.checked = saved.draft;
+      const titleField = document.createElement("input"); titleField.name = "title"; titleField.value = saved.title; titleField.required = true;
+      const bodyField = document.createElement("textarea"); bodyField.name = "body"; bodyField.rows = 10; bodyField.value = saved.body;
+      const baseField = document.createElement("input"); baseField.name = "base_branch"; baseField.value = saved.base_branch; baseField.required = true;
+      const draft = document.createElement("input"); draft.name = "draft"; draft.type = "checkbox"; draft.checked = saved.draft;
       const save = () => remember({ form: { kind: "create", title: titleField.value, body: bodyField.value, base_branch: baseField.value, draft: draft.checked } });
       form.addEventListener("input", save);
       form.addEventListener("change", save);
@@ -283,7 +309,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       section.className = "section";
       const title = document.createElement("div"); title.className = "section-title"; title.textContent = "Link pull request";
       const form = document.createElement("form");
-      const urlField = document.createElement("input"); urlField.type = "url"; urlField.required = true; urlField.placeholder = "https://github.com/owner/repo/pull/123";
+      const urlField = document.createElement("input"); urlField.name = "url"; urlField.type = "url"; urlField.required = true; urlField.placeholder = "https://github.com/owner/repo/pull/123";
       urlField.value = saved.url;
       urlField.addEventListener("input", () => remember({ form: { kind: "link", url: urlField.value } }));
       const labelled = document.createElement("label"); labelled.textContent = "Pull request URL"; labelled.append(urlField);
@@ -376,9 +402,9 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const section = document.createElement("section"); section.className = "section";
       const actions = document.createElement("div"); actions.className = "form-actions";
       if (!branchHasPullRequest(pullRequests(), status()?.branch)) {
-        actions.append(button("Create PR", async () => { try { const defaults = await call("github.defaults"); remember({ form: { kind: "create", title: defaults?.title || "", body: defaults?.body || "", base_branch: defaults?.base_branch || "main", draft: false } }); render(); } catch (loadError) { render(String(loadError)); } }, { shortcut: "c" }));
+        actions.append(button("Create PR", async () => { try { const defaults = await call("github.defaults"); openNewForm({ kind: "create", title: defaults?.title || "", body: defaults?.body || "", base_branch: defaults?.base_branch || "main", draft: false }); render(); } catch (loadError) { render(String(loadError)); } }, { shortcut: "c" }));
       }
-      actions.append(button("Link pull request", () => { remember({ form: { kind: "link", url: "" } }); render(); }, { shortcut: "l" }));
+      actions.append(button("Link pull request", () => { openNewForm({ kind: "link", url: "" }); render(); }, { shortcut: "l" }));
       section.append(actions);
       content.append(section);
     }
