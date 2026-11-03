@@ -3,7 +3,7 @@
 use crate::github_graphql::{FetchedPr, GraphqlResponse, Lookup, LookupRequest};
 use crate::pull_requests::{
     known_keys, record_branch_pr, record_stack, refresh_snapshot, LinkStatus, PrKey, PrSnapshot,
-    PullRequestLink, TrackedSource,
+    PrState, PullRequestLink, TrackedSource,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -86,6 +86,7 @@ enum Reach {
 fn stack_reach<'a>(
     lists: &'a SessionLinks,
     group: &[String],
+    default_branches: &BTreeMap<String, String>,
 ) -> Vec<(&'a str, &'a PullRequestLink, &'a PrSnapshot, Reach)> {
     let entries: Vec<(&str, &PullRequestLink, &PrSnapshot)> = group
         .iter()
@@ -127,14 +128,33 @@ fn stack_reach<'a>(
         .collect();
     walk(&mut reach, Reach::Up, own.clone());
     walk(&mut reach, Reach::Down, own);
-    // GitHub retargets a stack onto the base branch when its bottom merges, so a live stack link
-    // that no longer connects to the task's own pull requests still grows upward from itself.
+    // When the bottom of a stack merges, GitHub retargets the pull request above it onto the
+    // default branch. Such a pull request no longer connects to the task's own ones, so it keeps
+    // walking downward, toward children; a still-open former parent never does.
+    let on_default = |snapshot: &PrSnapshot, repository: &String| {
+        snapshot.base_branch.is_some()
+            && snapshot.base_branch.as_ref() == default_branches.get(repository)
+    };
+    let merged_bottom = |repository: &String| {
+        entries
+            .iter()
+            .zip(&reach)
+            .any(|((_, link, snapshot), reach)| {
+                *reach == Some(Reach::Both)
+                    && snapshot.state == PrState::Merged
+                    && &link.key.repository == repository
+                    && on_default(snapshot, repository)
+            })
+    };
     let detached: Vec<usize> = (0..entries.len())
-        .filter(|index| reach[*index].is_none() && entries[*index].2.state.is_live())
+        .filter(|index| {
+            let (_, link, snapshot) = entries[*index];
+            reach[*index].is_none()
+                && snapshot.state.is_live()
+                && on_default(snapshot, &link.key.repository)
+                && merged_bottom(&link.key.repository)
+        })
         .collect();
-    for index in &detached {
-        reach[*index] = Some(Reach::Down);
-    }
     walk(&mut reach, Reach::Down, detached);
     entries
         .into_iter()
@@ -157,7 +177,7 @@ fn neighbor_lookups(
         .map(|session| vec![session.clone()])
         .collect();
     for group in groups.iter().chain(&singletons) {
-        for (owner, link, snapshot, reach) in stack_reach(lists, group) {
+        for (owner, link, snapshot, reach) in stack_reach(lists, group, default_branches) {
             if !snapshot.state.is_live() {
                 continue;
             }
@@ -772,6 +792,26 @@ mod tests {
             vec![2, 3, 4],
             "the first task's answer for branch f also serves the second"
         );
+    }
+
+    #[test]
+    fn a_former_parent_the_task_moved_off_never_brings_its_other_children() {
+        let mine = fetched(1, PrState::Open, "c", "main");
+        let former_parent = fetched(2, PrState::Open, "a", "main");
+        let github = github(vec![
+            mine.clone(),
+            former_parent.clone(),
+            fetched(3, PrState::Open, "y", "a"),
+        ]);
+        let fresh = refresh_one(
+            &github,
+            vec![
+                tracked(&mine, TrackedSource::Branch),
+                tracked(&former_parent, TrackedSource::Stack),
+            ],
+            3,
+        );
+        assert_eq!(tracked_numbers(&fresh), vec![1, 2]);
     }
 
     #[test]
