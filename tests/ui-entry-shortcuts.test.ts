@@ -29,7 +29,6 @@ test("GitHub session panel uses the compact PR layout and capture-phase shortcut
   assert.match(entry, /const contentObserver = new MutationObserver/);
   assert.match(entry, /contentObserver\.disconnect\(\)/);
   assert.match(entry, /call\("github\.merge", \{ strategy: selectedStrategy, url: pr\.url \}\)/);
-  assert.match(entry, /function renderLink\(saved: LinkForm\)/);
   assert.match(entry, /Link pull request/);
   assert.match(entry, /await call\("github\.link", \{ url: urlField\.value \}\)/);
   assert.match(entry, /const recipient = await context\.host\.recipient\.getFocusedAgentSession\(\)/);
@@ -69,16 +68,10 @@ test("GitHub titlebar shows the pill summary or the create control", () => {
 });
 
 test("GitHub UI links existing PRs and configures automatic task transitions", () => {
-  assert.match(entry, /function renderLink\(saved: LinkForm\)/);
   assert.match(entry, /call\("github\.link", \{ url: urlField\.value \}\)/);
   assert.match(entry, /appendFooter\(\[\["L", "link"\], \["Esc", "close"\]\]\)/, "the link form documents its keyboard flow");
-  assert.match(entry, /if \(!branchHasPullRequest\(pullRequests\(\), status\(\)\?\.branch\)\) \{\s*actions\.append\(button\("Create PR"[\s\S]*?\{ shortcut: "c" \}\)\);\s*\}\s*actions\.append\(button\("Link pull request"/, "Create PR shows only while the branch has no pull request, beside Link");
   assert.match(entry, /function installFormKeyboard\(form, focusField, cancel\)/, "forms share keyboard behavior");
   assert.match(entry, /requestAnimationFrame\(\(\) => focusField\.focus\(\)\)/, "both forms autofocus their supplied first field");
-  assert.match(entry, /event\.key === "Escape"/, "Escape cancels a form");
-  assert.match(entry, /\(event\.metaKey \|\| event\.ctrlKey\) && event\.key === "Enter"/, "platform-modifier Enter submits from multi-line fields");
-  assert.match(entry, /installFormKeyboard\(form, titleField, \(\) => \{ closeForm\(\); render\(\); \}\)/, "Create PR wires shared form keyboard behavior");
-  assert.match(entry, /installFormKeyboard\(form, urlField, \(\) => \{ closeForm\(\); render\(\); \}\)/, "Link PR wires shared form keyboard behavior");
   assert.match(settings, /context\.host\.call\("github\.settings"\)/);
   assert.match(settings, /context\.host\.call\("github\.settings\.update"/);
   assert.match(settings, /When a pull request opens/);

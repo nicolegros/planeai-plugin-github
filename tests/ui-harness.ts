@@ -22,6 +22,6 @@ export function deferred<T>(): Deferred<T> {
 /** Lets pending promise callbacks and timers run. */
 export const settle = () => new Promise((done) => setTimeout(done, 0));
 
-export function press(key: string, target: Element = document.activeElement ?? document.body) {
-  target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+export function press(key: string, target: Element = document.activeElement ?? document.body, modifiers: KeyboardEventInit = {}) {
+  target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...modifiers }));
 }

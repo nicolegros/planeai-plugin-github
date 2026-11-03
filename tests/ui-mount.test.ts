@@ -202,3 +202,43 @@ test("a refresh that changed stored pull requests tells the host once", async ()
   await unchanged.answer("github.status", status());
   assert.equal(unchanged.changes(), 0);
 });
+
+const withoutBranchPullRequest = () => ({ ...status(), pull_requests: [pr(2, "manual")], own_url: url(2), details: [detail(2)] });
+const actionLabels = (root: Element) =>
+  [...root.querySelectorAll(".form-actions button")].map((button) => button.firstChild?.textContent?.trim());
+
+test("Create PR shows beside Link only while the branch has no live pull request", async () => {
+  const withBranch = mountPanel();
+  await withBranch.answer("github.status", status());
+  assert.deepEqual(actionLabels(withBranch.root), ["Link pull request"]);
+  const withoutBranch = mountPanel("s2");
+  await withoutBranch.answer("github.status", withoutBranchPullRequest());
+  assert.deepEqual(actionLabels(withoutBranch.root), ["Create PR", "Link pull request"]);
+});
+
+test("Escape closes the create form for good", async () => {
+  const first = mountPanel();
+  await first.answer("github.status", withoutBranchPullRequest());
+  press("c", document.body);
+  await first.answer("github.defaults", { title: "Title", body: "", base_branch: "main" });
+  const title = first.root.querySelector<HTMLInputElement>("form input");
+  assert.equal(title?.value, "Title");
+  press("Escape", title);
+  assert.equal(first.root.querySelector("form"), null);
+  first.dispose();
+  const second = mountPanel();
+  await second.answer("github.status", withoutBranchPullRequest());
+  assert.equal(second.root.querySelector("form"), null);
+});
+
+test("Cmd or Ctrl+Enter submits a form", async () => {
+  for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
+    const panel = mountPanel(`s-${Object.keys(modifier)[0]}`);
+    await panel.answer("github.status", status());
+    press("l", document.body);
+    const field = panel.root.querySelector<HTMLInputElement>('input[type="url"]');
+    field.value = "https://github.com/o/r/pull/9";
+    press("Enter", field, modifier);
+    assert.deepEqual(panel.pending("github.link").map((call) => call.params.url), ["https://github.com/o/r/pull/9"]);
+  }
+});
