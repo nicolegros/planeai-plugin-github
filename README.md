@@ -82,6 +82,7 @@ With the manifest-granted `settings` capability, the sidecar persists only its `
 The namespace is a strict version-4 JSON document containing `pull_requests` keyed by session ID, a reconciliation ledger, and optional `task_transitions`.
 Each session holds a list of links keyed by `host`, `repository` (`owner/name`), and `number`, each with its `url`, `source` (`branch`, `created`, `manual`, `stack`, or the `stack-dismissed` tombstone), and, except for tombstones, the cached `state`, `title`, `checks`, `head_branch`, `base_branch`, GitHub `updated_at`, and `refreshed_at`.
 Older documents migrate in place: version 1 and 2 gain the transition defaults, and version 3 turns each session's single mapping into a one-element list of `manual` links.
+A legacy mapping whose URL is not a `github.com` pull request becomes an empty list, with a log line on stderr.
 Because the host deletes keys patched to `null`, absent optional fields read as `null`.
 Malformed or unsupported documents are rejected rather than migrated implicitly.
 `github.status`, `github.create`, `github.link`, `github.unlink`, and `github.merge` update links only after their GitHub operation succeeds, and `github.summary` reads the cached links without asking GitHub.

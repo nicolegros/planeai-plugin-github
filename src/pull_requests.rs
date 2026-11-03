@@ -329,29 +329,39 @@ pub fn parse_session_links(value: &Value) -> Result<Vec<PullRequestLink>, String
             Ok(links)
         }
         Value::Object(_) => {
-            let legacy: LegacyMapping = serde_json::from_value(value.clone())
-                .map_err(|error| format!("invalid legacy pull request mapping: {error}"))?;
-            let key = PrKey::from_url(&legacy.url).ok_or_else(|| {
-                format!("legacy pull request url {} is not supported", legacy.url)
-            })?;
-            // The legacy shape did not record why the PR was tracked, so keep it as a removable link.
-            Ok(vec![PullRequestLink::tracked(
-                key,
-                &legacy.url,
-                TrackedSource::Manual,
-                PrSnapshot {
-                    state: legacy.state,
-                    title: None,
-                    checks: legacy.check_summary.map(|summary| summary.state),
-                    head_branch: None,
-                    base_branch: None,
-                    updated_at: None,
-                    refreshed_at: legacy.updated_at,
-                },
-            )])
+            let legacy = parse_legacy_mapping(value)?;
+            let url = value.get("url").and_then(Value::as_str).unwrap_or_default();
+            Ok(vec![legacy.ok_or_else(|| {
+                format!("legacy pull request url {url} is not supported")
+            })?])
         }
         _ => Err("a session's pull requests must be a list".into()),
     }
+}
+
+/// Reads the single mapping a session held before version 4; `None` when its URL is not a
+/// supported pull request, such as one on a GitHub Enterprise host.
+pub fn parse_legacy_mapping(value: &Value) -> Result<Option<PullRequestLink>, String> {
+    let legacy: LegacyMapping = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid legacy pull request mapping: {error}"))?;
+    let Some(key) = PrKey::from_url(&legacy.url) else {
+        return Ok(None);
+    };
+    // The legacy shape did not record why the PR was tracked, so keep it as a removable link.
+    Ok(Some(PullRequestLink::tracked(
+        key,
+        &legacy.url,
+        TrackedSource::Manual,
+        PrSnapshot {
+            state: legacy.state,
+            title: None,
+            checks: legacy.check_summary.map(|summary| summary.state),
+            head_branch: None,
+            base_branch: None,
+            updated_at: None,
+            refreshed_at: legacy.updated_at,
+        },
+    )))
 }
 
 pub fn session_links_value(links: &[PullRequestLink]) -> Value {

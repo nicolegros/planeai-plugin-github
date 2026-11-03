@@ -1,6 +1,6 @@
 //! The versioned `github` settings namespace: its shape, migrations, validation, and reconciliation patches.
 
-use crate::pull_requests::{parse_session_links, session_links_value};
+use crate::pull_requests::{parse_legacy_mapping, parse_session_links, session_links_value};
 use serde_json::{json, Map, Value};
 
 pub const STATE_NAMESPACE: &str = "github";
@@ -240,8 +240,16 @@ fn migrate_v3_durable_state(state: &mut Value) -> Result<(), String> {
         .get_mut("pull_requests")
         .and_then(Value::as_object_mut)
         .ok_or("GitHub durable state pull_requests must be an object")?;
-    for links in pull_requests.values_mut() {
-        *links = session_links_value(&parse_session_links(links)?);
+    for (session_id, links) in pull_requests.iter_mut() {
+        let parsed = if links.is_array() {
+            parse_session_links(links)?
+        } else if let Some(link) = parse_legacy_mapping(links)? {
+            vec![link]
+        } else {
+            eprintln!("github dropped the unsupported legacy pull request of session {session_id}: {links}");
+            Vec::new()
+        };
+        *links = session_links_value(&parsed);
     }
     object.insert("version".to_string(), json!(STATE_VERSION));
     Ok(())
@@ -433,6 +441,24 @@ mod tests {
                 ["error"]
                 .is_null()
         );
+    }
+
+    #[test]
+    fn v3_migration_drops_legacy_mappings_on_unsupported_hosts() {
+        let mapping = |url: &str| json!({ "session_id": "s", "url": url, "state": "open", "remote": null, "branch": null, "updated_at": 1, "check_summary": null });
+        let mut v3 = empty_durable_state();
+        v3["version"] = json!(V3_STATE_VERSION);
+        v3["pull_requests"] = json!({
+            "enterprise": mapping("https://github.example.com/o/r/pull/3"),
+            "kept": mapping("https://github.com/o/r/pull/4"),
+        });
+        let migrated = migrate_durable_state(&v3).unwrap();
+        assert_eq!(
+            migrated["pull_requests"]["enterprise"],
+            json!([]),
+            "an empty list, because the host deep-merges the migration and would keep a removed key"
+        );
+        assert_eq!(migrated["pull_requests"]["kept"][0]["number"], 4);
     }
 
     #[test]
