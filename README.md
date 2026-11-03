@@ -51,7 +51,17 @@ The titlebar shows the same summary, or **Create PR** when the session has none;
 The panel lists every pull request of the task, each with its state, CI, title, repository when it differs from the session's, and source, and with **Unlink** or **Dismiss** and an open-on-GitHub action.
 Below the list, it details the session's own pull request: its checks, merge, ready-for-review, and CI failure hand-off.
 
-When the GitHub session panel has focus, use `R` to refresh, `C` to create a pull request, `L` to link an existing pull request, `O` to open the current pull request in GitHub, `Shift+R` to mark the session's draft ready, and `F` to retrieve failed-check logs and send them to the currently focused agent session. `S` cycles the available merge strategies; activate the focused strategy with `Enter` or `Space`. This deliberate two-step merge interaction avoids merging from a bare shortcut.
+One row is highlighted at a time, starting with the session's own pull request; the details below the list follow it.
+When the GitHub session panel has focus, use these shortcuts:
+
+- `↑`/`↓` or `j`/`k` move the highlight.
+- `O` opens the highlighted pull request on GitHub.
+- `U` unlinks the highlighted pull request, or dismisses it when stack discovery added it.
+- `Shift+R` marks the highlighted draft ready for review.
+- `F` retrieves the highlighted pull request's failed-check logs and sends them to the currently focused agent session.
+- `S` cycles the highlighted pull request's available merge strategies; `Enter` or `Space` merges with the focused one.
+  This deliberate two-step merge interaction avoids merging from a bare shortcut.
+- `R` refreshes, `C` creates a pull request for the session branch, and `L` links an existing pull request.
 
 ## Task transitions
 
