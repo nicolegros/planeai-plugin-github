@@ -1011,6 +1011,22 @@ fn session_task_group(
     }
 }
 
+/// The task group a change is about; without the task's other sessions the change could store a
+/// state whose task transition is then lost, so the change fails before it starts.
+fn changing_task_group(
+    context: &ExecutionContext,
+    session_id: &str,
+) -> Result<TaskGroup, RequestError> {
+    let task = session_task_group(context, session_id)?;
+    if task.resolved {
+        Ok(task)
+    } else {
+        Err(invalid_state(
+            "Could not list the task's sessions; try again.",
+        ))
+    }
+}
+
 fn group_prs(lists: &SessionLinks, group: &[String]) -> Vec<AggregatedPr> {
     aggregate(
         group
@@ -1308,10 +1324,10 @@ fn pull_request_key(params: &Value) -> Result<PrKey, RequestError> {
 
 fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
+    let task = changing_task_group(context, session_id)?;
     let key = pull_request_key(params)?;
     let repository = repository_context(params, context)?;
     let pr = fetch_pull_request(context, &context_path(&repository)?, &key)?;
-    let task = session_task_group(context, session_id)?;
     let update = update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
             refresh_snapshot(links, &pr.key, &pr.snapshot);
@@ -1330,8 +1346,8 @@ fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value
 /// Unlinks a pull request, or dismisses a stack pull request, from every session of the task.
 fn unlink_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
+    let task = changing_task_group(context, session_id)?;
     let key = pull_request_key(params)?;
-    let task = session_task_group(context, session_id)?;
     let update = update_group_links(context, &task, |lists| {
         let mut removed = false;
         for links in lists.values_mut() {
@@ -1350,6 +1366,7 @@ fn unlink_pull_request(params: &Value, context: &ExecutionContext) -> Result<Val
 
 fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
+    let task = changing_task_group(context, session_id)?;
     let repository = repository_context(params, context)?;
     let cwd = context_path(&repository)?;
     let branch = context_string(&repository, "branch")?;
@@ -1390,7 +1407,6 @@ fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Val
         updated_at: None,
         refreshed_at: unix_timestamp_ms(),
     };
-    let task = session_task_group(context, session_id)?;
     update_group_links(context, &task, |lists| {
         record_created(
             lists.entry(session_id.to_string()).or_default(),
@@ -1497,6 +1513,7 @@ fn fetch_target_detail(
 
 fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
+    let task = changing_task_group(context, session_id)?;
     let strategy = params
         .get("strategy")
         .and_then(Value::as_str)
@@ -1527,7 +1544,6 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
         args.push("--delete-branch");
     }
     gh_output(context, cwd, args)?;
-    let task = session_task_group(context, session_id)?;
     update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
             let merged = links
@@ -2593,29 +2609,48 @@ fi
 
     #[cfg(unix)]
     #[test]
-    fn a_task_whose_sessions_cannot_be_listed_never_transitions() {
+    fn actions_fail_before_any_change_when_the_tasks_sessions_cannot_be_listed() {
         let cli = FakeGithubCli::new();
-        let host = merge_transition_host(&cli, json!([]), "topic");
-        {
-            let mut host = host.lock().unwrap();
-            host.settings["github"]["task_transitions"]["on_open"] = json!("in_review");
-            host.sessions = Value::Null;
-        }
-        cli.respond(
-            json!({ "data": { "r0": { "l0": graphql_pr("o/r", 12, "OPEN", "x", "main", "") } } }),
-        );
-        let linked = with_host(&cli.runner, &host, |context| {
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "topic");
+        host.lock().unwrap().sessions = Value::Null;
+        let before = host.lock().unwrap().settings.clone();
+        let failure = |result: Result<Value, RequestError>| match result {
+            Err(RequestError::Message(message)) => message,
+            other => panic!("expected an error, got {other:?}"),
+        };
+        let link = with_host(&cli.runner, &host, |context| {
             link_pull_request(
                 &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/12" }),
                 context,
             )
-        })
-        .unwrap();
-        assert_eq!(numbers(&linked["pull_requests"]), vec![12]);
-        assert!(
-            host.lock().unwrap().transitions.is_empty(),
-            "the session's siblings are unknown, so the task's state is too"
+        });
+        assert_eq!(
+            failure(link),
+            "Could not list the task's sessions; try again."
         );
+        let merge = with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4", "strategy": "squash" }),
+                context,
+            )
+        });
+        assert_eq!(
+            failure(merge),
+            "Could not list the task's sessions; try again."
+        );
+        let unlink = with_host(&cli.runner, &host, |context| {
+            unlink_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/4" }),
+                context,
+            )
+        });
+        assert_eq!(
+            failure(unlink),
+            "Could not list the task's sessions; try again."
+        );
+        assert_eq!(cli.calls(), 0, "nothing happens on GitHub either");
+        assert_eq!(host.lock().unwrap().settings, before);
+        assert!(host.lock().unwrap().transitions.is_empty());
     }
 
     #[cfg(unix)]
