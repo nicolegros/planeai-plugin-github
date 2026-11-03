@@ -81,7 +81,7 @@ test("GitHub UI links existing PRs and configures automatic task transitions", (
   assert.match(entry, /\(event\.metaKey \|\| event\.ctrlKey\) && event\.key === "Enter"/, "platform-modifier Enter submits from multi-line fields");
   assert.match(entry, /installFormKeyboard\(form, titleField, \(\) => \{ creating = false; render\(\); \}\)/, "Create PR wires shared form keyboard behavior");
   assert.match(entry, /installFormKeyboard\(form, urlField, \(\) => \{ linking = false; render\(\); \}\)/, "Link PR wires shared form keyboard behavior");
-  assert.match(entry, /const mergeMethods = pr\.merge_methods\.filter/);
+  assert.match(entry, /const mergeMethods = mergeStrategies\(pr\)/);
   assert.match(entry, /for \(const strategy of mergeMethods\)/);
   assert.doesNotMatch(entry, /for \(const strategy of \["squash", "merge", "rebase"\]\)/);
   assert.match(settings, /context\.host\.call\("github\.settings"\)/);
@@ -101,8 +101,6 @@ test("GitHub session panel lists every pull request with per-row actions", () =>
   assert.match(entry, /const SELECTION_KEYS: Record<string, 1 \| -1> = \{ ArrowDown: 1, j: 1, ArrowUp: -1, k: -1 \}/, "arrows and j/k move the highlight");
   assert.match(entry, /if \(isSelected\) remove\.dataset\.shortcut = "u"/, "U unlinks or dismisses the highlighted row");
   assert.match(entry, /const detail = detailOf\(selected\);/, "the details follow the highlight");
-  assert.match(entry, /const label = pr\.source === "stack" \? "Dismiss" : "Unlink";/, "stack rows dismiss, other rows unlink");
-  assert.match(entry, /if \(pr\.source !== "branch"\)/, "branch rows cannot be unlinked");
   assert.match(entry, /call\("github\.unlink", \{ url: pr\.url \}\)/);
   assert.match(entry, /foreignRepository\(pr, status\(\)\?\.repository\)/, "rows name a repository only when it differs");
   assert.match(entry, /\.pr-repo \{ flex:0 1000 auto; min-width:4ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;/, "the repository name shrinks before the title does");

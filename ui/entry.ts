@@ -8,8 +8,10 @@ import {
   displayOrder,
   foreignRepository,
   isLive,
+  mergeStrategies,
   moveSelection,
   panelHints,
+  removalAction,
   resolveSelection,
   stateTone,
   type GithubStatus,
@@ -312,10 +314,10 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const actions = document.createElement("span"); actions.className = "pr-actions";
       const open = button("↗", () => context.host.navigation.openExternal(pr.url));
       open.setAttribute("aria-label", `Open #${pr.number} on GitHub`); open.title = "Open on GitHub";
-      if (pr.source !== "branch") {
-        const label = pr.source === "stack" ? "Dismiss" : "Unlink";
-        const remove = button(label, () => { void mutate(() => call("github.unlink", { url: pr.url })); });
-        remove.setAttribute("aria-label", `${label} #${pr.number}`);
+      const removal = removalAction(pr);
+      if (removal) {
+        const remove = button(removal.label, () => { void mutate(() => call("github.unlink", { url: pr.url })); });
+        remove.setAttribute("aria-label", `${removal.label} #${pr.number}`);
         // U acts on the highlighted row; the footer hints it, so the row stays uncluttered.
         if (isSelected) remove.dataset.shortcut = "u";
         actions.append(remove);
@@ -440,9 +442,9 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         content.append(section);
       }
 
-      const mergeMethods = pr.merge_methods.filter((method) => ["squash", "merge", "rebase"].includes(method));
+      const mergeMethods = mergeStrategies(pr);
       if (!mergeMethods.includes(selectedStrategy)) selectedStrategy = mergeMethods[0] || "squash";
-      if (pr.state === "open" && mergeMethods.length) {
+      if (mergeMethods.length) {
         const section = document.createElement("section"); section.className = "section";
         const label = document.createElement("div"); label.className = "section-title"; label.textContent = "Merge";
         const strategies = document.createElement("div"); strategies.className = "strategies";
@@ -476,7 +478,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       if (detail) appendDetail(detail);
       appendActions();
       if (error) appendStatus("GitHub could not complete that action.", error);
-      appendFooter(panelHints({ prs, selected, mergeable: content.querySelector("button[data-merge-strategy]") !== null, branch: status()?.branch }));
+      appendFooter(panelHints({ prs, selected, mergeable: mergeStrategies(detail).length > 0, branch: status()?.branch }));
     }
 
     function renderContent(error: string) {

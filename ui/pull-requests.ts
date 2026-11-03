@@ -176,12 +176,27 @@ export function branchHasPullRequest(prs: readonly PullRequest[], branch: string
   return prs.some((pr) => isLive(pr) && (pr.source === "branch" || (pr.source === "created" && !!branch && pr.head_branch === branch)));
 }
 
+/** How a pull request leaves the task; a branch pull request follows the branch and cannot. */
+export function removalAction(pr: PullRequest): { label: string; hint: string } | null {
+  if (pr.source === "branch") return null;
+  return pr.source === "stack" ? { label: "Dismiss", hint: "dismiss" } : { label: "Unlink", hint: "unlink" };
+}
+
+const MERGE_STRATEGIES = ["squash", "merge", "rebase"];
+
+/** The merge strategies the panel offers: the repository's known ones, only while the pull request is open. */
+export function mergeStrategies(detail: PullRequestDetail | null): string[] {
+  if (detail?.state !== "open") return [];
+  return detail.merge_methods.filter((method) => MERGE_STRATEGIES.includes(method));
+}
+
 /** The panel footer's shortcut hints, in display order. */
 export function panelHints({ prs, selected, mergeable, branch }: { prs: readonly PullRequest[]; selected: PullRequest | null; mergeable: boolean; branch: string | null | undefined }): [string, string][] {
   const hints: [string, string][] = [];
   if (prs.length > 1) hints.push(["↑↓", "select"]);
   if (selected) hints.push(["O", "open"]);
-  if (selected && selected.source !== "branch") hints.push(["U", selected.source === "stack" ? "dismiss" : "unlink"]);
+  const removal = selected && removalAction(selected);
+  if (removal) hints.push(["U", removal.hint]);
   if (mergeable) hints.push(["S", "strategy"]);
   hints.push(["R", "refresh"]);
   if (!branchHasPullRequest(prs, branch)) hints.push(["C", "create"]);

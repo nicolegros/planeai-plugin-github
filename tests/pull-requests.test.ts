@@ -5,14 +5,17 @@ import {
   currentPullRequest,
   displayOrder,
   foreignRepository,
+  mergeStrategies,
   moveSelection,
   panelHints,
+  removalAction,
   resolveSelection,
   stackOrder,
   summarize,
   tooltipLines,
   worstCheck,
   type PullRequest,
+  type PullRequestDetail,
 } from "../ui/pull-requests.js";
 
 const pr = (number: number, overrides: Partial<PullRequest> = {}): PullRequest => ({
@@ -139,4 +142,22 @@ test("the footer hints the shortcuts that act on the panel right now", () => {
   assert.deepEqual(keys(panelHints({ prs: [branch, stacked], selected: stacked, mergeable: false, branch: "topic" })), ["↑↓ select", "O open", "U dismiss", "R refresh", "L link"]);
   const linked = pr(3);
   assert.deepEqual(keys(panelHints({ prs: [linked], selected: linked, mergeable: false, branch: "topic" })), ["O open", "U unlink", "R refresh", "C create", "L link"]);
+});
+
+test("a branch pull request cannot be removed, a stack one is dismissed, others are unlinked", () => {
+  assert.equal(removalAction(pr(1, { source: "branch" })), null);
+  assert.deepEqual(removalAction(pr(1, { source: "stack" })), { label: "Dismiss", hint: "dismiss" });
+  assert.deepEqual(removalAction(pr(1, { source: "created" })), { label: "Unlink", hint: "unlink" });
+  assert.deepEqual(removalAction(pr(1, { source: "manual" })), { label: "Unlink", hint: "unlink" });
+});
+
+test("only an open pull request offers its repository's known merge strategies", () => {
+  const detail = (overrides: Partial<PullRequestDetail>): PullRequestDetail => ({
+    url: "https://github.com/o/r/pull/1", number: 1, state: "open", checks: [], conflicting: false, merge_blocked: false, merge_methods: ["squash", "rebase"], ...overrides,
+  });
+  assert.deepEqual(mergeStrategies(detail({})), ["squash", "rebase"]);
+  assert.deepEqual(mergeStrategies(detail({ merge_methods: ["merge", "octopus"] })), ["merge"]);
+  assert.deepEqual(mergeStrategies(detail({ state: "draft" })), []);
+  assert.deepEqual(mergeStrategies(detail({ state: "merged" })), []);
+  assert.deepEqual(mergeStrategies(null), []);
 });
