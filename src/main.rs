@@ -933,24 +933,18 @@ fn lock_pull_requests(context: &ExecutionContext) -> Result<MutexGuard<'_, ()>, 
         .map_err(|_| invalid_state("pull request persistence lock poisoned"))
 }
 
-/// Every session's stored links, unparsed, in one host call.
-/// A namespace that is not migrated yet reads as its migration would write it.
+/// Every session's stored links, unparsed, in one host call; callers ensure the namespace first.
 fn read_stored_links(context: &ExecutionContext) -> Result<Map<String, Value>, RequestError> {
     let response = host_call(
         context,
         "github-settings-pr-links",
         "host.settings.get",
-        json!({ "path": [STATE_NAMESPACE] }),
+        json!({ "path": [STATE_NAMESPACE, "pull_requests"] }),
     )?;
-    let mut state = match settings_value_from_host_response(&response)? {
-        Value::Null => return Ok(Map::new()),
-        state if state.get("version").and_then(Value::as_u64) == Some(STATE_VERSION) => state,
-        state => migrate_durable_state(&state)?,
-    };
-    match state.get_mut("pull_requests").map(Value::take) {
-        None | Some(Value::Null) => Ok(Map::new()),
-        Some(Value::Object(stored)) => Ok(stored),
-        Some(_) => Err(invalid_state(
+    match settings_value_from_host_response(&response)? {
+        Value::Null => Ok(Map::new()),
+        Value::Object(stored) => Ok(stored),
+        _ => Err(invalid_state(
             "GitHub durable state pull_requests must be an object",
         )),
     }
@@ -970,6 +964,7 @@ fn read_group_links(
     context: &ExecutionContext,
     group: &[String],
 ) -> Result<SessionLinks, RequestError> {
+    ensure_durable_state(context, false)?;
     Ok(group_links(&read_stored_links(context)?, group)?)
 }
 
@@ -1676,6 +1671,7 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<boo
             }
         }
     }
+    ensure_durable_state(context, false)?;
     let stored = read_stored_links(context)?;
     let mut lists = SessionLinks::new();
     groups.retain(|group| match group_links(&stored, group) {
@@ -1984,16 +1980,21 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
-        let callback = receive_frame(&output_rx);
-        let callback_id = callback["id"].as_str().unwrap();
-        assert_eq!(callback["method"], "host.settings.get");
-        assert_eq!(callback["params"], json!({ "path": ["github"] }));
-        input_tx
-            .send(
-                json!({ "jsonrpc": "2.0", "id": callback_id, "result": { "settings": null } })
-                    .to_string(),
-            )
-            .unwrap();
+        for (path, settings) in [
+            (json!(["github", "version"]), json!(STATE_VERSION)),
+            (json!(["github", "pull_requests"]), Value::Null),
+        ] {
+            let callback = receive_frame(&output_rx);
+            let callback_id = callback["id"].as_str().unwrap();
+            assert_eq!(callback["method"], "host.settings.get");
+            assert_eq!(callback["params"], json!({ "path": path }));
+            input_tx
+                .send(
+                    json!({ "jsonrpc": "2.0", "id": callback_id, "result": { "settings": settings } })
+                        .to_string(),
+                )
+                .unwrap();
+        }
         wait_for_file(&marker);
         input_tx
             .send(json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": "request-1" } }).to_string())
@@ -2727,8 +2728,8 @@ fi
         .unwrap();
         assert_eq!(
             count("host.settings.get"),
-            1,
-            "the summary reads every link at once"
+            2,
+            "the version, then every link at once"
         );
 
         with_host(&cli.runner, &host, |context| {
