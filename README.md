@@ -29,7 +29,7 @@ The plugin tracks four kinds of links for each session:
 Stack discovery follows base and head branches as one linear chain: from each of the task's own open pull requests, it walks up to the pull request whose head is its base, and down to the pull request based on its head.
 A discovered parent only keeps walking up and a discovered child only keeps walking down, so a parent's other children never join.
 The chain ends at the repository's default branch, so a long-lived `main -> production` pull request never joins, and at a branch that several open pull requests share, since that is no chain.
-Discovery is bounded to eight stack links per task, and dismissed ones count toward that bound.
+Discovery is bounded to eight stack links per task, and dismissed stack links count toward that bound; unlinked created or manual links do not.
 Sessions linked to the same task in the same project share their pull requests, so every session of a task shows the union of their links.
 **Unlink** and **Dismiss** remove a link from every session of the task and leave a tombstone, so stack discovery never adds it back; linking it again revives it.
 Branch links follow the branch and cannot be unlinked.
@@ -94,7 +94,7 @@ The sidecar speaks newline-delimited JSON-RPC on stdin/stdout. Stdout is protoco
 
 With the manifest-granted `settings` capability, the sidecar persists only its `github` namespace through `host.settings.get` and `host.settings.patch`; host deep-merge semantics preserve unrelated plugin settings.
 The namespace is a strict version-4 JSON document containing `pull_requests` keyed by session ID, a reconciliation ledger, and optional `task_transitions`.
-Each session holds a list of links keyed by `host`, `repository` (`owner/name`), and `number`, each with its `url`, `source` (`branch`, `created`, `manual`, `stack`, or the `stack-dismissed` tombstone), and, except for tombstones, the cached `state`, `title`, `checks`, `head_branch`, `base_branch`, GitHub `updated_at`, and `refreshed_at`.
+Each session holds a list of links keyed by `host`, `repository` (`owner/name`), and `number`, each with its `url`, `source` (`branch`, `created`, `manual`, `stack`, or a tombstone: `stack-dismissed` for a dismissed stack link, `unlinked` for an unlinked created or manual one), and, except for tombstones, the cached `state`, `title`, `checks`, `head_branch`, `base_branch`, GitHub `updated_at`, and `refreshed_at`.
 Older documents migrate in place: version 1 and 2 gain the transition defaults, and version 3 turns each session's single mapping into a one-element list of `manual` links.
 A legacy mapping whose URL is not a `github.com` pull request becomes an empty list, with a log line on stderr.
 Because the host deletes keys patched to `null`, absent optional fields read as `null`.

@@ -132,7 +132,10 @@ pub enum LinkStatus {
         snapshot: PrSnapshot,
     },
     /// The user removed it; stack discovery must not add it back.
-    Dismissed,
+    Dismissed {
+        /// Stack discovery had added it, so it still counts toward the task's stack bound.
+        stack: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,14 +157,14 @@ impl PullRequestLink {
     pub fn snapshot(&self) -> Option<&PrSnapshot> {
         match &self.status {
             LinkStatus::Tracked { snapshot, .. } => Some(snapshot),
-            LinkStatus::Dismissed => None,
+            LinkStatus::Dismissed { .. } => None,
         }
     }
 
     pub fn source(&self) -> Option<TrackedSource> {
         match &self.status {
             LinkStatus::Tracked { source, .. } => Some(*source),
-            LinkStatus::Dismissed => None,
+            LinkStatus::Dismissed { .. } => None,
         }
     }
 }
@@ -174,6 +177,8 @@ enum SourceRecord {
     Manual,
     Stack,
     StackDismissed,
+    /// A dismissed link that stack discovery had not added.
+    Unlinked,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -213,7 +218,7 @@ impl TryFrom<LinkRecord> for PullRequestLink {
             SourceRecord::Created => TrackedSource::Created,
             SourceRecord::Manual => TrackedSource::Manual,
             SourceRecord::Stack => TrackedSource::Stack,
-            SourceRecord::StackDismissed => {
+            SourceRecord::StackDismissed | SourceRecord::Unlinked => {
                 let has_snapshot = record.state.is_some()
                     || record.title.is_some()
                     || record.checks.is_some()
@@ -227,7 +232,9 @@ impl TryFrom<LinkRecord> for PullRequestLink {
                 return Ok(Self {
                     key,
                     url: record.url,
-                    status: LinkStatus::Dismissed,
+                    status: LinkStatus::Dismissed {
+                        stack: record.source == SourceRecord::StackDismissed,
+                    },
                 });
             }
         };
@@ -259,7 +266,10 @@ impl From<&PullRequestLink> for LinkRecord {
             repository: link.key.repository.clone(),
             number: link.key.number,
             url: link.url.clone(),
-            source: SourceRecord::StackDismissed,
+            source: match link.status {
+                LinkStatus::Dismissed { stack: false } => SourceRecord::Unlinked,
+                _ => SourceRecord::StackDismissed,
+            },
             state: None,
             title: None,
             checks: None,
@@ -461,7 +471,7 @@ pub fn refresh_snapshot(links: &mut [PullRequestLink], key: &PrKey, snapshot: &P
             *stored = snapshot.clone();
             true
         }
-        LinkStatus::Dismissed => false,
+        LinkStatus::Dismissed { .. } => false,
     }
 }
 
@@ -471,8 +481,10 @@ pub fn dismiss(links: &mut [PullRequestLink], key: &PrKey) -> bool {
         return false;
     };
     match links[index].source() {
-        Some(TrackedSource::Created | TrackedSource::Manual | TrackedSource::Stack) => {
-            links[index].status = LinkStatus::Dismissed;
+        Some(source @ (TrackedSource::Created | TrackedSource::Manual | TrackedSource::Stack)) => {
+            links[index].status = LinkStatus::Dismissed {
+                stack: source == TrackedSource::Stack,
+            };
             true
         }
         _ => false,
@@ -691,7 +703,7 @@ mod tests {
         PullRequestLink {
             key: key(number),
             url: format!("https://github.com/o/r/pull/{number}"),
-            status: LinkStatus::Dismissed,
+            status: LinkStatus::Dismissed { stack: true },
         }
     }
 
@@ -716,7 +728,11 @@ mod tests {
             snapshot.base_branch = Some("a".into());
             snapshot.updated_at = Some("2026-10-01T00:00:00Z".into());
         }
-        let links = vec![tracked, tombstone(8)];
+        let unlinked = PullRequestLink {
+            status: LinkStatus::Dismissed { stack: false },
+            ..tombstone(9)
+        };
+        let links = vec![tracked, tombstone(8), unlinked];
         let value = session_links_value(&links);
         assert_eq!(value[0]["source"], "stack");
         assert_eq!(value[0]["checks"], "failing");
@@ -724,6 +740,7 @@ mod tests {
             value[1],
             json!({ "host": "github.com", "repository": "o/r", "number": 8, "url": "https://github.com/o/r/pull/8", "source": "stack-dismissed" })
         );
+        assert_eq!(value[2]["source"], "unlinked");
         assert_eq!(parse_session_links(&value).unwrap(), links);
     }
 
@@ -853,7 +870,13 @@ mod tests {
         assert_eq!(links[0].source(), Some(TrackedSource::Branch));
         assert!(links[1..]
             .iter()
-            .all(|link| link.status == LinkStatus::Dismissed));
+            .all(|link| matches!(link.status, LinkStatus::Dismissed { .. })));
+        assert_eq!(
+            links[3].status,
+            LinkStatus::Dismissed { stack: true },
+            "only a stack link leaves a stack tombstone"
+        );
+        assert_eq!(links[2].status, LinkStatus::Dismissed { stack: false });
     }
 
     fn updated(mut link: PullRequestLink, updated_at: &str) -> PullRequestLink {
@@ -919,7 +942,7 @@ mod tests {
         assert!(refresh_snapshot(&mut links, &key(1), &fresh));
         assert!(!refresh_snapshot(&mut links, &key(2), &fresh));
         assert_eq!(links[0].snapshot(), Some(&fresh));
-        assert_eq!(links[1].status, LinkStatus::Dismissed);
+        assert_eq!(links[1].status, LinkStatus::Dismissed { stack: true });
     }
 
     #[test]

@@ -1933,10 +1933,7 @@ mod tests {
         let callback = receive_frame(&output_rx);
         let callback_id = callback["id"].as_str().unwrap();
         assert_eq!(callback["method"], "host.settings.get");
-        assert_eq!(
-            callback["params"],
-            json!({ "path": ["github"] })
-        );
+        assert_eq!(callback["params"], json!({ "path": ["github"] }));
         input_tx
             .send(
                 json!({ "jsonrpc": "2.0", "id": callback_id, "result": { "settings": null } })
@@ -2444,7 +2441,7 @@ fi
             "a dismissed PR cannot be dismissed again"
         );
         let stored = host.lock().unwrap().settings["github"]["pull_requests"].clone();
-        assert_eq!(stored["s1"][1]["source"], "stack-dismissed");
+        assert_eq!(stored["s1"][1]["source"], "unlinked");
         assert_eq!(
             stored["s2"][0],
             json!({ "host": "github.com", "repository": "o/r", "number": 9, "url": "https://github.com/o/r/pull/9", "source": "stack-dismissed" })

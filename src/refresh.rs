@@ -54,12 +54,20 @@ fn group_lists<'a>(lists: &'a SessionLinks, group: &[String]) -> Vec<&'a [PullRe
         .collect()
 }
 
-/// Stack links and tombstones both count, so dismissing a stack pull request never makes room for another.
+/// Stack links and their tombstones both count, so dismissing a stack pull request never makes room for another.
 fn stack_count(lists: &SessionLinks, group: &[String]) -> usize {
     group_lists(lists, group)
         .into_iter()
         .flatten()
-        .filter(|link| matches!(link.source(), Some(TrackedSource::Stack) | None))
+        .filter(|link| {
+            matches!(
+                link.status,
+                LinkStatus::Tracked {
+                    source: TrackedSource::Stack,
+                    ..
+                } | LinkStatus::Dismissed { stack: true }
+            )
+        })
         .count()
 }
 
@@ -573,7 +581,7 @@ mod tests {
         let tombstone = PullRequestLink {
             key: key(1),
             url: "https://github.com/o/r/pull/1".into(),
-            status: LinkStatus::Dismissed,
+            status: LinkStatus::Dismissed { stack: true },
         };
         let lists = SessionLinks::from([
             (
@@ -681,6 +689,20 @@ mod tests {
     }
 
     #[test]
+    fn unlinked_pull_requests_leave_the_bound_to_the_stack() {
+        let github = github(chain(20));
+        let mut links = vec![tracked(&github.prs[0], TrackedSource::Branch)];
+        let unlinked: Vec<serde_json::Value> = (100..100 + MAX_STACK_LINKS as u64)
+            .map(|number| serde_json::json!({ "host": "github.com", "repository": "o/r", "number": number, "url": format!("https://github.com/o/r/pull/{number}"), "source": "unlinked" }))
+            .collect();
+        links.extend(
+            crate::pull_requests::parse_session_links(&serde_json::Value::Array(unlinked)).unwrap(),
+        );
+        let fresh = refresh_one(&github, links, 20);
+        assert_eq!(fresh["s1"].len(), 1 + 2 * MAX_STACK_LINKS);
+    }
+
+    #[test]
     fn dismissed_stack_pull_requests_count_toward_the_bound() {
         let github = github(chain(20));
         let mut links = vec![tracked(&github.prs[0], TrackedSource::Branch)];
@@ -688,7 +710,7 @@ mod tests {
             (100..100 + MAX_STACK_LINKS as u64).map(|number| PullRequestLink {
                 key: key(number),
                 url: format!("https://github.com/o/r/pull/{number}"),
-                status: LinkStatus::Dismissed,
+                status: LinkStatus::Dismissed { stack: true },
             }),
         );
         let fresh = refresh_one(&github, links.clone(), 20);
