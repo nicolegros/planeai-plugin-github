@@ -291,7 +291,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const row = document.createElement("div");
       row.className = "pr-row";
       row.id = `pull-request-${pr.number}-${pr.repository.replace(/[^a-z0-9]/gi, "-")}`;
-      row.setAttribute("role", "option");
+      row.setAttribute("role", "row");
       const isSelected = selected?.url === pr.url;
       row.setAttribute("aria-selected", String(isSelected));
       row.dataset.tone = stateTone(pr.state);
@@ -301,7 +301,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         select(pr.url);
       });
       const dot = document.createElement("span"); dot.className = "pr-dot"; dot.dataset.state = pr.state;
-      dot.setAttribute("role", "img"); dot.setAttribute("aria-label", STATE_LABELS[pr.state] ?? pr.state);
+      dot.setAttribute("aria-label", STATE_LABELS[pr.state] ?? pr.state);
       const number = document.createElement("span"); number.className = "pr-number"; number.textContent = `#${pr.number}`;
       const text = document.createElement("span"); text.className = "pr-text";
       const title = document.createElement("span"); title.className = "pr-title"; title.textContent = pr.title || pr.url; title.title = pr.title || pr.url;
@@ -313,7 +313,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       if (ciTone) {
         ci.dataset.tone = ciTone;
         ci.textContent = pr.checks === "passing" ? "✓" : pr.checks === "failing" ? "✗" : "●";
-        ci.setAttribute("role", "img"); ci.setAttribute("aria-label", CHECK_LABELS[pr.checks]);
+        ci.setAttribute("aria-label", CHECK_LABELS[pr.checks]);
       }
       const source = document.createElement("span"); source.className = "pr-source"; source.textContent = SOURCE_LABELS[pr.source] ?? pr.source;
       const actions = document.createElement("span"); actions.className = "pr-actions";
@@ -328,6 +328,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         actions.append(remove);
       }
       actions.append(open);
+      for (const cell of [dot, number, text, ci, source, actions]) cell.setAttribute("role", "gridcell");
       row.append(dot, number, text, ci, source, actions);
       return row;
     }
@@ -342,7 +343,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       section.append(heading);
       if (prs.length) {
         const list = document.createElement("div"); list.className = "pr-list";
-        list.setAttribute("role", "listbox"); list.setAttribute("aria-label", "Pull requests"); list.tabIndex = 0;
+        list.setAttribute("role", "grid"); list.setAttribute("aria-label", "Pull requests"); list.tabIndex = 0;
         for (const pr of displayOrder(prs)) list.append(pullRequestRow(pr, current, selected));
         const active = list.querySelector('[aria-selected="true"]');
         if (active) list.setAttribute("aria-activedescendant", active.id);
@@ -485,8 +486,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       appendFooter(panelHints({ prs, selected, mergeable: content.querySelector("button[data-merge-strategy]") !== null, branch: status()?.branch }));
     }
 
-    function render(error = "") {
-      content.replaceChildren();
+    function renderContent(error: string) {
       if (!sourceSessionId) { renderSetup("Select a PlaneAI session before opening this panel."); return; }
       if (!snapshot) { appendHeader(null); appendStatus("Refreshing GitHub status…", error); return; }
       if (!snapshot.applicable) { renderSetup(("reason" in snapshot && snapshot.reason) || "GitHub is not applicable to this session."); return; }
@@ -495,12 +495,18 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       renderPullRequests(error);
     }
 
+    function render(error = "") {
+      // Rendering replaces the list, so keyboard focus inside it moves to the new one.
+      const listFocused = document.activeElement?.closest?.(".pr-list") != null;
+      content.replaceChildren();
+      renderContent(error);
+      if (listFocused) content.querySelector<HTMLElement>(".pr-list")?.focus();
+    }
+
     function select(url: string | null) {
       if (!url || url === selectedUrl) return;
-      const listFocused = document.activeElement?.closest?.(".pr-list") != null;
       selectedUrl = url;
       render();
-      if (listFocused) content.querySelector<HTMLElement>(".pr-list")?.focus();
     }
 
     const SELECTION_KEYS: Record<string, 1 | -1> = { ArrowDown: 1, j: 1, ArrowUp: -1, k: -1 };

@@ -92,8 +92,12 @@ test("GitHub UI links existing PRs and configures automatic task transitions", (
 
 test("GitHub session panel lists every pull request with per-row actions", () => {
   assert.match(entry, /for \(const pr of displayOrder\(prs\)\) list\.append\(pullRequestRow\(pr, current, selected\)\)/);
-  assert.match(entry, /list\.setAttribute\("role", "listbox"\)/, "the rows are one listbox");
+  assert.match(entry, /list\.setAttribute\("role", "grid"\)/, "the rows are one grid, since they hold buttons");
+  assert.match(entry, /row\.setAttribute\("role", "row"\)/);
+  assert.match(entry, /cell\.setAttribute\("role", "gridcell"\)/);
+  assert.doesNotMatch(entry, /"listbox"|"option"/, "options cannot hold buttons");
   assert.match(entry, /row\.setAttribute\("aria-selected", String\(isSelected\)\)/);
+  assert.match(entry, /if \(listFocused\) content\.querySelector<HTMLElement>\("\.pr-list"\)\?\.focus\(\)/, "every render keeps focus in the list");
   assert.match(entry, /const SELECTION_KEYS: Record<string, 1 \| -1> = \{ ArrowDown: 1, j: 1, ArrowUp: -1, k: -1 \}/, "arrows and j/k move the highlight");
   assert.match(entry, /if \(isSelected\) remove\.dataset\.shortcut = "u"/, "U unlinks or dismisses the highlighted row");
   assert.match(entry, /const detail = detailOf\(selected\);/, "the details follow the highlight");
