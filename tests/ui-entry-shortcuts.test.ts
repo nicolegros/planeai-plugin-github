@@ -80,9 +80,6 @@ test("GitHub UI links existing PRs and configures automatic task transitions", (
   assert.match(entry, /\(event\.metaKey \|\| event\.ctrlKey\) && event\.key === "Enter"/, "platform-modifier Enter submits from multi-line fields");
   assert.match(entry, /installFormKeyboard\(form, titleField, \(\) => \{ creating = false; render\(\); \}\)/, "Create PR wires shared form keyboard behavior");
   assert.match(entry, /installFormKeyboard\(form, urlField, \(\) => \{ linking = false; render\(\); \}\)/, "Link PR wires shared form keyboard behavior");
-  assert.match(entry, /const mergeMethods = mergeStrategies\(pr\)/);
-  assert.match(entry, /for \(const strategy of mergeMethods\)/);
-  assert.doesNotMatch(entry, /for \(const strategy of \["squash", "merge", "rebase"\]\)/);
   assert.match(settings, /context\.host\.call\("github\.settings"\)/);
   assert.match(settings, /context\.host\.call\("github\.settings\.update"/);
   assert.match(settings, /When a pull request opens/);
@@ -100,6 +97,4 @@ test("GitHub session panel lists every pull request with per-row actions", () =>
   assert.match(entry, /SOURCE_LABELS\[pr\.source\]/);
   assert.match(entry, /button\("↗", \(\) => context\.host\.navigation\.openExternal\(pr\.url\)\)/);
   assert.match(entry, /grid-template-columns:8px 42px minmax\(0, 1fr\) 12px 52px 92px/, "fixed columns keep numbers, titles, and actions aligned across rows");
-  assert.match(entry, /if \(next\.applicable && next\.changed\) void dataChanged\(\)/, "a refresh that changed stored PRs refreshes the sidebar pills");
-  assert.match(entry, /appendFooter\(panelHints\(\{ prs, selected,/, "the footer hints come from panelHints");
 });

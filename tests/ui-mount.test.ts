@@ -17,9 +17,11 @@ const status = (title = "Change") => ({
   own_url: url(1), details: [detail(1), detail(2)], changed: false,
 });
 
+type HostCall = { method: string; params: Record<string, unknown>; reply: Deferred<unknown>; answered: boolean };
+
 /** Mounts the panel with a host whose every call waits until the test answers it. */
 function mountPanel(sessionId = "s1") {
-  const calls: { method: string; params: Record<string, unknown>; reply: Deferred<unknown> }[] = [];
+  const calls: HostCall[] = [];
   let changed = 0;
   const root = document.createElement("div");
   document.body.append(root);
@@ -28,7 +30,7 @@ function mountPanel(sessionId = "s1") {
     host: {
       call: (method, params) => {
         const reply = deferred<unknown>();
-        calls.push({ method, params, reply });
+        calls.push({ method, params, reply, answered: false });
         return reply.promise;
       },
       navigation: { openExternal: () => {} },
@@ -41,7 +43,7 @@ function mountPanel(sessionId = "s1") {
     root, dispose, calls, pending,
     changes: () => changed,
     async answer(method: string, value: unknown) {
-      const call = pending(method).find((candidate) => !(candidate as { answered?: boolean }).answered) as { reply: Deferred<unknown>; answered?: boolean };
+      const call = pending(method).find((candidate) => !candidate.answered);
       call.answered = true;
       call.reply.resolve(value);
       await settle();
@@ -144,4 +146,36 @@ test("the titlebar reloads its summary when the plugin's data changes", async ()
   listeners.forEach((listener) => listener());
   await settle();
   assert.equal(root.querySelector("button").dataset.state, "pull-requests");
+});
+
+test("the merge section offers the repository's strategies only for an open pull request", async () => {
+  const panel = mountPanel();
+  const draft = status();
+  draft.details[1] = { ...draft.details[1], state: "draft" };
+  draft.pull_requests[1] = { ...draft.pull_requests[1], state: "draft" };
+  await panel.answer("github.status", draft);
+  const strategies = () => [...panel.root.querySelectorAll("button[data-merge-strategy]")].map((button) => button.textContent);
+  assert.deepEqual(strategies(), ["squash", "merge"]);
+  list(panel.root).focus();
+  press("j");
+  assert.deepEqual(strategies(), [], "a draft cannot be merged");
+});
+
+test("the footer hints the shortcuts for the highlighted pull request", async () => {
+  const panel = mountPanel();
+  await panel.answer("github.status", status());
+  const hints = () => [...panel.root.querySelectorAll(".footer .hints span")].map((hint) => hint.textContent);
+  assert.deepEqual(hints(), ["↑↓ select", "O open", "S strategy", "R refresh", "L link"]);
+  list(panel.root).focus();
+  press("j");
+  assert.deepEqual(hints(), ["↑↓ select", "O open", "U unlink", "S strategy", "R refresh", "L link"]);
+});
+
+test("a refresh that changed stored pull requests tells the host once", async () => {
+  const panel = mountPanel();
+  await panel.answer("github.status", { ...status(), changed: true });
+  assert.equal(panel.changes(), 1);
+  const unchanged = mountPanel("s2");
+  await unchanged.answer("github.status", status());
+  assert.equal(unchanged.changes(), 0);
 });
