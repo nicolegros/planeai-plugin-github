@@ -1508,11 +1508,12 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
             "{strategy} merge is disabled for this GitHub repository"
         )));
     }
-    gh_output(
-        context,
-        cwd,
-        ["pr", "merge", &url, strategy_flag, "--delete-branch"],
-    )?;
+    let mut args = vec!["pr", "merge", &url, strategy_flag];
+    // The session's checkout only knows its own repository's branches.
+    if key.repository == session.repository {
+        args.push("--delete-branch");
+    }
+    gh_output(context, cwd, args)?;
     let task = session_task_group(context, session_id)?;
     update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
@@ -2871,6 +2872,29 @@ fi
             args,
             "pr\nready\nhttps://github.com/o/r/pull/4\npr\nready\nhttps://github.com/o/r/pull/9\n",
             "the session's own pull request, not its branch, when no url is given"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merging_another_repositorys_pull_request_keeps_its_branch() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([]), "topic");
+        cli.respond(json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("x/y", 7, "OPEN", "feature", "main", ""),
+        } } }));
+        with_host(&cli.runner, &host, |context| {
+            merge_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/x/y/pull/7", "strategy": "squash" }),
+                context,
+            )
+        })
+        .unwrap();
+        let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
+        assert!(
+            args.ends_with("pr\nmerge\nhttps://github.com/x/y/pull/7\n--squash\n"),
+            "{args}"
         );
     }
 
