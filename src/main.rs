@@ -2285,7 +2285,9 @@ fi
     #[cfg(unix)]
     const INVOCATION_END: &str = "--end-of-invocation--";
 
-    /// Fake `git` and `gh`: the remote follows the working tree, and `gh` serves `gh-response` once, then empty data.
+    /// Fake `git` and `gh`: the remote follows the working tree. `gh api` serves the queued
+    /// `gh-response-*` answers in order, then empty data; `gh pr create` prints `gh-pr-create`;
+    /// every call's arguments go to `gh-args`, each call ending with `INVOCATION_END`.
     #[cfg(unix)]
     struct FakeGithubCli {
         directory: TestDirectory,
