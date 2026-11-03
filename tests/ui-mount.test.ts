@@ -20,7 +20,7 @@ const status = (title = "Change") => ({
 type HostCall = { method: string; params: Record<string, unknown>; reply: Deferred<unknown>; answered: boolean };
 
 /** Mounts the panel with a host whose every call waits until the test answers it. */
-function mountPanel(sessionId = "s1", { listens = true, changedFails = false } = {}) {
+function mountPanel(sessionId = "s1", { listens = true, echoes = true, changedFails = false } = {}) {
   const calls: HostCall[] = [];
   let changed = 0;
   const listeners = new Set<() => void>();
@@ -35,13 +35,13 @@ function mountPanel(sessionId = "s1", { listens = true, changedFails = false } =
         return reply.promise;
       },
       navigation: { openExternal: () => {} },
-      recipient: { getFocusedAgentSession: async () => null },
+      recipient: { getFocusedAgentSession: async () => ({ id: "agent" }) },
       // Like the host, data.changed notifies every view of the plugin, this one included.
       data: {
         changed: async () => {
           changed += 1;
           if (changedFails) throw new Error("the host could not refresh plugin views");
-          listeners.forEach((listener) => listener());
+          if (echoes) listeners.forEach((listener) => listener());
         },
         ...(listens ? { onChanged: (listener: () => void) => { listeners.add(listener); return () => listeners.delete(listener); } } : {}),
         notify: () => {},
@@ -91,18 +91,51 @@ test("only the latest status refresh renders, whatever order the answers come in
   assert.match(panel.root.querySelector(".pr-title").textContent, /^Third/);
 });
 
-test("a change tells the host once and reloads the panel once, through the host's echo", async () => {
+test("a change tells the host once and reloads the panel itself, whatever the echo does", async () => {
   const panel = mountPanel();
   await panel.answer("github.status", status());
   panel.root.querySelector<HTMLButtonElement>('button[aria-label="Unlink #2"]').click();
   await panel.answer("github.unlink", { pull_requests: [] });
   assert.equal(panel.changes(), 1);
-  assert.equal(panel.pending("github.status").length, 2);
-  await panel.answer("github.status", status());
+  const [, echoed, own] = panel.pending("github.status");
+  own.reply.resolve(status("Fresh"));
+  await settle();
+  assert.match(panel.root.querySelector(".pr-title").textContent, /^Fresh/);
+  assert.equal(panel.root.querySelector<HTMLButtonElement>("button.refresh").disabled, false);
+  echoed.reply.resolve(status("Echo"));
+  await settle();
+  assert.match(panel.root.querySelector(".pr-title").textContent, /^Fresh/, "the older echo answer is dropped");
   panel.dataChangedElsewhere();
-  assert.equal(panel.pending("github.status").length, 3, "a change elsewhere right after still reloads");
+  assert.equal(panel.pending("github.status").length, 4, "a change elsewhere right after still reloads");
 });
 
+test("a host whose echo never arrives still sees the panel return to idle with the fresh list", async () => {
+  const panel = mountPanel("s1", { echoes: false });
+  await panel.answer("github.status", status());
+  panel.root.querySelector<HTMLButtonElement>('button[aria-label="Unlink #2"]').click();
+  await panel.answer("github.unlink", { pull_requests: [] });
+  assert.equal(panel.pending("github.status").length, 2);
+  await panel.answer("github.status", status("Fresh"));
+  assert.match(panel.root.querySelector(".pr-title").textContent, /^Fresh/);
+  assert.equal(panel.root.querySelector<HTMLButtonElement>("button.refresh").disabled, false);
+});
+
+test("an older status answer landing after a change neither ends the wait nor shows the old list", async () => {
+  const panel = mountPanel("s1", { echoes: false });
+  await panel.answer("github.status", status());
+  panel.root.querySelector<HTMLButtonElement>("button.refresh").click();
+  panel.root.querySelector<HTMLButtonElement>('button[aria-label="Unlink #2"]').click();
+  await panel.answer("github.unlink", { pull_requests: [] });
+  const [, older, own] = panel.pending("github.status");
+  older.reply.resolve(status("Old"));
+  await settle();
+  assert.doesNotMatch(panel.root.querySelector(".pr-title").textContent, /^Old/);
+  assert.equal(panel.root.querySelector<HTMLButtonElement>("button.refresh").disabled, true, "still waiting for its own reload");
+  own.reply.resolve(status("Fresh"));
+  await settle();
+  assert.match(panel.root.querySelector(".pr-title").textContent, /^Fresh/);
+  assert.equal(panel.root.querySelector<HTMLButtonElement>("button.refresh").disabled, false);
+});
 test("without data change notifications, a change reloads the panel itself", async () => {
   const panel = mountPanel("s1", { listens: false });
   await panel.answer("github.status", status());
@@ -274,13 +307,13 @@ test("a refresh that fails while a form is open shows its error once the list is
 });
 
 test("after a change, the panel stays inert until its reload lands", async () => {
-  const panel = mountPanel();
+  const panel = mountPanel("s1", { echoes: false });
   await panel.answer("github.status", withoutBranchPullRequest());
   press("c", document.body);
   await panel.answer("github.defaults", { title: "Title", body: "", base_branch: "main" });
   [...panel.root.querySelectorAll<HTMLButtonElement>("form button")].find((button) => button.textContent.startsWith("Create")).click();
   await panel.answer("github.create", { url: url(7) });
-  assert.equal(panel.pending("github.status").length, 2, "the host's echo started the reload");
+  assert.equal(panel.pending("github.status").length, 2, "the panel reloads itself");
   assert.match(panel.root.textContent, /Refreshing GitHub status/);
   assert.deepEqual([...panel.root.querySelectorAll("button")].filter((button) => !button.disabled).map((button) => button.textContent), [], "no action can start on the stale list");
   press("l", document.body);
@@ -288,17 +321,34 @@ test("after a change, the panel stays inert until its reload lands", async () =>
   assert.equal(panel.root.querySelector("form"), null, "shortcuts do nothing meanwhile");
   assert.equal(panel.pending("github.defaults").length, 1);
   await panel.answer("github.status", status());
-  assert.ok(panel.root.querySelector<HTMLButtonElement>("button.refresh").disabled === false);
+  assert.equal(panel.root.querySelector<HTMLButtonElement>("button.refresh").disabled, false);
   assert.doesNotMatch(panel.root.textContent, /Refreshing GitHub status/);
 });
 
-test("when the host cannot take the change notice, the panel reloads itself", async () => {
+test("sending CI failures holds the panel the same way, without reloading it", async () => {
+  const panel = mountPanel();
+  const failing = status();
+  failing.details[0] = { ...failing.details[0], checks: [{ name: "test", workflowName: "CI", result: "fail" }] } as never;
+  await panel.answer("github.status", failing);
+  panel.root.querySelector<HTMLButtonElement>('button[data-shortcut="f"]').click();
+  await settle();
+  assert.deepEqual(
+    panel.pending("github.sendFailureLogs").map((call) => call.params),
+    [{ session_id: "s1", recipient_session_id: "agent", url: url(1) }],
+    "the highlighted pull request's failures go to the focused agent"
+  );
+  assert.deepEqual([...panel.root.querySelectorAll("button")].filter((button) => !button.disabled).map((button) => button.textContent), []);
+  await panel.answer("github.sendFailureLogs", { sent: true });
+  assert.equal(panel.root.querySelector<HTMLButtonElement>("button.refresh").disabled, false);
+  assert.equal(panel.pending("github.status").length, 1);
+  assert.equal(panel.changes(), 0);
+});
+test("a host that rejects the change notice does not stop the panel", async () => {
   const panel = mountPanel("s1", { changedFails: true });
   await panel.answer("github.status", status());
   panel.root.querySelector<HTMLButtonElement>('button[aria-label="Unlink #2"]').click();
   await panel.answer("github.unlink", { pull_requests: [] });
-  assert.equal(panel.pending("github.status").length, 2);
-  await panel.answer("github.status", { ...status(), changed: true });
-  assert.equal(panel.pending("github.status").length, 3, "a changed refresh falls back the same way");
-  await panel.answer("github.status", status());
+  await panel.answer("github.status", status("Fresh"));
+  assert.match(panel.root.querySelector(".pr-title").textContent, /^Fresh/);
+  assert.equal(panel.root.querySelector<HTMLButtonElement>("button.refresh").disabled, false);
 });

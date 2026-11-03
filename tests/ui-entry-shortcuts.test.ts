@@ -30,13 +30,10 @@ test("GitHub session panel uses the compact PR layout and capture-phase shortcut
   assert.match(entry, /contentObserver\.disconnect\(\)/);
   assert.match(entry, /call\("github\.merge", \{ strategy: selectedStrategy, url: pr\.url \}\)/);
   assert.match(entry, /Link pull request/);
-  assert.match(entry, /const recipient = await context\.host\.recipient\.getFocusedAgentSession\(\)/);
   assert.doesNotMatch(entry, /github\.recipients/);
   assert.doesNotMatch(entry, /Recipient session/);
   assert.doesNotMatch(entry, /selectedRecipientId/);
   assert.match(entry, /recipient_session_id: recipient\.id/);
-  assert.match(entry, /await call\("github\.sendFailureLogs", \{ recipient_session_id: recipient\.id, url: pr\.url \}\)/);
-  assert.match(entry, /context\.host\.data\.notify\("CI failures sent to agent", "success"\)/);
   assert.doesNotMatch(entry, /call\("github\.failureLogs"\)/);
   assert.doesNotMatch(entry, /render\(result\.message/);
 });
