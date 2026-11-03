@@ -951,17 +951,30 @@ fn list_sessions(context: &ExecutionContext) -> Result<Vec<SessionInfo>, Request
     .map(|response| parse_sessions(&response))
 }
 
+/// The sessions that share a task, starting with the one a request is about.
+struct TaskGroup {
+    members: Vec<String>,
+    /// False when the host could not list sessions, so the task's other sessions are unknown.
+    resolved: bool,
+}
+
 /// A session's task group; a host that cannot list sessions leaves the session on its own.
 fn session_task_group(
     context: &ExecutionContext,
     session_id: &str,
-) -> Result<Vec<String>, RequestError> {
+) -> Result<TaskGroup, RequestError> {
     match list_sessions(context) {
-        Ok(sessions) => Ok(task_group(&sessions, session_id)),
+        Ok(sessions) => Ok(TaskGroup {
+            members: task_group(&sessions, session_id),
+            resolved: true,
+        }),
         Err(RequestError::Cancelled) => Err(RequestError::Cancelled),
         Err(RequestError::Message(message)) => {
             eprintln!("{PLUGIN_ID} could not list sessions for {session_id}: {message}");
-            Ok(vec![session_id.to_string()])
+            Ok(TaskGroup {
+                members: vec![session_id.to_string()],
+                resolved: false,
+            })
         }
     }
 }
@@ -986,11 +999,13 @@ struct GroupUpdate {
 
 /// Reads, changes, and persists the links of a task group, then applies the task transition
 /// that the persisted change caused, so an unchanged state never repeats a transition.
+/// A group whose other sessions are unknown never transitions, since its task's state is unknown.
 fn update_group_links(
     context: &ExecutionContext,
-    group: &[String],
+    task: &TaskGroup,
     mutate: impl FnOnce(&mut SessionLinks) -> Result<(), RequestError>,
 ) -> Result<GroupUpdate, RequestError> {
+    let group = task.members.as_slice();
     let (update, transition) = {
         let _persistence = context
             .durable_state_locks
@@ -1030,7 +1045,7 @@ fn update_group_links(
             transition,
         )
     };
-    if let Some(session_id) = group.first() {
+    if let Some(session_id) = group.first().filter(|_| task.resolved) {
         apply_task_transition(context, session_id, transition);
     }
     Ok(update)
@@ -1104,8 +1119,9 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
             json!({ "applicable": false, "reason": "The origin remote is not github.com." }),
         );
     };
-    let group = session_task_group(context, session_id)?;
-    let lists = read_group_links(context, &group)?;
+    let task = session_task_group(context, session_id)?;
+    let group = &task.members;
+    let lists = read_group_links(context, group)?;
     // The panel can highlight any of the task's pull requests, so each one gets its details.
     let detail_keys: BTreeSet<PrKey> = lists
         .values()
@@ -1129,7 +1145,7 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
     let outcome = refresh::run(&plan, STATUS_REFRESH_ROUNDS, |requests| {
         fetch_graphql(context, &session.cwd, requests)
     })?;
-    let update = update_group_links(context, &group, |fresh| {
+    let update = update_group_links(context, &task, |fresh| {
         refresh::apply(fresh, &groups, &outcome);
         Ok(())
     })?;
@@ -1169,9 +1185,10 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
 /// The cached pull requests of a session's task, without asking GitHub.
 fn summary(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
-    let group = session_task_group(context, session_id)?;
-    let lists = read_group_links(context, &group)?;
-    Ok(json!({ "pull_requests": prs_json(&group_prs(&lists, &group)) }))
+    let task = session_task_group(context, session_id)?;
+    let group = &task.members;
+    let lists = read_group_links(context, group)?;
+    Ok(json!({ "pull_requests": prs_json(&group_prs(&lists, group)) }))
 }
 
 fn fetch_pull_request(
@@ -1214,8 +1231,8 @@ fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value
     let key = pull_request_key(params)?;
     let repository = repository_context(params, context)?;
     let pr = fetch_pull_request(context, &context_path(&repository)?, &key)?;
-    let group = session_task_group(context, session_id)?;
-    let update = update_group_links(context, &group, |lists| {
+    let task = session_task_group(context, session_id)?;
+    let update = update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
             refresh_snapshot(links, &pr.key, &pr.snapshot);
         }
@@ -1234,8 +1251,8 @@ fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value
 fn unlink_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
     let key = pull_request_key(params)?;
-    let group = session_task_group(context, session_id)?;
-    let update = update_group_links(context, &group, |lists| {
+    let task = session_task_group(context, session_id)?;
+    let update = update_group_links(context, &task, |lists| {
         let mut removed = false;
         for links in lists.values_mut() {
             removed |= dismiss(links, &key);
@@ -1293,8 +1310,8 @@ fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Val
         updated_at: None,
         refreshed_at: unix_timestamp_ms(),
     };
-    let group = session_task_group(context, session_id)?;
-    update_group_links(context, &group, |lists| {
+    let task = session_task_group(context, session_id)?;
+    update_group_links(context, &task, |lists| {
         record_created(
             lists.entry(session_id.to_string()).or_default(),
             &key,
@@ -1366,8 +1383,8 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
         &cwd,
         ["pr", "merge", &url, strategy_flag, "--delete-branch"],
     )?;
-    let group = session_task_group(context, session_id)?;
-    update_group_links(context, &group, |lists| {
+    let task = session_task_group(context, session_id)?;
+    update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
             let merged = links
                 .iter()
@@ -1553,7 +1570,11 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<(),
     })?;
     for group in &groups {
         context.check_cancelled()?;
-        update_group_links(context, group, |fresh| {
+        let task = TaskGroup {
+            members: group.clone(),
+            resolved: true,
+        };
+        update_group_links(context, &task, |fresh| {
             refresh::apply(fresh, &groups, &outcome);
             Ok(())
         })?;
@@ -2022,6 +2043,12 @@ fi
                         merge_settings_patch(&mut host.settings, &params["patch"]);
                         json!({ "updated": true })
                     }
+                    "host.sessions.list" if host.sessions.is_null() => {
+                        let _ = response.send(Err(RequestError::Message(
+                            "sessions unavailable".to_string(),
+                        )));
+                        continue;
+                    }
                     "host.sessions.list" => host.sessions.clone(),
                     "host.sessions.repositoryContext" => {
                         host.contexts[params["session_id"].as_str().unwrap()].clone()
@@ -2393,6 +2420,33 @@ fi
             "the branch link followed the branch away"
         );
         assert!(host.lock().unwrap().transitions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_task_whose_sessions_cannot_be_listed_never_transitions() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([]), "topic");
+        {
+            let mut host = host.lock().unwrap();
+            host.settings["github"]["task_transitions"]["on_open"] = json!("in_review");
+            host.sessions = Value::Null;
+        }
+        cli.respond(
+            json!({ "data": { "r0": { "l0": graphql_pr("o/r", 12, "OPEN", "x", "main", "") } } }),
+        );
+        let linked = with_host(&cli.runner, &host, |context| {
+            link_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/12" }),
+                context,
+            )
+        })
+        .unwrap();
+        assert_eq!(numbers(&linked["pull_requests"]), vec![12]);
+        assert!(
+            host.lock().unwrap().transitions.is_empty(),
+            "the session's siblings are unknown, so the task's state is too"
+        );
     }
 
     #[cfg(unix)]
