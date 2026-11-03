@@ -2281,6 +2281,10 @@ fi
         })
     }
 
+    /// Ends each `gh` call's arguments in the fake's argument log.
+    #[cfg(unix)]
+    const INVOCATION_END: &str = "--end-of-invocation--";
+
     /// Fake `git` and `gh`: the remote follows the working tree, and `gh` serves `gh-response` once, then empty data.
     #[cfg(unix)]
     struct FakeGithubCli {
@@ -2303,7 +2307,7 @@ fi
             let gh = directory.script(
                 "gh",
                 &format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{root}/gh-args'\nprintf x >> '{root}/gh-calls'\nif [ \"$1\" = api ]; then next=$(ls '{root}'/gh-response-* 2>/dev/null | head -n 1); if [ -n \"$next\" ]; then cat \"$next\"; rm \"$next\"; else printf '{{\"data\":{{}}}}'; fi; elif [ \"$1 $2\" = 'pr create' ]; then cat '{root}/gh-pr-create'; fi\n"
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" '{INVOCATION_END}' >> '{root}/gh-args'\nprintf x >> '{root}/gh-calls'\nif [ \"$1\" = api ]; then next=$(ls '{root}'/gh-response-* 2>/dev/null | head -n 1); if [ -n \"$next\" ]; then cat \"$next\"; rm \"$next\"; else printf '{{\"data\":{{}}}}'; fi; elif [ \"$1 $2\" = 'pr create' ]; then cat '{root}/gh-pr-create'; fi\n"
                 ),
             );
             Self {
@@ -2330,6 +2334,29 @@ fi
                 .0
                 .join(format!("gh-response-{:04}", self.calls() + queued));
             fs::write(path, body.to_string()).unwrap();
+        }
+
+        /// The arguments of each `gh` call, in order.
+        fn invocations(&self) -> Vec<Vec<String>> {
+            let args = fs::read_to_string(self.directory.0.join("gh-args")).unwrap_or_default();
+            let mut invocations = vec![Vec::new()];
+            for line in args.lines() {
+                if line == INVOCATION_END {
+                    invocations.push(Vec::new());
+                } else {
+                    invocations.last_mut().unwrap().push(line.to_string());
+                }
+            }
+            invocations.pop();
+            invocations
+        }
+
+        /// The calls that start with these arguments.
+        fn invocations_of(&self, command: &[&str]) -> Vec<Vec<String>> {
+            self.invocations()
+                .into_iter()
+                .filter(|args| args.len() >= command.len() && args[..command.len()] == *command)
+                .collect()
         }
 
         fn calls(&self) -> usize {
@@ -2494,10 +2521,9 @@ fi
             "an unchanged state never repeats a transition"
         );
 
-        let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
-        assert!(args.starts_with(
-            "api\ngraphql\n-f\nquery=query { r0: repository(owner: \"o\", name: \"r\")"
-        ));
+        let first = &cli.invocations()[0];
+        assert_eq!(first[..3], ["api", "graphql", "-f"]);
+        assert!(first[3].starts_with("query=query { r0: repository(owner: \"o\", name: \"r\")"));
     }
 
     #[cfg(unix)]
@@ -2867,19 +2893,24 @@ fi
         cli.respond(json!({ "data": { "r0": { "l0": merged } } }));
         assert_eq!(merge("squash").unwrap(), json!({ "merged": true }));
 
-        let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
         assert!(
-            !args.contains("repos/"),
-            "no REST repository lookup: {args}"
+            cli.invocations_of(&["api", "repos/o/r"]).is_empty(),
+            "no REST repository lookup"
         );
         assert_eq!(
-            args.matches("api\ngraphql\n").count(),
+            cli.invocations_of(&["api", "graphql"]).len(),
             3,
             "one lookup per merge attempt, and one for the merge time"
         );
-        assert_eq!(args.matches("pr\nmerge\n").count(), 1);
-        assert!(
-            args.contains("pr\nmerge\nhttps://github.com/o/r/pull/4\n--squash\n--delete-branch\n")
+        assert_eq!(
+            cli.invocations_of(&["pr", "merge"]),
+            [[
+                "pr",
+                "merge",
+                "https://github.com/o/r/pull/4",
+                "--squash",
+                "--delete-branch"
+            ]]
         );
         assert_eq!(
             host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["state"],
@@ -2975,10 +3006,12 @@ fi
         );
         ready(json!({ "session_id": "s1" })).unwrap();
         ready(json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/9" })).unwrap();
-        let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
         assert_eq!(
-            args,
-            "pr\nready\nhttps://github.com/o/r/pull/4\npr\nready\nhttps://github.com/o/r/pull/9\n",
+            cli.invocations(),
+            [
+                ["pr", "ready", "https://github.com/o/r/pull/4"],
+                ["pr", "ready", "https://github.com/o/r/pull/9"],
+            ],
             "the session's own pull request, not its branch, when no url is given"
         );
     }
@@ -2999,11 +3032,17 @@ fi
             )
         })
         .unwrap();
-        let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
-        assert!(
-            args.contains("pr\nmerge\nhttps://github.com/o/r/pull/7\n--squash\napi\n"),
-            "{args}"
+        let calls = cli.invocations();
+        assert_eq!(
+            cli.invocations_of(&["pr", "merge"]),
+            [["pr", "merge", "https://github.com/o/r/pull/7", "--squash"]]
         );
+        assert_eq!(
+            cli.invocations_of(&["api", "graphql"]).len(),
+            2,
+            "the detail lookup, then one for the merge time"
+        );
+        assert_eq!(calls.last().unwrap()[..2], ["api", "graphql"]);
     }
 
     #[cfg(unix)]
@@ -3056,11 +3095,17 @@ fi
             )
         })
         .unwrap();
-        let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
-        assert!(
-            args.contains("pr\nmerge\nhttps://github.com/x/y/pull/7\n--squash\napi\n"),
-            "{args}"
+        let calls = cli.invocations();
+        assert_eq!(
+            cli.invocations_of(&["pr", "merge"]),
+            [["pr", "merge", "https://github.com/x/y/pull/7", "--squash"]]
         );
+        assert_eq!(
+            cli.invocations_of(&["api", "graphql"]).len(),
+            2,
+            "the detail lookup, then one for the merge time"
+        );
+        assert_eq!(calls.last().unwrap()[..2], ["api", "graphql"]);
     }
 
     #[cfg(unix)]
