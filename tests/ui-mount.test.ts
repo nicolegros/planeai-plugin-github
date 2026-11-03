@@ -20,7 +20,7 @@ const status = (title = "Change") => ({
 type HostCall = { method: string; params: Record<string, unknown>; reply: Deferred<unknown>; answered: boolean };
 
 /** Mounts the panel with a host whose every call waits until the test answers it. */
-function mountPanel(sessionId = "s1") {
+function mountPanel(sessionId = "s1", { listens = true } = {}) {
   const calls: HostCall[] = [];
   let changed = 0;
   const listeners = new Set<() => void>();
@@ -39,7 +39,7 @@ function mountPanel(sessionId = "s1") {
       // Like the host, data.changed notifies every view of the plugin, this one included.
       data: {
         changed: async () => { changed += 1; listeners.forEach((listener) => listener()); },
-        onChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+        ...(listens ? { onChanged: (listener: () => void) => { listeners.add(listener); return () => listeners.delete(listener); } } : {}),
         notify: () => {},
       },
     },
@@ -60,6 +60,9 @@ function mountPanel(sessionId = "s1") {
   };
 }
 
+const withoutBranchPullRequest = () => ({ ...status(), pull_requests: [pr(2, "manual")], own_url: url(2), details: [detail(2)] });
+const actionLabels = (root: Element) =>
+  [...root.querySelectorAll(".form-actions button")].map((button) => button.firstChild?.textContent?.trim());
 const list = (root: Element) => root.querySelector<HTMLElement>(".pr-list");
 const selectedNumber = (root: Element) => root.querySelector('.pr-row[aria-selected="true"] .pr-number')?.textContent;
 
@@ -78,14 +81,26 @@ test("only the latest status refresh renders, whatever order the answers come in
   assert.match(panel.root.querySelector(".pr-title").textContent, /^Third/);
 });
 
-test("a change tells the host once and reloads the panel once", async () => {
+test("a change tells the host once and reloads the panel once, through the host's echo", async () => {
   const panel = mountPanel();
   await panel.answer("github.status", status());
   panel.root.querySelector<HTMLButtonElement>('button[aria-label="Unlink #2"]').click();
   await panel.answer("github.unlink", { pull_requests: [] });
   assert.equal(panel.changes(), 1);
-  assert.equal(panel.pending("github.status").length, 2, "its own notification does not reload it again");
+  assert.equal(panel.pending("github.status").length, 2);
+  await panel.answer("github.status", status());
+  panel.dataChangedElsewhere();
+  assert.equal(panel.pending("github.status").length, 3, "a change elsewhere right after still reloads");
 });
+
+test("without data change notifications, a change reloads the panel itself", async () => {
+  const panel = mountPanel("s1", { listens: false });
+  await panel.answer("github.status", status());
+  panel.root.querySelector<HTMLButtonElement>('button[aria-label="Unlink #2"]').click();
+  await panel.answer("github.unlink", { pull_requests: [] });
+  assert.equal(panel.pending("github.status").length, 2);
+});
+
 test("the list is a grid whose focus survives re-renders and refreshes", async () => {
   const panel = mountPanel();
   await panel.answer("github.status", status());
@@ -195,18 +210,15 @@ test("the footer hints the shortcuts for the highlighted pull request", async ()
   assert.deepEqual(hints(), ["↑↓ select", "O open", "U unlink", "S strategy", "R refresh", "L link"]);
 });
 
-test("a refresh that changed stored pull requests tells the host once without reloading itself", async () => {
+test("a refresh that changed stored pull requests tells the host, and the echo settles", async () => {
   const panel = mountPanel();
   await panel.answer("github.status", { ...status(), changed: true });
   assert.equal(panel.changes(), 1);
-  assert.equal(panel.pending("github.status").length, 1);
-  const unchanged = mountPanel("s2");
-  await unchanged.answer("github.status", status());
-  assert.equal(unchanged.changes(), 0);
+  assert.equal(panel.pending("github.status").length, 2, "the host's echo reloads once");
+  await panel.answer("github.status", status());
+  assert.equal(panel.changes(), 1, "an unchanged refresh tells nobody");
+  assert.equal(panel.pending("github.status").length, 2, "and nothing loops");
 });
-const withoutBranchPullRequest = () => ({ ...status(), pull_requests: [pr(2, "manual")], own_url: url(2), details: [detail(2)] });
-const actionLabels = (root: Element) =>
-  [...root.querySelectorAll(".form-actions button")].map((button) => button.firstChild?.textContent?.trim());
 
 test("Create PR shows beside Link only while the branch has no live pull request", async () => {
   const withBranch = mountPanel();

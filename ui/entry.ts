@@ -142,19 +142,10 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     contentObserver.observe(content, { childList: true, subtree: true, characterData: true });
     const call = (method, params = {}) => context.host.call(method, { session_id: sourceSessionId, ...params });
     const editableTarget = (target) => target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']");
-    // The host tells every view of the plugin about a data change, this panel included, and this
-    // panel reloads itself after its own changes; so the notification its own change causes,
-    // which arrives within this window, is skipped instead of fetching status twice.
-    const OWN_CHANGE_WINDOW_MS = 2000;
-    let ownChangeUntil = 0;
-    const dataChanged = () => {
-      ownChangeUntil = Date.now() + OWN_CHANGE_WINDOW_MS;
-      return context.host.data.changed?.();
-    };
-    const onDataChanged = () => {
-      if (Date.now() < ownChangeUntil) { ownChangeUntil = 0; return; }
-      void load();
-    };
+    // The host tells every view of the plugin about a data change, this panel included, so its
+    // own changes reload it through that echo.
+    const dataChanged = () => context.host.data.changed?.();
+    const listensForChanges = typeof context.host.data.onChanged === "function";
 
     const canMerge = (pr: PullRequestDetail) => !busy && !pr.conflicting && !pr.merge_blocked && pr.state === "open";
     const status = () => (snapshot?.applicable ? snapshot : null);
@@ -185,8 +176,9 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         await action();
         busy = false;
         if (success) context.host.data.notify(success, "success");
+        render();
         void dataChanged();
-        await load();
+        if (!listensForChanges) await load();
       } catch (error) { busy = false; render(String(error)); }
     }
 
@@ -587,6 +579,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         snapshot = next;
         // An open form does not show the status, and rebuilding it would move focus mid-typing.
         if (!activeForm) render();
+        // The host's echo reloads once more; that refresh changes nothing, so it stops there.
         if (next.applicable && next.changed) void dataChanged();
       } catch (error) {
         if (disposed || current !== generation) return;
@@ -596,7 +589,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     }
 
     window.addEventListener("keydown", handleKeydown, true);
-    const unsubscribe = context.host.data.onChanged?.(onDataChanged) ?? (() => {});
+    const unsubscribe = context.host.data.onChanged?.(() => { void load(); }) ?? (() => {});
     void load();
     return () => { disposed = true; unsubscribe(); contentObserver.disconnect(); window.removeEventListener("keydown", handleKeydown, true); root.replaceChildren(); };
   },
