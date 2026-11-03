@@ -1839,7 +1839,7 @@ mod tests {
 
     /// Only bounds a hung test; fake subprocesses can take seconds when the suite runs in parallel.
     const TEST_WAIT: Duration = Duration::from_secs(10);
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Instant;
 
     #[test]
     fn recognizes_existing_github_remote_forms_only() {
@@ -2849,15 +2849,38 @@ fi
     struct TestDirectory(PathBuf);
 
     #[cfg(unix)]
+    #[test]
+    fn test_directories_never_share_a_path() {
+        let start = Arc::new(std::sync::Barrier::new(16));
+        let directories: Vec<TestDirectory> = (0..16)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    TestDirectory::new()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let paths: BTreeSet<&PathBuf> = directories.iter().map(|directory| &directory.0).collect();
+        assert_eq!(
+            paths.len(),
+            directories.len(),
+            "tests starting together get their own directory"
+        );
+    }
+
+    #[cfg(unix)]
     impl TestDirectory {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            // The clock alone is not unique: macOS reports microseconds, so parallel tests collided.
+            static NEXT: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "planeai-plugin-github-test-{}-{nonce}",
-                std::process::id()
+                "planeai-plugin-github-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&path).unwrap();
             Self(path)
