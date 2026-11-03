@@ -100,14 +100,12 @@ fn stack_reach<'a>(
         .iter()
         .map(|(_, link, _)| (link.source() != Some(TrackedSource::Stack)).then_some(Reach::Both))
         .collect();
-    for direction in [Reach::Up, Reach::Down] {
+    let walk = |reach: &mut [Option<Reach>], direction: Reach, seeds: Vec<usize>| {
         let joints = |snapshot: &'a PrSnapshot| match direction {
             Reach::Up => (&snapshot.base_branch, &snapshot.head_branch),
             _ => (&snapshot.head_branch, &snapshot.base_branch),
         };
-        let mut frontier: Vec<usize> = (0..entries.len())
-            .filter(|index| reach[*index] == Some(Reach::Both))
-            .collect();
+        let mut frontier = seeds;
         while let Some(index) = frontier.pop() {
             let (_, from, from_snapshot) = entries[index];
             let Some(joint) = joints(from_snapshot).0 else {
@@ -123,7 +121,21 @@ fn stack_reach<'a>(
                 }
             }
         }
+    };
+    let own: Vec<usize> = (0..entries.len())
+        .filter(|index| reach[*index] == Some(Reach::Both))
+        .collect();
+    walk(&mut reach, Reach::Up, own.clone());
+    walk(&mut reach, Reach::Down, own);
+    // GitHub retargets a stack onto the base branch when its bottom merges, so a live stack link
+    // that no longer connects to the task's own pull requests still grows upward from itself.
+    let detached: Vec<usize> = (0..entries.len())
+        .filter(|index| reach[*index].is_none() && entries[*index].2.state.is_live())
+        .collect();
+    for index in &detached {
+        reach[*index] = Some(Reach::Down);
     }
+    walk(&mut reach, Reach::Down, detached);
     entries
         .into_iter()
         .zip(reach)
@@ -650,6 +662,29 @@ mod tests {
             vec![1, 2],
             "a stored parent keeps walking away from the task"
         );
+    }
+
+    #[test]
+    fn a_restacked_chain_keeps_growing_after_its_bottom_merges() {
+        let own = fetched(1, PrState::Merged, "a", "main");
+        let retargeted = fetched(2, PrState::Open, "b", "main");
+        let above = fetched(3, PrState::Open, "c", "b");
+        let github = github(vec![
+            own.clone(),
+            retargeted.clone(),
+            above.clone(),
+            fetched(4, PrState::Open, "d", "c"),
+        ]);
+        let fresh = refresh_one(
+            &github,
+            vec![
+                tracked(&own, TrackedSource::Manual),
+                tracked(&retargeted, TrackedSource::Stack),
+                tracked(&above, TrackedSource::Stack),
+            ],
+            3,
+        );
+        assert_eq!(tracked_numbers(&fresh), vec![1, 2, 3, 4]);
     }
 
     #[test]

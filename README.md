@@ -28,6 +28,7 @@ The plugin tracks four kinds of links for each session:
 
 Stack discovery follows base and head branches as one linear chain: from each of the task's own open pull requests, it walks up to the pull request whose head is its base, and down to the pull request based on its head.
 A discovered parent only keeps walking up and a discovered child only keeps walking down, so a parent's other children never join.
+When the bottom of a stack merges and GitHub retargets the rest onto the base branch, the remaining open stack pull requests keep walking down, so a pull request opened on top still joins.
 The chain ends at the repository's default branch, so a long-lived `main -> production` pull request never joins, and at a branch that several open pull requests share, since that is no chain.
 Discovery is bounded to eight stack links per task, and dismissed stack links count toward that bound; unlinked created or manual links do not.
 Sessions linked to the same task in the same project share their pull requests, so every session of a task shows the union of their links.
