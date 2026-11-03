@@ -1551,8 +1551,22 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<(),
             }
         }
     }
-    let members: Vec<String> = groups.iter().flatten().cloned().collect();
-    let lists = read_group_links(context, &members)?;
+    let mut lists = SessionLinks::new();
+    let mut readable = Vec::new();
+    for group in groups {
+        match read_group_links(context, &group) {
+            Ok(links) => {
+                lists.extend(links);
+                readable.push(group);
+            }
+            Err(RequestError::Cancelled) => return Err(RequestError::Cancelled),
+            Err(RequestError::Message(message)) => {
+                eprintln!("{PLUGIN_ID} skipped refreshing sessions {group:?}: {message}");
+            }
+        }
+    }
+    let groups = readable;
+    targets.retain(|target| lists.contains_key(&target.session_id));
     let has_links = lists.values().any(|links| !links.is_empty());
     if targets.is_empty() && !has_links {
         return Ok(());
@@ -2446,6 +2460,49 @@ fi
         assert!(
             host.lock().unwrap().transitions.is_empty(),
             "the session's siblings are unknown, so the task's state is too"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_skips_a_task_whose_stored_links_cannot_be_read() {
+        let cli = FakeGithubCli::new();
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["pull_requests"] = json!({
+            "s1": [stored_link(4, "manual", "open")],
+            "s2": [{ "host": "github.com", "repository": "o/r", "number": 5, "url": "https://github.com/o/r/pull/5", "source": "unknown" }],
+        });
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [
+                { "id": "s1", "project_id": "p", "task_key": "T-1", "status": "active" },
+                { "id": "s2", "project_id": "p", "task_key": "T-2", "status": "active" },
+            ] }),
+            contexts: HashMap::from([
+                (
+                    "s1".to_string(),
+                    cli.context("s1", "repo", "topic", Some("T-1")),
+                ),
+                (
+                    "s2".to_string(),
+                    cli.context("s2", "repo", "other", Some("T-2")),
+                ),
+            ]),
+            transitions: Vec::new(),
+        }));
+        cli.respond(json!({ "data": { "r0": {
+            "l0": graphql_pr("o/r", 4, "MERGED", "feature", "main", ""),
+            "l1": { "nodes": [] },
+        } } }));
+
+        let result = with_host(&cli.runner, &host, reconcile).unwrap();
+        assert_eq!(result["checked"], 2);
+        let stored = host.lock().unwrap().settings["github"].clone();
+        assert_eq!(stored["reconciliation"]["status"], "idle");
+        assert_eq!(stored["pull_requests"]["s1"][0]["state"], "merged");
+        assert_eq!(
+            stored["pull_requests"]["s2"][0]["source"], "unknown",
+            "left as it was"
         );
     }
 
