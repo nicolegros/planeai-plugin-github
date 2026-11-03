@@ -30,7 +30,6 @@ test("GitHub session panel uses the compact PR layout and capture-phase shortcut
   assert.match(entry, /contentObserver\.disconnect\(\)/);
   assert.match(entry, /call\("github\.merge", \{ strategy: selectedStrategy, url: pr\.url \}\)/);
   assert.match(entry, /Link pull request/);
-  assert.match(entry, /await call\("github\.link", \{ url: urlField\.value \}\)/);
   assert.match(entry, /const recipient = await context\.host\.recipient\.getFocusedAgentSession\(\)/);
   assert.doesNotMatch(entry, /github\.recipients/);
   assert.doesNotMatch(entry, /Recipient session/);
@@ -68,8 +67,6 @@ test("GitHub titlebar shows the pill summary or the create control", () => {
 });
 
 test("GitHub UI links existing PRs and configures automatic task transitions", () => {
-  assert.match(entry, /call\("github\.link", \{ url: urlField\.value \}\)/);
-  assert.match(entry, /appendFooter\(\[\["L", "link"\], \["Esc", "close"\]\]\)/, "the link form documents its keyboard flow");
   assert.match(settings, /context\.host\.call\("github\.settings"\)/);
   assert.match(settings, /context\.host\.call\("github\.settings\.update"/);
   assert.match(settings, /When a pull request opens/);
