@@ -2,7 +2,7 @@
 
 use crate::github_graphql::{FetchedPr, GraphqlResponse, Lookup, LookupRequest};
 use crate::pull_requests::{
-    known_keys, record_branch_pr, record_stack, refresh_snapshot, LinkStatus, PrKey,
+    known_keys, record_branch_pr, record_stack, refresh_snapshot, LinkStatus, PrKey, PrSnapshot,
     PullRequestLink, TrackedSource,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,44 +54,141 @@ fn group_lists<'a>(lists: &'a SessionLinks, group: &[String]) -> Vec<&'a [PullRe
         .collect()
 }
 
+/// Stack links and tombstones both count, so dismissing a stack pull request never makes room for another.
 fn stack_count(lists: &SessionLinks, group: &[String]) -> usize {
     group_lists(lists, group)
         .into_iter()
         .flatten()
-        .filter(|link| link.source() == Some(TrackedSource::Stack))
+        .filter(|link| matches!(link.source(), Some(TrackedSource::Stack) | None))
         .count()
 }
 
-/// The stack-neighbor lookups of every live pull request whose branches are known.
-fn neighbor_lookups(lists: &SessionLinks) -> BTreeMap<LookupRequest, BTreeSet<String>> {
-    let mut lookups: BTreeMap<LookupRequest, BTreeSet<String>> = BTreeMap::new();
-    for (session_id, links) in lists {
-        for link in links {
-            let Some(snapshot) = link.snapshot().filter(|snapshot| snapshot.state.is_live()) else {
+/// Which way a tracked pull request extends its task's stack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The task's own pull requests look for their parent and their children.
+    Both,
+    /// A discovered parent looks only for its own parent, never for its other children.
+    Up,
+    /// A discovered child looks only for its own children.
+    Down,
+}
+
+/// Each tracked pull request of a task that extends its stack, with how it does.
+fn stack_reach<'a>(
+    lists: &'a SessionLinks,
+    group: &[String],
+) -> Vec<(&'a str, &'a PullRequestLink, &'a PrSnapshot, Reach)> {
+    let entries: Vec<(&str, &PullRequestLink, &PrSnapshot)> = group
+        .iter()
+        .filter_map(|member| lists.get_key_value(member))
+        .flat_map(|(member, links)| {
+            links
+                .iter()
+                .filter_map(move |link| Some((member.as_str(), link, link.snapshot()?)))
+        })
+        .collect();
+    let mut reach: Vec<Option<Reach>> = entries
+        .iter()
+        .map(|(_, link, _)| (link.source() != Some(TrackedSource::Stack)).then_some(Reach::Both))
+        .collect();
+    for direction in [Reach::Up, Reach::Down] {
+        let joints = |snapshot: &'a PrSnapshot| match direction {
+            Reach::Up => (&snapshot.base_branch, &snapshot.head_branch),
+            _ => (&snapshot.head_branch, &snapshot.base_branch),
+        };
+        let mut frontier: Vec<usize> = (0..entries.len())
+            .filter(|index| reach[*index] == Some(Reach::Both))
+            .collect();
+        while let Some(index) = frontier.pop() {
+            let (_, from, from_snapshot) = entries[index];
+            let Some(joint) = joints(from_snapshot).0 else {
                 continue;
             };
-            let repository = &link.key.repository;
-            if let Some(base) = &snapshot.base_branch {
-                lookups
-                    .entry(LookupRequest::new(
-                        repository,
-                        Lookup::OpenHead(base.clone()),
-                    ))
-                    .or_default()
-                    .insert(session_id.clone());
+            for (next, (_, link, snapshot)) in entries.iter().enumerate() {
+                if reach[next].is_none()
+                    && link.key.repository == from.key.repository
+                    && joints(snapshot).1.as_ref() == Some(joint)
+                {
+                    reach[next] = Some(direction);
+                    frontier.push(next);
+                }
             }
-            if let Some(head) = &snapshot.head_branch {
+        }
+    }
+    entries
+        .into_iter()
+        .zip(reach)
+        .filter_map(|((member, link, snapshot), reach)| Some((member, link, snapshot, reach?)))
+        .collect()
+}
+
+/// The stack-neighbor lookups of every task, so its stack grows as one linear chain away from the
+/// task's own pull requests; nothing is looked up below a repository's default branch.
+fn neighbor_lookups(
+    lists: &SessionLinks,
+    groups: &[Vec<String>],
+    default_branches: &BTreeMap<String, String>,
+) -> BTreeMap<LookupRequest, BTreeSet<String>> {
+    let mut lookups: BTreeMap<LookupRequest, BTreeSet<String>> = BTreeMap::new();
+    let singletons: Vec<Vec<String>> = lists
+        .keys()
+        .filter(|session| group_of(groups, session).is_empty())
+        .map(|session| vec![session.clone()])
+        .collect();
+    for group in groups.iter().chain(&singletons) {
+        for (owner, link, snapshot, reach) in stack_reach(lists, group) {
+            if !snapshot.state.is_live() {
+                continue;
+            }
+            let repository = &link.key.repository;
+            let is_default = |branch: &String| default_branches.get(repository) == Some(branch);
+            let mut add = |lookup: Lookup| {
                 lookups
-                    .entry(LookupRequest::new(
-                        repository,
-                        Lookup::OpenBase(head.clone()),
-                    ))
+                    .entry(LookupRequest::new(repository, lookup))
                     .or_default()
-                    .insert(session_id.clone());
+                    .insert(owner.to_string());
+            };
+            if reach != Reach::Down {
+                if let Some(base) = snapshot
+                    .base_branch
+                    .as_ref()
+                    .filter(|base| !is_default(base))
+                {
+                    add(Lookup::OpenHead(base.clone()));
+                }
+            }
+            if reach != Reach::Up {
+                if let Some(head) = snapshot
+                    .head_branch
+                    .as_ref()
+                    .filter(|head| !is_default(head))
+                {
+                    add(Lookup::OpenBase(head.clone()));
+                }
             }
         }
     }
     lookups
+}
+
+/// The one pull request a neighbor lookup adds to a stack: none when the branch is the default
+/// branch, or when several open pull requests share it, since then it is no linear chain.
+fn stack_neighbor<'a>(
+    prs: &'a [FetchedPr],
+    branch: &str,
+    default_branch: Option<&String>,
+) -> Option<&'a FetchedPr> {
+    if default_branch.is_some_and(|default| default == branch) {
+        return None;
+    }
+    let mut candidates = prs.iter().filter(|pr| {
+        !pr.cross_repository
+            && pr.snapshot.state.is_live()
+            && pr.snapshot.head_branch.as_ref() != default_branch
+    });
+    let first = candidates.next()?;
+    candidates.next().is_none().then_some(first)
 }
 
 /// GitHub's pick for a branch: an open pull request first, else the most recently updated one.
@@ -146,7 +243,8 @@ pub fn run<E>(
             requests.push(request);
         }
     }
-    let mut neighbors = neighbor_lookups(&working);
+    let mut default_branches = BTreeMap::new();
+    let mut neighbors = neighbor_lookups(&working, plan.groups, &default_branches);
     let mut queried: BTreeSet<LookupRequest> = BTreeSet::new();
     requests.extend(neighbors.keys().cloned());
 
@@ -156,6 +254,7 @@ pub fn run<E>(
         }
         let response = fetch(&requests)?;
         outcome.merge_methods.extend(response.merge_methods);
+        default_branches.extend(response.default_branches);
         for request in &requests {
             queried.insert(request.clone());
             let Some(Some(prs)) = response.lookups.get(request) else {
@@ -189,12 +288,10 @@ pub fn run<E>(
                             .insert(target.session_id.clone(), detected.map(|pr| pr.key.clone()));
                     }
                 }
-                Lookup::OpenHead(_) | Lookup::OpenBase(_) => {
+                Lookup::OpenHead(branch) | Lookup::OpenBase(branch) => {
                     let owners = neighbors.get(request).cloned().unwrap_or_default();
-                    for pr in prs
-                        .iter()
-                        .filter(|pr| !pr.cross_repository && pr.snapshot.state.is_live())
-                    {
+                    let default_branch = default_branches.get(&request.repository);
+                    if let Some(pr) = stack_neighbor(prs, branch, default_branch) {
                         for owner in &owners {
                             let group = group_of(plan.groups, owner);
                             if known_keys(group_lists(&working, group)).contains(&pr.key)
@@ -211,7 +308,7 @@ pub fn run<E>(
                 }
             }
         }
-        neighbors = neighbor_lookups(&working);
+        neighbors = neighbor_lookups(&working, plan.groups, &default_branches);
         neighbors.retain(|request, _| !queried.contains(request));
         requests = neighbors.keys().cloned().collect();
     }
@@ -329,8 +426,47 @@ mod tests {
                     Some(self.prs.iter().filter(matches).cloned().collect()),
                 );
             }
+            for request in requests {
+                response
+                    .default_branches
+                    .insert(request.repository.clone(), "main".into());
+            }
             Ok(response)
         }
+    }
+
+    fn github(prs: Vec<FetchedPr>) -> FakeGithub {
+        FakeGithub {
+            prs,
+            calls: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Runs a refresh of one session tracking `links`, then applies it, as a status request would.
+    fn refresh_one(
+        github: &FakeGithub,
+        links: Vec<PullRequestLink>,
+        rounds: usize,
+    ) -> SessionLinks {
+        let lists = SessionLinks::from([("s1".to_string(), links)]);
+        let groups = vec![vec!["s1".to_string()]];
+        let detail = BTreeSet::new();
+        let plan = Plan {
+            lists: &lists,
+            groups: &groups,
+            branch_targets: &[],
+            detail_keys: &detail,
+        };
+        let outcome = run(&plan, rounds, |requests| github.fetch(requests)).unwrap();
+        let mut fresh = lists.clone();
+        apply(&mut fresh, &groups, &outcome);
+        fresh
+    }
+
+    fn tracked_numbers(lists: &SessionLinks) -> Vec<u64> {
+        let mut numbers: Vec<u64> = lists["s1"].iter().map(|link| link.key.number).collect();
+        numbers.sort();
+        numbers
     }
 
     fn stack_github() -> FakeGithub {
@@ -466,34 +602,100 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_request_from_the_default_branch_ends_the_stack() {
+        let release = fetched(1, PrState::Open, "main", "production");
+        let feature = fetched(2, PrState::Open, "feature", "main");
+        let github = github(vec![
+            release.clone(),
+            feature.clone(),
+            fetched(3, PrState::Open, "unrelated-1", "main"),
+            fetched(4, PrState::Open, "unrelated-2", "main"),
+        ]);
+
+        let fresh = refresh_one(&github, vec![tracked(&feature, TrackedSource::Branch)], 3);
+        assert_eq!(
+            tracked_numbers(&fresh),
+            vec![2],
+            "neither the release pull request nor what else targets main joins the stack"
+        );
+
+        let fresh = refresh_one(&github, vec![tracked(&release, TrackedSource::Manual)], 3);
+        assert_eq!(
+            tracked_numbers(&fresh),
+            vec![1],
+            "a tracked release pull request does not collect every pull request into main"
+        );
+    }
+
+    #[test]
+    fn stack_discovery_never_reaches_a_parents_other_children() {
+        let parent = fetched(1, PrState::Open, "a", "main");
+        let mine = fetched(2, PrState::Open, "b", "a");
+        let sibling = fetched(3, PrState::Open, "c", "a");
+        let github = github(vec![parent, mine.clone(), sibling]);
+
+        let first = refresh_one(&github, vec![tracked(&mine, TrackedSource::Branch)], 3);
+        assert_eq!(tracked_numbers(&first), vec![1, 2]);
+        let second = refresh_one(&github, first["s1"].clone(), 3);
+        assert_eq!(
+            tracked_numbers(&second),
+            vec![1, 2],
+            "a stored parent keeps walking away from the task"
+        );
+    }
+
+    #[test]
+    fn a_branch_that_several_pull_requests_target_ends_the_stack() {
+        let base = fetched(1, PrState::Open, "a", "main");
+        let github = github(vec![
+            base.clone(),
+            fetched(2, PrState::Open, "b", "a"),
+            fetched(3, PrState::Open, "c", "a"),
+        ]);
+        let fresh = refresh_one(&github, vec![tracked(&base, TrackedSource::Branch)], 3);
+        assert_eq!(tracked_numbers(&fresh), vec![1]);
+    }
+
+    fn chain(length: u64) -> Vec<FetchedPr> {
+        (1..=length)
+            .map(|number| {
+                let base = if number == 1 {
+                    "main".to_string()
+                } else {
+                    format!("b{}", number - 1)
+                };
+                fetched(number, PrState::Open, &format!("b{number}"), &base)
+            })
+            .collect()
+    }
+
+    #[test]
     fn stack_discovery_is_bounded_per_task() {
-        let mut prs = vec![fetched(1, PrState::Open, "a", "main")];
-        for number in 2..30 {
-            prs.push(fetched(
-                number,
-                PrState::Open,
-                &format!("child-{number}"),
-                "a",
-            ));
-        }
-        let github = FakeGithub {
-            prs,
-            calls: RefCell::new(Vec::new()),
-        };
-        let lists = SessionLinks::from([(
-            "s1".to_string(),
+        let github = github(chain(20));
+        let fresh = refresh_one(
+            &github,
             vec![tracked(&github.prs[0], TrackedSource::Branch)],
-        )]);
-        let groups = vec![vec!["s1".to_string()]];
-        let detail = BTreeSet::new();
-        let plan = Plan {
-            lists: &lists,
-            groups: &groups,
-            branch_targets: &[],
-            detail_keys: &detail,
-        };
-        let outcome = run(&plan, 3, |requests| github.fetch(requests)).unwrap();
-        assert_eq!(outcome.discovered.len(), MAX_STACK_LINKS);
+            20,
+        );
+        assert_eq!(fresh["s1"].len(), 1 + MAX_STACK_LINKS);
+    }
+
+    #[test]
+    fn dismissed_stack_pull_requests_count_toward_the_bound() {
+        let github = github(chain(20));
+        let mut links = vec![tracked(&github.prs[0], TrackedSource::Branch)];
+        links.extend(
+            (100..100 + MAX_STACK_LINKS as u64).map(|number| PullRequestLink {
+                key: key(number),
+                url: format!("https://github.com/o/r/pull/{number}"),
+                status: LinkStatus::Dismissed,
+            }),
+        );
+        let fresh = refresh_one(&github, links.clone(), 20);
+        assert!(
+            !differs(&links, &fresh["s1"]),
+            "dismissing never makes room for more"
+        );
     }
 
     #[test]
@@ -522,7 +724,7 @@ mod tests {
                     .iter()
                     .map(|request| (request.clone(), None))
                     .collect(),
-                merge_methods: BTreeMap::new(),
+                ..GraphqlResponse::default()
             })
         })
         .unwrap();
@@ -536,7 +738,7 @@ mod tests {
                     .iter()
                     .map(|request| (request.clone(), Some(Vec::new())))
                     .collect(),
-                merge_methods: BTreeMap::new(),
+                ..GraphqlResponse::default()
             })
         })
         .unwrap();

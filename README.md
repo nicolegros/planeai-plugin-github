@@ -26,7 +26,10 @@ The plugin tracks four kinds of links for each session:
 - **Linked**: a pull request linked by URL with **Link pull request**; linking appends to the list.
 - **Stack**: an open pull request discovered through a base-branch chain from a tracked pull request in the same repository.
 
-Stack discovery follows `gh` base and head branches only: pull requests whose head is a tracked open pull request's base, and pull requests based on its head, recursively and bounded to eight per task.
+Stack discovery follows base and head branches as one linear chain: from each of the task's own open pull requests, it walks up to the pull request whose head is its base, and down to the pull request based on its head.
+A discovered parent only keeps walking up and a discovered child only keeps walking down, so a parent's other children never join.
+The chain ends at the repository's default branch, so a long-lived `main -> production` pull request never joins, and at a branch that several open pull requests share, since that is no chain.
+Discovery is bounded to eight stack links per task, and dismissed ones count toward that bound.
 Sessions linked to the same task in the same project share their pull requests, so every session of a task shows the union of their links.
 **Unlink** and **Dismiss** remove a link from every session of the task and leave a tombstone, so stack discovery never adds it back; linking it again revives it.
 Branch links follow the branch and cannot be unlinked.

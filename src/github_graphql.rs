@@ -82,6 +82,8 @@ pub struct GraphqlResponse {
     /// `None` when GitHub could not answer that lookup, so cached state must be kept.
     pub lookups: BTreeMap<LookupRequest, Option<Vec<FetchedPr>>>,
     pub merge_methods: BTreeMap<String, Vec<String>>,
+    /// Each answered repository's default branch.
+    pub default_branches: BTreeMap<String, String>,
 }
 
 const PR_FIELDS: &str = "number url title state isDraft updatedAt headRefName baseRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
@@ -145,7 +147,7 @@ pub fn build_query(requests: &[LookupRequest]) -> String {
             };
             query.push_str(&format!(" l{index}: {selection}"));
         }
-        query.push_str(" }");
+        query.push_str(" defaultBranchRef { name } }");
     }
     query.push_str(" }");
     query
@@ -254,6 +256,14 @@ pub fn parse_response(requests: &[LookupRequest], body: &Value, now: u64) -> Gra
             .get(format!("r{repository_index}"))
             .filter(|node| !node.is_null());
         if let Some(node) = node {
+            if let Some(name) = node
+                .pointer("/defaultBranchRef/name")
+                .and_then(Value::as_str)
+            {
+                response
+                    .default_branches
+                    .insert(repository.to_string(), name.to_string());
+            }
             if lookups.iter().any(|(_, request)| request.wants_detail()) {
                 let methods = [
                     ("squash", "squashMergeAllowed"),
@@ -328,6 +338,8 @@ mod tests {
         assert!(query.contains("l2: pullRequests(headRefName: \"topic\", first: 10, orderBy: { field: UPDATED_AT, direction: DESC }) { nodes { number url title state isDraft updatedAt headRefName baseRefName isCrossRepository mergeable"));
         assert!(query.contains("l3: pullRequests(headRefName: \"base\", states: OPEN, first: 10)"));
         assert!(query.contains("r1: repository(owner: \"x\", name: \"y\") { l1: pullRequests(baseRefName: \"feat/\\\"quoted\\\"\", states: OPEN"));
+        assert!(query.contains("states: OPEN, first: 10) { nodes { number url title state isDraft updatedAt headRefName baseRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } } defaultBranchRef { name } }"));
+        assert_eq!(query.matches("defaultBranchRef { name }").count(), 2);
         assert_eq!(query.matches('{').count(), query.matches('}').count());
     }
 
@@ -419,10 +431,11 @@ mod tests {
         pr["reviewDecision"] = json!("APPROVED");
         let body = json!({ "data": { "r0": {
             "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": true,
-            "l0": { "nodes": [pr] },
+            "l0": { "nodes": [pr] }, "defaultBranchRef": { "name": "trunk" },
         } } });
         let response = parse_response(&requests, &body, 1);
         assert_eq!(response.merge_methods["o/r"], vec!["squash", "rebase"]);
+        assert_eq!(response.default_branches["o/r"], "trunk");
         let fetched = &response.lookups[&requests[0]].as_ref().unwrap()[0];
         let detail = fetched.detail.as_ref().unwrap();
         assert!(detail.merge_blocked);
