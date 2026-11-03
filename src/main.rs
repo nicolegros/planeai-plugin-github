@@ -16,7 +16,7 @@ use pull_requests::{
     AggregatedPr, PrKey, PrSnapshot, PrState, PrStateTransition, PullRequestLink, SessionInfo,
 };
 use refresh::{BranchTarget, Plan, SessionLinks};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, RecvTimeoutError, Sender},
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -439,6 +439,7 @@ fn durable_state_patch_request(patch: Value) -> Value {
     json!({ "patch": Value::Object(namespaces) })
 }
 
+/// Callers make sure the namespace is current first, with `ensure_durable_state`.
 fn patch_durable_state(
     context: &ExecutionContext,
     allow_cancelled: bool,
@@ -447,7 +448,6 @@ fn patch_durable_state(
     if !allow_cancelled {
         context.check_cancelled()?;
     }
-    ensure_durable_state(context, allow_cancelled)?;
     let response = host_call_with_cancellation(
         context,
         "github-settings-patch",
@@ -858,6 +858,7 @@ fn update_github_settings(
         .get("task_transitions")
         .ok_or_else(|| RequestError::Message("task_transitions is required".to_string()))?;
     validate_task_transitions(transitions)?;
+    ensure_durable_state(context, false)?;
     patch_durable_state(context, false, json!({ "task_transitions": transitions }))?;
     Ok(json!({ "task_transitions": transitions }))
 }
@@ -866,10 +867,10 @@ fn invalid_state(message: impl Into<String>) -> RequestError {
     RequestError::Message(message.into())
 }
 
-fn ensure_durable_state(
+fn read_state_version(
     context: &ExecutionContext,
     allow_cancelled: bool,
-) -> Result<(), RequestError> {
+) -> Result<Value, RequestError> {
     let response = host_call_with_cancellation(
         context,
         "github-settings-version",
@@ -877,7 +878,15 @@ fn ensure_durable_state(
         json!({ "path": [STATE_NAMESPACE, "version"] }),
         allow_cancelled,
     )?;
-    let version = settings_value_from_host_response(&response)?;
+    settings_value_from_host_response(&response)
+}
+
+/// Initializes or migrates the namespace unless it is current.
+fn ensure_durable_state(
+    context: &ExecutionContext,
+    allow_cancelled: bool,
+) -> Result<(), RequestError> {
+    let version = read_state_version(context, allow_cancelled)?;
     match version.as_u64() {
         None if version.is_null() => {
             host_call_with_cancellation(
@@ -918,6 +927,14 @@ fn ensure_durable_state(
     }
 }
 
+fn lock_pull_requests(context: &ExecutionContext) -> Result<MutexGuard<'_, ()>, RequestError> {
+    context
+        .durable_state_locks
+        .pull_requests
+        .lock()
+        .map_err(|_| invalid_state("pull request persistence lock poisoned"))
+}
+
 fn read_session_links(
     context: &ExecutionContext,
     session_id: &str,
@@ -931,14 +948,38 @@ fn read_session_links(
     parse_session_links(&settings_value_from_host_response(&response)?).map_err(invalid_state)
 }
 
+/// Every session's stored links, unparsed, in one host call.
+fn read_stored_links(context: &ExecutionContext) -> Result<Map<String, Value>, RequestError> {
+    let response = host_call(
+        context,
+        "github-settings-pr-links",
+        "host.settings.get",
+        json!({ "path": [STATE_NAMESPACE, "pull_requests"] }),
+    )?;
+    match settings_value_from_host_response(&response)? {
+        Value::Null => Ok(Map::new()),
+        Value::Object(stored) => Ok(stored),
+        _ => Err(invalid_state(
+            "GitHub durable state pull_requests must be an object",
+        )),
+    }
+}
+
+fn group_links(stored: &Map<String, Value>, group: &[String]) -> Result<SessionLinks, String> {
+    group
+        .iter()
+        .map(|session_id| {
+            let links = parse_session_links(stored.get(session_id).unwrap_or(&Value::Null))?;
+            Ok((session_id.clone(), links))
+        })
+        .collect()
+}
+
 fn read_group_links(
     context: &ExecutionContext,
     group: &[String],
 ) -> Result<SessionLinks, RequestError> {
-    group
-        .iter()
-        .map(|session_id| Ok((session_id.clone(), read_session_links(context, session_id)?)))
-        .collect()
+    Ok(group_links(&read_stored_links(context)?, group)?)
 }
 
 fn list_sessions(context: &ExecutionContext) -> Result<Vec<SessionInfo>, RequestError> {
@@ -999,56 +1040,81 @@ struct GroupUpdate {
 
 /// Reads, changes, and persists the links of a task group, then applies the task transition
 /// that the persisted change caused, so an unchanged state never repeats a transition.
-/// A group whose other sessions are unknown never transitions, since its task's state is unknown.
 fn update_group_links(
     context: &ExecutionContext,
     task: &TaskGroup,
     mutate: impl FnOnce(&mut SessionLinks) -> Result<(), RequestError>,
 ) -> Result<GroupUpdate, RequestError> {
-    let group = task.members.as_slice();
-    let (update, transition) = {
-        let _persistence = context
-            .durable_state_locks
-            .pull_requests
-            .lock()
-            .map_err(|_| invalid_state("pull request persistence lock poisoned"))?;
-        ensure_durable_state(context, false)?;
-        let before = read_group_links(context, group)?;
-        let mut after = before.clone();
-        mutate(&mut after)?;
-        let mut patch = serde_json::Map::new();
-        for (session_id, links) in &after {
-            let previous = before
-                .get(session_id)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            if refresh::differs(previous, links) {
-                patch.insert(session_id.clone(), session_links_value(links));
+    let mut mutate = Some(mutate);
+    let mut updates = update_groups(context, std::slice::from_ref(task), false, |lists| {
+        mutate.take().expect("one group mutates once")(lists)
+    })?;
+    Ok(updates.remove(0))
+}
+
+/// Like `update_group_links` for several tasks at once, with one read and one write.
+/// With `skip_unreadable`, a task whose stored links cannot be parsed is left out instead of
+/// failing every other task. A task whose other sessions are unknown never transitions.
+fn update_groups(
+    context: &ExecutionContext,
+    tasks: &[TaskGroup],
+    skip_unreadable: bool,
+    mut mutate: impl FnMut(&mut SessionLinks) -> Result<(), RequestError>,
+) -> Result<Vec<GroupUpdate>, RequestError> {
+    ensure_durable_state(context, false)?;
+    let mut updates = Vec::new();
+    let mut transitions = Vec::new();
+    {
+        let _persistence = lock_pull_requests(context)?;
+        let stored = read_stored_links(context)?;
+        let mut patch = Map::new();
+        for task in tasks {
+            let group = task.members.as_slice();
+            let before = match group_links(&stored, group) {
+                Ok(before) => before,
+                Err(message) if skip_unreadable => {
+                    eprintln!("{PLUGIN_ID} skipped updating sessions {group:?}: {message}");
+                    continue;
+                }
+                Err(message) => return Err(invalid_state(message)),
+            };
+            let mut after = before.clone();
+            mutate(&mut after)?;
+            let mut changed = false;
+            for (session_id, links) in &after {
+                let previous = before
+                    .get(session_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if refresh::differs(previous, links) {
+                    patch.insert(session_id.clone(), session_links_value(links));
+                    changed = true;
+                }
             }
+            let prs = group_prs(&after, group);
+            if let Some(session_id) = group.first().filter(|_| task.resolved) {
+                if let Some(transition) = task_transition(&group_prs(&before, group), &prs) {
+                    transitions.push((session_id.clone(), transition));
+                }
+            }
+            updates.push(GroupUpdate {
+                lists: after,
+                prs,
+                changed,
+            });
         }
-        let changed = !patch.is_empty();
-        if changed {
+        if !patch.is_empty() {
             patch_durable_state(
                 context,
                 false,
                 json!({ "pull_requests": Value::Object(patch) }),
             )?;
         }
-        let prs = group_prs(&after, group);
-        let transition = task_transition(&group_prs(&before, group), &prs);
-        (
-            GroupUpdate {
-                lists: after,
-                prs,
-                changed,
-            },
-            transition,
-        )
-    };
-    if let Some(session_id) = group.first().filter(|_| task.resolved) {
-        apply_task_transition(context, session_id, transition);
     }
-    Ok(update)
+    for (session_id, transition) in transitions {
+        apply_task_transition(context, &session_id, Some(transition));
+    }
+    Ok(updates)
 }
 
 fn fetch_graphql(
@@ -1551,21 +1617,18 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<(),
             }
         }
     }
+    let stored = read_stored_links(context)?;
     let mut lists = SessionLinks::new();
-    let mut readable = Vec::new();
-    for group in groups {
-        match read_group_links(context, &group) {
-            Ok(links) => {
-                lists.extend(links);
-                readable.push(group);
-            }
-            Err(RequestError::Cancelled) => return Err(RequestError::Cancelled),
-            Err(RequestError::Message(message)) => {
-                eprintln!("{PLUGIN_ID} skipped refreshing sessions {group:?}: {message}");
-            }
+    groups.retain(|group| match group_links(&stored, group) {
+        Ok(links) => {
+            lists.extend(links);
+            true
         }
-    }
-    let groups = readable;
+        Err(message) => {
+            eprintln!("{PLUGIN_ID} skipped refreshing sessions {group:?}: {message}");
+            false
+        }
+    });
     targets.retain(|target| lists.contains_key(&target.session_id));
     let has_links = lists.values().any(|links| !links.is_empty());
     if targets.is_empty() && !has_links {
@@ -1582,17 +1645,18 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<(),
     let outcome = refresh::run(&plan, RECONCILE_REFRESH_ROUNDS, |requests| {
         fetch_graphql(context, &cwd, requests)
     })?;
-    for group in &groups {
-        context.check_cancelled()?;
-        let task = TaskGroup {
+    context.check_cancelled()?;
+    let tasks: Vec<TaskGroup> = groups
+        .iter()
+        .map(|group| TaskGroup {
             members: group.clone(),
             resolved: true,
-        };
-        update_group_links(context, &task, |fresh| {
-            refresh::apply(fresh, &groups, &outcome);
-            Ok(())
-        })?;
-    }
+        })
+        .collect();
+    update_groups(context, &tasks, true, |fresh| {
+        refresh::apply(fresh, &groups, &outcome);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1843,7 +1907,7 @@ mod tests {
         assert_eq!(callback["method"], "host.settings.get");
         assert_eq!(
             callback["params"],
-            json!({ "path": ["github", "pull_requests", "s1"] })
+            json!({ "path": ["github", "pull_requests"] })
         );
         input_tx
             .send(
@@ -2008,6 +2072,8 @@ fi
         sessions: Value,
         contexts: HashMap<String, Value>,
         transitions: Vec<(String, String)>,
+        /// Every host method called, in order.
+        calls: Vec<String>,
     }
 
     fn merge_settings_patch(target: &mut Value, patch: &Value) {
@@ -2040,6 +2106,7 @@ fi
             }) = events.recv()
             {
                 let mut host = host.lock().unwrap();
+                host.calls.push(method.clone());
                 let result = match method.as_str() {
                     "host.settings.get" => {
                         let value = params["path"]
@@ -2208,6 +2275,7 @@ fi
                 cli.context("s1", "repo", "topic", Some("T-1")),
             )]),
             transitions: Vec::new(),
+            calls: Vec::new(),
         }));
         let round = json!({ "data": {
             "r0": {
@@ -2307,6 +2375,7 @@ fi
                 cli.context("s1", "repo", "topic", Some("T-1")),
             )]),
             transitions: Vec::new(),
+            calls: Vec::new(),
         }));
 
         cli.respond(json!({ "data": { "r0": { "l0": graphql_pr("other/repo", 12, "OPEN", "x", "main", "PENDING") } } }));
@@ -2381,6 +2450,7 @@ fi
                 cli.context("s1", "repo", branch, Some("T-1")),
             )]),
             transitions: Vec::new(),
+            calls: Vec::new(),
         }))
     }
 
@@ -2489,6 +2559,7 @@ fi
                 ),
             ]),
             transitions: Vec::new(),
+            calls: Vec::new(),
         }));
         cli.respond(json!({ "data": { "r0": {
             "l0": graphql_pr("o/r", 4, "MERGED", "feature", "main", ""),
@@ -2504,6 +2575,52 @@ fi
             stored["pull_requests"]["s2"][0]["source"], "unknown",
             "left as it was"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_task_reads_its_stored_links_once_however_many_sessions_it_has() {
+        let cli = FakeGithubCli::new();
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["pull_requests"] = json!({
+            "s1": [stored_link(4, "manual", "open")],
+            "s2": [stored_link(5, "manual", "open")],
+            "s3": [stored_link(6, "manual", "open")],
+        });
+        let session = |id: &str| json!({ "id": id, "project_id": "p", "task_key": "T-1", "status": "active" });
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [session("s1"), session("s2"), session("s3")] }),
+            contexts: HashMap::new(),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+        let count = |method: &str| {
+            let mut host = host.lock().unwrap();
+            let count = host.calls.iter().filter(|call| *call == method).count();
+            host.calls.clear();
+            count
+        };
+
+        with_host(&cli.runner, &host, |context| {
+            summary(&json!({ "session_id": "s1" }), context)
+        })
+        .unwrap();
+        assert_eq!(
+            count("host.settings.get"),
+            1,
+            "the summary reads every link at once"
+        );
+
+        with_host(&cli.runner, &host, |context| {
+            unlink_pull_request(
+                &json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/5" }),
+                context,
+            )
+        })
+        .unwrap();
+        let reads = count("host.settings.get");
+        assert_eq!(reads, 2, "the version once, then every link at once");
     }
 
     #[cfg(unix)]
@@ -2534,6 +2651,7 @@ fi
                 ),
             ]),
             transitions: Vec::new(),
+            calls: Vec::new(),
         }));
         let merged = json!({ "data": {
             "r0": {
