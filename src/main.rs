@@ -490,8 +490,13 @@ fn apply_task_transition(
         PrStateTransition::Opened => "on_open",
         PrStateTransition::Merged => "on_merge",
     };
-    let Ok(transitions) = read_task_transitions(context, false) else {
-        return;
+    // The change is already stored, so a transition that cannot be read is logged and dropped.
+    let transitions = match read_task_transitions(context, false) {
+        Ok(transitions) => transitions,
+        Err(error) => {
+            eprintln!("{PLUGIN_ID} skipped the {field} task transition: {error:?}");
+            return;
+        }
     };
     let Some(status) = transitions.get(field).and_then(Value::as_str) else {
         return;
@@ -1195,10 +1200,22 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
     let outcome = refresh::run(&plan, STATUS_REFRESH_ROUNDS, |requests| {
         fetch_graphql(context, &session.cwd, requests)
     })?;
-    let update = update_group_links(context, &task, |fresh| {
-        refresh::apply(fresh, &groups, &outcome);
-        Ok(())
-    })?;
+    let update = if task.resolved {
+        update_group_links(context, &task, |fresh| {
+            refresh::apply(fresh, &groups, &outcome);
+            Ok(())
+        })?
+    } else {
+        // Storing it would hide the change from the next refresh that knows the whole task,
+        // so that refresh could never apply its task transition.
+        let mut fresh = lists.clone();
+        refresh::apply(&mut fresh, &groups, &outcome);
+        GroupUpdate {
+            prs: group_prs(&fresh, group),
+            lists: fresh,
+            changed: false,
+        }
+    };
     let own = update
         .lists
         .get(session_id)
@@ -2764,6 +2781,47 @@ fi
             false
         );
         assert_eq!(cli.calls(), 0, "a summary never asks GitHub");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_without_the_task_keeps_the_change_for_one_that_has_it() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([stored_link(4, "manual", "open")]), "other");
+        let sessions = host.lock().unwrap().sessions.clone();
+        host.lock().unwrap().sessions = Value::Null;
+        let merged = json!({ "data": { "r0": {
+            "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": false,
+            "l0": graphql_pr("o/r", 4, "MERGED", "topic", "main", ""),
+            "l1": { "nodes": [] },
+        } } });
+        let refresh = || {
+            with_host(&cli.runner, &host, |context| {
+                status(&json!({ "session_id": "s1" }), context)
+            })
+            .unwrap()
+        };
+
+        cli.respond(merged.clone());
+        let unresolved = refresh();
+        assert_eq!(
+            unresolved["pull_requests"][0]["state"], "merged",
+            "the panel still sees what GitHub said"
+        );
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["state"],
+            "open",
+            "nothing is stored while the task's other sessions are unknown"
+        );
+        assert!(host.lock().unwrap().transitions.is_empty());
+
+        host.lock().unwrap().sessions = sessions;
+        cli.respond(merged);
+        refresh();
+        assert_eq!(
+            host.lock().unwrap().transitions,
+            vec![("s1".to_string(), "done".to_string())]
+        );
     }
 
     #[cfg(unix)]
