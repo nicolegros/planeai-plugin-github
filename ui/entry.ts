@@ -187,8 +187,6 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       await load();
     }
 
-    const mutate = (action: () => Promise<unknown>, success = "") => act(action, { success });
-
     function installFormKeyboard(form: HTMLFormElement, focusField: HTMLElement, cancel: () => void) {
       form.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
@@ -276,7 +274,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       actions.append(
         button("Cancel", () => { closeForm(); render(); }),
         button("Create", () => {
-          void mutate(async () => { await call("github.create", { title: titleField.value, body: bodyField.value, base_branch: baseField.value, draft: draft.checked }); closeForm(); });
+          void act(async () => { await call("github.create", { title: titleField.value, body: bodyField.value, base_branch: baseField.value, draft: draft.checked }); closeForm(); });
         }, { shortcut: "c" }),
       );
       form.addEventListener("submit", (event) => { event.preventDefault(); actions.querySelectorAll("button")[1]?.click(); });
@@ -301,7 +299,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       actions.append(
         button("Cancel", () => { closeForm(); render(); }),
         button("Link pull request", () => {
-          void mutate(async () => { await call("github.link", { url: urlField.value }); closeForm(); }, "Pull request linked");
+          void act(async () => { await call("github.link", { url: urlField.value }); closeForm(); }, { success: "Pull request linked" });
         }, { shortcut: "l" }),
       );
       form.addEventListener("submit", (event) => { event.preventDefault(); actions.querySelectorAll("button")[1]?.click(); });
@@ -347,7 +345,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const removal = removalAction(pr);
       if (removal) {
         const label = REMOVAL_LABELS[removal];
-        const remove = button(label, () => { void mutate(() => call("github.unlink", { url: pr.url })); });
+        const remove = button(label, () => { void act(() => call("github.unlink", { url: pr.url })); });
         remove.tabIndex = -1;
         remove.setAttribute("aria-label", `${label} #${pr.number}`);
         // U acts on the highlighted row; the footer hints it, so the row stays uncluttered.
@@ -448,7 +446,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
     async function mergeSelected(pr: PullRequestDetail) {
       if (!canMerge(pr)) return;
-      await mutate(() => call("github.merge", { strategy: selectedStrategy, url: pr.url }));
+      await act(() => call("github.merge", { strategy: selectedStrategy, url: pr.url }));
     }
 
     function confirmFocusedMergeStrategy() {
@@ -470,7 +468,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
       if (pr.state === "draft") {
         const section = document.createElement("section"); section.className = "section";
-        section.append(button(`Mark #${pr.number} as ready`, () => { void mutate(() => call("github.markReady", { url: pr.url })); }, { shortcut: "shift+r", className: "draft" }));
+        section.append(button(`Mark #${pr.number} as ready`, () => { void act(() => call("github.markReady", { url: pr.url })); }, { shortcut: "shift+r", className: "draft" }));
         content.append(section);
       }
 
