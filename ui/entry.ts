@@ -28,16 +28,16 @@ type GithubPluginContext = {
     recipient: {
       getFocusedAgentSession: () => Promise<{ id: string } | null>;
     };
-    data: { changed?: () => Promise<unknown>; notify: (message: string, kind?: "success" | "error") => void };
+    data: {
+      changed?: () => Promise<unknown>;
+      onChanged?: (listener: () => void) => () => void;
+      notify: (message: string, kind?: "success" | "error") => void;
+    };
   };
 };
 
 type CreateForm = { kind: "create"; title: string; body: string; base_branch: string; draft: boolean };
 type LinkForm = { kind: "link"; url: string };
-/** What a panel keeps for its session across remounts. */
-/** The form field that had focus, by name, with its selection. */
-type FormFocus = { field: string; start: number | null; end: number | null };
-type PanelMemory = { highlight?: string | null; strategy?: string; form?: CreateForm | LinkForm | null; focus?: FormFocus | null };
 
 type GithubPluginEntrypoint = {
   mount: (root: HTMLElement, context: GithubPluginContext) => () => void;
@@ -49,22 +49,17 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     let snapshot: GithubStatus | null = null;
     // Only the latest github.status answer may render, however the requests finish.
     let generation = 0;
-    // The host remounts the panel on every data change, so what the user is doing outlives a mount.
-    const memoryKey = `planeai-plugin-github:panel:${sourceSessionId}`;
-    const recall = (): PanelMemory => { try { return JSON.parse(sessionStorage.getItem(memoryKey) ?? "{}") ?? {}; } catch { return {}; } };
-    let memory: PanelMemory = sourceSessionId ? recall() : {};
-    const remember = (change: PanelMemory) => {
-      memory = { ...memory, ...change };
-      try { sessionStorage.setItem(memoryKey, JSON.stringify(memory)); } catch { /* best effort */ }
-    };
-    const openForm = (): CreateForm | LinkForm | null => memory.form ?? null;
+    let activeForm: CreateForm | LinkForm | null = null;
+    // Only a form just opened takes focus; re-rendering it otherwise leaves focus where the user is.
+    let formJustOpened = false;
     let busy = false;
     let disposed = false;
-    let selectedStrategy = memory.strategy ?? "squash";
+    let selectedStrategy = "squash";
     // The highlighted pull request; the header, checks, merge, and failure hand-off follow it.
-    let selectedUrl: string | null = memory.highlight ?? null;
-    const closeForm = () => remember({ form: null, focus: null });
-    const openNewForm = (form: CreateForm | LinkForm) => remember({ form, focus: null });
+    let selectedUrl: string | null = null;
+    const openForm = () => activeForm;
+    const closeForm = () => { activeForm = null; };
+    const openNewForm = (form: CreateForm | LinkForm) => { activeForm = form; formJustOpened = true; };
 
     const page = document.createElement("main");
     page.innerHTML = `
@@ -147,8 +142,19 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     contentObserver.observe(content, { childList: true, subtree: true, characterData: true });
     const call = (method, params = {}) => context.host.call(method, { session_id: sourceSessionId, ...params });
     const editableTarget = (target) => target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']");
-    // Refreshes every sidebar pill; the host also remounts this panel, which then loads afresh.
-    const dataChanged = () => context.host.data.changed?.();
+    // The host tells every view of the plugin about a data change, this panel included, and this
+    // panel reloads itself after its own changes; so the notification its own change causes,
+    // which arrives within this window, is skipped instead of fetching status twice.
+    const OWN_CHANGE_WINDOW_MS = 2000;
+    let ownChangeUntil = 0;
+    const dataChanged = () => {
+      ownChangeUntil = Date.now() + OWN_CHANGE_WINDOW_MS;
+      return context.host.data.changed?.();
+    };
+    const onDataChanged = () => {
+      if (Date.now() < ownChangeUntil) { ownChangeUntil = 0; return; }
+      void load();
+    };
 
     const canMerge = (pr: PullRequestDetail) => !busy && !pr.conflicting && !pr.merge_blocked && pr.state === "open";
     const status = () => (snapshot?.applicable ? snapshot : null);
@@ -179,8 +185,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         await action();
         busy = false;
         if (success) context.host.data.notify(success, "success");
-        if (context.host.data.changed) await dataChanged();
-        else await load();
+        void dataChanged();
+        await load();
       } catch (error) { busy = false; render(String(error)); }
     }
 
@@ -194,30 +200,9 @@ const githubEntrypoint: GithubPluginEntrypoint = {
           form.requestSubmit();
         }
       });
-      const saveFocus = (event: Event) => {
-        const field = event.target;
-        if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) || !field.name) return;
-        let start: number | null = null;
-        let end: number | null = null;
-        try { start = field.selectionStart; end = field.selectionEnd; } catch { /* checkboxes have no selection */ }
-        remember({ focus: { field: field.name, start, end } });
-      };
-      for (const type of ["focusin", "select", "keyup", "mouseup", "input"]) form.addEventListener(type, saveFocus);
-      form.addEventListener("focusout", (event: FocusEvent) => {
-        // A field removed by a re-render loses focus to nothing; only a move elsewhere forgets it.
-        if (event.relatedTarget instanceof Node && !form.contains(event.relatedTarget)) remember({ focus: null });
-      });
-      const saved = memory.focus;
-      requestAnimationFrame(() => {
-        if (disposed || !form.isConnected) return;
-        const field = saved ? form.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[name="${saved.field}"]`) : null;
-        if (field) {
-          field.focus();
-          if (saved.start !== null) { try { field.setSelectionRange(saved.start, saved.end ?? saved.start); } catch { /* checkboxes have no selection */ } }
-        } else if (!saved) {
-          focusField.focus();
-        }
-      });
+      if (!formJustOpened) return;
+      formJustOpened = false;
+      requestAnimationFrame(() => { if (!disposed && focusField.isConnected) focusField.focus(); });
     }
 
     function appendHeader(current: PullRequest | null) {
@@ -283,7 +268,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const bodyField = document.createElement("textarea"); bodyField.name = "body"; bodyField.rows = 10; bodyField.value = saved.body;
       const baseField = document.createElement("input"); baseField.name = "base_branch"; baseField.value = saved.base_branch; baseField.required = true;
       const draft = document.createElement("input"); draft.name = "draft"; draft.type = "checkbox"; draft.checked = saved.draft;
-      const save = () => remember({ form: { kind: "create", title: titleField.value, body: bodyField.value, base_branch: baseField.value, draft: draft.checked } });
+      const save = () => { activeForm = { kind: "create", title: titleField.value, body: bodyField.value, base_branch: baseField.value, draft: draft.checked }; };
       form.addEventListener("input", save);
       form.addEventListener("change", save);
       const labelled = (label, field) => { const wrapper = document.createElement("label"); wrapper.textContent = label; wrapper.append(field); return wrapper; };
@@ -311,7 +296,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const form = document.createElement("form");
       const urlField = document.createElement("input"); urlField.name = "url"; urlField.type = "url"; urlField.required = true; urlField.placeholder = "https://github.com/owner/repo/pull/123";
       urlField.value = saved.url;
-      urlField.addEventListener("input", () => remember({ form: { kind: "link", url: urlField.value } }));
+      urlField.addEventListener("input", () => { activeForm = { kind: "link", url: urlField.value }; });
       const labelled = document.createElement("label"); labelled.textContent = "Pull request URL"; labelled.append(urlField);
       const actions = document.createElement("div"); actions.className = "form-actions";
       actions.append(
@@ -444,7 +429,6 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
     function selectMergeStrategy(strategy) {
       selectedStrategy = strategy;
-      remember({ strategy });
       for (const button of content.querySelectorAll<HTMLButtonElement>("button[data-merge-strategy]")) {
         button.setAttribute("aria-pressed", String(button.dataset.mergeStrategy === strategy));
       }
@@ -551,7 +535,6 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     function select(url: string | null) {
       if (!url || url === selectedUrl) return;
       selectedUrl = url;
-      remember({ highlight: url });
       render();
     }
 
@@ -602,19 +585,20 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         const next: GithubStatus = await call("github.status");
         if (disposed || current !== generation) return;
         snapshot = next;
-        render();
-        // Known cost: the host remounts this panel on data.changed, which fetches status once more.
+        // An open form does not show the status, and rebuilding it would move focus mid-typing.
+        if (!activeForm) render();
         if (next.applicable && next.changed) void dataChanged();
       } catch (error) {
         if (disposed || current !== generation) return;
         if (!snapshot?.applicable) snapshot = null;
-        render(String(error));
+        if (!activeForm) render(String(error));
       }
     }
 
     window.addEventListener("keydown", handleKeydown, true);
+    const unsubscribe = context.host.data.onChanged?.(onDataChanged) ?? (() => {});
     void load();
-    return () => { disposed = true; contentObserver.disconnect(); window.removeEventListener("keydown", handleKeydown, true); root.replaceChildren(); };
+    return () => { disposed = true; unsubscribe(); contentObserver.disconnect(); window.removeEventListener("keydown", handleKeydown, true); root.replaceChildren(); };
   },
 };
 

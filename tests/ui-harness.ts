@@ -4,7 +4,7 @@ import { JSDOM } from "jsdom";
 export function installDom(): JSDOM {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "https://plugin.test/", pretendToBeVisual: true });
   const browser = dom.window as unknown as Record<string, unknown>;
-  for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLButtonElement", "HTMLInputElement", "HTMLTextAreaElement", "MutationObserver", "KeyboardEvent", "requestAnimationFrame", "sessionStorage"]) {
+  for (const name of ["window", "document", "Element", "HTMLElement", "HTMLButtonElement", "MutationObserver", "KeyboardEvent", "requestAnimationFrame"]) {
     Object.defineProperty(globalThis, name, { value: name === "window" ? dom.window : browser[name], configurable: true, writable: true });
   }
   return dom;
@@ -21,9 +21,6 @@ export function deferred<T>(): Deferred<T> {
 
 /** Lets pending promise callbacks and timers run. */
 export const settle = () => new Promise((done) => setTimeout(done, 0));
-
-/** Lets animation frame callbacks run. */
-export const nextFrame = () => new Promise((done) => setTimeout(done, 40));
 
 export function press(key: string, target: Element = document.activeElement ?? document.body, modifiers: KeyboardEventInit = {}) {
   target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...modifiers }));

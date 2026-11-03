@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
-import { deferred, installDom, nextFrame, press, settle, type Deferred } from "./ui-harness.js";
+import { deferred, installDom, press, settle, type Deferred } from "./ui-harness.js";
 import githubEntrypoint from "../ui/entry.js";
 import githubTitlebarEntrypoint from "../ui/titlebar.js";
 import type { PullRequest, PullRequestSource } from "../ui/pull-requests.js";
@@ -23,6 +23,7 @@ type HostCall = { method: string; params: Record<string, unknown>; reply: Deferr
 function mountPanel(sessionId = "s1") {
   const calls: HostCall[] = [];
   let changed = 0;
+  const listeners = new Set<() => void>();
   const root = document.createElement("div");
   document.body.append(root);
   const dispose = githubEntrypoint.mount(root, {
@@ -35,13 +36,21 @@ function mountPanel(sessionId = "s1") {
       },
       navigation: { openExternal: () => {} },
       recipient: { getFocusedAgentSession: async () => null },
-      data: { changed: async () => { changed += 1; }, notify: () => {} },
+      // Like the host, data.changed notifies every view of the plugin, this one included.
+      data: {
+        changed: async () => { changed += 1; listeners.forEach((listener) => listener()); },
+        onChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+        notify: () => {},
+      },
     },
   });
   const pending = (method: string) => calls.filter((call) => call.method === method);
   return {
     root, dispose, calls, pending,
     changes: () => changed,
+    /** Another view of the plugin changed its data. */
+    dataChangedElsewhere: () => listeners.forEach((listener) => listener()),
+    listening: () => listeners.size,
     async answer(method: string, value: unknown) {
       const call = pending(method).find((candidate) => !candidate.answered);
       call.answered = true;
@@ -69,15 +78,14 @@ test("only the latest status refresh renders, whatever order the answers come in
   assert.match(panel.root.querySelector(".pr-title").textContent, /^Third/);
 });
 
-test("a change refreshes through the host once, without another status call", async () => {
+test("a change tells the host once and reloads the panel once", async () => {
   const panel = mountPanel();
   await panel.answer("github.status", status());
   panel.root.querySelector<HTMLButtonElement>('button[aria-label="Unlink #2"]').click();
   await panel.answer("github.unlink", { pull_requests: [] });
   assert.equal(panel.changes(), 1);
-  assert.equal(panel.pending("github.status").length, 1, "the host remount loads the panel again");
+  assert.equal(panel.pending("github.status").length, 2, "its own notification does not reload it again");
 });
-
 test("the list is a grid whose focus survives re-renders and refreshes", async () => {
   const panel = mountPanel();
   await panel.answer("github.status", status());
@@ -114,20 +122,6 @@ test("arrows on another control leave the highlight alone", async () => {
   assert.equal(selectedNumber(panel.root), "#2", "with nothing focused, arrows move the highlight");
 });
 
-test("the highlight survives the host remounting the panel", async () => {
-  const first = mountPanel();
-  await first.answer("github.status", status());
-  list(first.root).focus();
-  press("j");
-  first.dispose();
-  const second = mountPanel();
-  await second.answer("github.status", status());
-  assert.equal(selectedNumber(second.root), "#2");
-  const other = mountPanel("s2");
-  await other.answer("github.status", status());
-  assert.equal(selectedNumber(other.root), "#1", "each session keeps its own highlight");
-});
-
 test("the titlebar reloads its summary when the plugin's data changes", async () => {
   const listeners: (() => void)[] = [];
   const answers = [{ applicable: true, pull_requests: [] }, { applicable: true, pull_requests: [pr(1, "branch")] }];
@@ -148,29 +142,36 @@ test("the titlebar reloads its summary when the plugin's data changes", async ()
   assert.equal(root.querySelector("button").dataset.state, "pull-requests");
 });
 
-test("an open link form, its value, and the merge strategy survive a remount until the form closes", async () => {
-  const first = mountPanel();
-  await first.answer("github.status", status());
-  first.root.querySelector<HTMLButtonElement>('button[data-merge-strategy="merge"]').click();
+test("a data change elsewhere refreshes in place, keeping the highlight, the open form, and focus", async () => {
+  const panel = mountPanel();
+  await panel.answer("github.status", status());
+  list(panel.root).focus();
+  press("j");
+  panel.root.querySelector<HTMLButtonElement>('button[data-merge-strategy="merge"]').click();
   press("l", document.body);
-  const field = first.root.querySelector<HTMLInputElement>('input[type="url"]');
+  const field = panel.root.querySelector<HTMLInputElement>('input[type="url"]');
+  field.focus();
   field.value = "https://github.com/o/r/pull/9";
   field.dispatchEvent(new window.Event("input", { bubbles: true }));
-  first.dispose();
+  assert.deepEqual(
+    [...panel.root.querySelectorAll(".footer .hints span")].map((hint) => hint.textContent),
+    ["L link", "Esc close"],
+    "the link form documents its keyboard flow"
+  );
 
-  const second = mountPanel();
-  await second.answer("github.status", status());
-  assert.equal(second.root.querySelector<HTMLInputElement>('input[type="url"]')?.value, "https://github.com/o/r/pull/9");
-  press("Escape", second.root.querySelector('input[type="url"]'));
-  assert.equal(second.root.querySelector('input[type="url"]'), null);
-  assert.equal(second.root.querySelector('button[data-merge-strategy="merge"]')?.getAttribute("aria-pressed"), "true");
-  second.dispose();
+  panel.dataChangedElsewhere();
+  assert.equal(panel.pending("github.status").length, 2);
+  await panel.answer("github.status", status("Fresh"));
+  assert.equal(document.activeElement, field, "typing goes on in the same field");
+  assert.equal(field.value, "https://github.com/o/r/pull/9");
 
-  const third = mountPanel();
-  await third.answer("github.status", status());
-  assert.equal(third.root.querySelector('input[type="url"]'), null, "a closed form stays closed");
+  press("Escape", field);
+  assert.equal(selectedNumber(panel.root), "#2");
+  assert.match(panel.root.querySelector('.pr-row[aria-selected="true"] .pr-title').textContent, /^Fresh/);
+  assert.equal(panel.root.querySelector('button[data-merge-strategy="merge"]')?.getAttribute("aria-pressed"), "true");
+  panel.dispose();
+  assert.equal(panel.listening(), 0, "the panel stops listening once disposed");
 });
-
 test("the merge section offers the repository's strategies only for an open pull request", async () => {
   const panel = mountPanel();
   const draft = status();
@@ -194,15 +195,15 @@ test("the footer hints the shortcuts for the highlighted pull request", async ()
   assert.deepEqual(hints(), ["↑↓ select", "O open", "U unlink", "S strategy", "R refresh", "L link"]);
 });
 
-test("a refresh that changed stored pull requests tells the host once", async () => {
+test("a refresh that changed stored pull requests tells the host once without reloading itself", async () => {
   const panel = mountPanel();
   await panel.answer("github.status", { ...status(), changed: true });
   assert.equal(panel.changes(), 1);
+  assert.equal(panel.pending("github.status").length, 1);
   const unchanged = mountPanel("s2");
   await unchanged.answer("github.status", status());
   assert.equal(unchanged.changes(), 0);
 });
-
 const withoutBranchPullRequest = () => ({ ...status(), pull_requests: [pr(2, "manual")], own_url: url(2), details: [detail(2)] });
 const actionLabels = (root: Element) =>
   [...root.querySelectorAll(".form-actions button")].map((button) => button.firstChild?.textContent?.trim());
@@ -216,21 +217,16 @@ test("Create PR shows beside Link only while the branch has no live pull request
   assert.deepEqual(actionLabels(withoutBranch.root), ["Create PR", "Link pull request"]);
 });
 
-test("Escape closes the create form for good", async () => {
-  const first = mountPanel();
-  await first.answer("github.status", withoutBranchPullRequest());
+test("Escape closes the create form", async () => {
+  const panel = mountPanel();
+  await panel.answer("github.status", withoutBranchPullRequest());
   press("c", document.body);
-  await first.answer("github.defaults", { title: "Title", body: "", base_branch: "main" });
-  const title = first.root.querySelector<HTMLInputElement>("form input");
+  await panel.answer("github.defaults", { title: "Title", body: "", base_branch: "main" });
+  const title = panel.root.querySelector<HTMLInputElement>("form input");
   assert.equal(title?.value, "Title");
   press("Escape", title);
-  assert.equal(first.root.querySelector("form"), null);
-  first.dispose();
-  const second = mountPanel();
-  await second.answer("github.status", withoutBranchPullRequest());
-  assert.equal(second.root.querySelector("form"), null);
+  assert.equal(panel.root.querySelector("form"), null);
 });
-
 test("Cmd or Ctrl+Enter submits a form", async () => {
   for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
     const panel = mountPanel(`s-${Object.keys(modifier)[0]}`);
@@ -243,23 +239,3 @@ test("Cmd or Ctrl+Enter submits a form", async () => {
   }
 });
 
-test("a restored form keeps the field and selection that had focus", async () => {
-  const first = mountPanel();
-  await first.answer("github.status", withoutBranchPullRequest());
-  press("c", document.body);
-  await first.answer("github.defaults", { title: "Title", body: "Some body", base_branch: "main" });
-  await nextFrame();
-  assert.equal((document.activeElement as HTMLInputElement)?.value, "Title", "a form just opened focuses its first field");
-  const body = first.root.querySelector("textarea");
-  body.focus();
-  body.setSelectionRange(2, 6);
-  body.dispatchEvent(new window.Event("select", { bubbles: true }));
-  first.dispose();
-
-  const second = mountPanel();
-  await second.answer("github.status", withoutBranchPullRequest());
-  await nextFrame();
-  const restored = document.activeElement as HTMLTextAreaElement;
-  assert.equal(restored?.tagName, "TEXTAREA", "the body keeps focus, not the first field");
-  assert.deepEqual([restored.selectionStart, restored.selectionEnd], [2, 6]);
-});
