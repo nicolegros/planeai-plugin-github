@@ -802,10 +802,24 @@ fn is_github_remote(remote: &str) -> bool {
     .any(|prefix| remote.starts_with(prefix))
 }
 
-fn action_run_id(url: &str) -> Option<&str> {
-    let marker = "/actions/runs/";
-    let rest = url.get(url.find(marker)? + marker.len()..)?;
-    rest.split('/').next()
+/// The run id of a `https://github.com/<repository>/actions/runs/<id>` URL, only for that repository.
+fn action_run_id<'a>(url: &'a str, repository: &str) -> Option<&'a str> {
+    let path = url
+        .strip_prefix("https://github.com/")?
+        .split(['?', '#'])
+        .next()?;
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    if !format!("{owner}/{name}").eq_ignore_ascii_case(repository)
+        || segments.next()? != "actions"
+        || segments.next()? != "runs"
+    {
+        return None;
+    }
+    segments
+        .next()
+        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn success(id: Value, result: Value) -> Value {
@@ -1491,26 +1505,29 @@ fn mark_ready(params: &Value, context: &ExecutionContext) -> Result<Value, Reque
 
 fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<String, RequestError> {
     let session_id = required_string(params, "session_id")?;
-    let repository = repository_context(params, context)?;
-    let cwd = context_path(&repository)?;
-    let branch = context_string(&repository, "branch")?;
+    let session = github_session(params, context)?
+        .ok_or_else(|| invalid_state("The origin remote is not github.com."))?;
+    let GithubSession {
+        cwd,
+        repository,
+        branch,
+        ..
+    } = &session;
     let reference = match params.get("url").and_then(Value::as_str) {
-        Some(_) => target_reference(params, &branch),
+        Some(_) => target_reference(params, branch),
         None => {
             let links = read_session_links(context, session_id)?;
-            let repository = git_output(context, &cwd, ["remote", "get-url", "origin"])
-                .ok()
-                .and_then(|remote| github_repository_slug(&remote))
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            own_link(&links, &repository)
+            own_link(&links, repository)
                 .map(|link| link.url.clone())
                 .unwrap_or_else(|| branch.clone())
         }
     };
+    // A linked pull request can live in another repository than the session's checkout.
+    let target = PrKey::from_url(&reference);
+    let run_repository = target.as_ref().map_or(repository, |key| &key.repository);
     let raw = gh_output(
         context,
-        &cwd,
+        cwd,
         ["pr", "view", &reference, "--json", "statusCheckRollup"],
     )?;
     let status: Value = serde_json::from_str(&raw)
@@ -1527,18 +1544,13 @@ fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<Str
                 .is_some_and(|value| value.eq_ignore_ascii_case("failure"))
         })
         .filter_map(|check| check.get("detailsUrl").and_then(Value::as_str))
-        .find_map(action_run_id)
+        .find_map(|url| action_run_id(url, run_repository))
         .ok_or_else(|| invalid_state("no failed GitHub Actions run found"))?;
-    // A linked pull request can live in another repository than the session's checkout.
-    let target = PrKey::from_url(&reference);
-    let logs = match &target {
-        Some(key) => gh_output(
-            context,
-            &cwd,
-            ["run", "view", run_id, "--log-failed", "-R", &key.repository],
-        )?,
-        None => gh_output(context, &cwd, ["run", "view", run_id, "--log-failed"])?,
-    };
+    let logs = gh_output(
+        context,
+        cwd,
+        ["run", "view", run_id, "--log-failed", "-R", run_repository],
+    )?;
     let tail = logs
         .lines()
         .rev()
@@ -1838,12 +1850,31 @@ mod tests {
     }
 
     #[test]
-    fn extracts_actions_run_id() {
-        assert_eq!(
-            action_run_id("https://github.com/o/r/actions/runs/123/job/45"),
-            Some("123")
-        );
-        assert_eq!(action_run_id("https://github.com/o/r/pull/1"), None);
+    fn extracts_actions_run_ids_of_the_pull_request_repository_only() {
+        for (url, expected) in [
+            (
+                "https://github.com/o/r/actions/runs/123/job/45",
+                Some("123"),
+            ),
+            ("https://github.com/O/R/actions/runs/123", Some("123")),
+            (
+                "https://github.com/o/r/actions/runs/123?check_suite_focus=true",
+                Some("123"),
+            ),
+            ("https://github.com/x/y/actions/runs/123", None),
+            ("https://github.com/o/r-other/actions/runs/123", None),
+            ("https://ci.example.com/o/r/actions/runs/123", None),
+            (
+                "https://evil.example/https://github.com/o/r/actions/runs/123",
+                None,
+            ),
+            ("http://github.com/o/r/actions/runs/123", None),
+            ("https://github.com/o/r/actions/runs/--help", None),
+            ("https://github.com/o/r/actions/runs/", None),
+            ("https://github.com/o/r/pull/1", None),
+        ] {
+            assert_eq!(action_run_id(url, "o/r"), expected, "{url}");
+        }
     }
 
     #[cfg(unix)]
@@ -1945,7 +1976,7 @@ mod tests {
                 r#"#!/bin/sh
 printf '%s\n' "$@" >> '{}'
 if [ "$1" = "pr" ]; then
-  printf '%s\n' '{{"statusCheckRollup":[{{"conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/123/job/45"}}]}}'
+  printf '%s\n' '{{"statusCheckRollup":[{{"conclusion":"FAILURE","detailsUrl":"https://github.com/x/y/actions/runs/999/job/1"}},{{"conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/123/job/45"}}]}}'
 else
   printf 'checkRun cargo fmt --check\nDiff in src-tauri/src/plugins.rs\n'
 fi
@@ -1953,11 +1984,12 @@ fi
                 gh_args.display()
             ),
         );
+        let git = directory.script("git", "#!/bin/sh\nprintf 'https://github.com/o/r.git\\n'\n");
         let (events, events_rx) = mpsc::channel();
         let context = ExecutionContext {
             cancelled: Arc::new(AtomicBool::new(false)),
             events,
-            runner: CommandRunner::new(&gh, &gh),
+            runner: CommandRunner::new(&git, &gh),
             request_key: "test-request".to_string(),
             callback_sequence: Arc::new(AtomicU64::new(1)),
             durable_state_locks: DurableStateLocks {
@@ -2006,7 +2038,7 @@ fi
         assert_eq!(
             fs::read_to_string(&gh_args).unwrap(),
             "pr\nview\nhttps://github.com/o/r/pull/456\n--json\nstatusCheckRollup\nrun\nview\n123\n--log-failed\n-R\no/r\n",
-            "the run is read from the pull request's repository, which can differ from the checkout"
+            "the run is read from the pull request's repository, which can differ from the checkout, and a run elsewhere is ignored"
         );
         assert!(params["text"]
             .as_str()
