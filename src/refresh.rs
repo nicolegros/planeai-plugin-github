@@ -219,6 +219,8 @@ pub fn run<E>(
 }
 
 /// Applies an outcome to freshly read lists, so writes made while GitHub answered are kept.
+/// Only the sessions in `lists` change: an outcome can cover other tasks, whose stored links
+/// these lists never read.
 pub fn apply(lists: &mut SessionLinks, groups: &[Vec<String>], outcome: &Outcome) {
     for pr in outcome.fetched.values() {
         for links in lists.values_mut() {
@@ -226,9 +228,12 @@ pub fn apply(lists: &mut SessionLinks, groups: &[Vec<String>], outcome: &Outcome
         }
     }
     for (session_id, detected) in &outcome.branch_prs {
+        let Some(links) = lists.get_mut(session_id) else {
+            continue;
+        };
         let detected = detected.as_ref().and_then(|key| outcome.fetched.get(key));
         record_branch_pr(
-            lists.entry(session_id.clone()).or_default(),
+            links,
             detected.map(|pr| (&pr.key, pr.url.as_str(), &pr.snapshot)),
         );
     }
@@ -236,16 +241,12 @@ pub fn apply(lists: &mut SessionLinks, groups: &[Vec<String>], outcome: &Outcome
         let Some(pr) = outcome.fetched.get(key) else {
             continue;
         };
-        let group = group_of(groups, owner);
-        if known_keys(group_lists(lists, group)).contains(key) {
+        if known_keys(group_lists(lists, group_of(groups, owner))).contains(key) {
             continue;
         }
-        record_stack(
-            lists.entry(owner.clone()).or_default(),
-            key,
-            &pr.url,
-            &pr.snapshot,
-        );
+        if let Some(links) = lists.get_mut(owner) {
+            record_stack(links, key, &pr.url, &pr.snapshot);
+        }
     }
 }
 
@@ -586,6 +587,31 @@ mod tests {
         assert!(
             !differs(&lists["s1"], &fresh["s1"]),
             "a refresh that changes nothing is not a change"
+        );
+    }
+
+    #[test]
+    fn apply_only_touches_the_sessions_it_was_given() {
+        let theirs = fetched(5, PrState::Open, "theirs", "main");
+        let stacked = fetched(6, PrState::Open, "next", "theirs");
+        let outcome = Outcome {
+            fetched: BTreeMap::from([
+                (theirs.key.clone(), theirs.clone()),
+                (stacked.key.clone(), stacked.clone()),
+            ]),
+            branch_prs: BTreeMap::from([("other-task".to_string(), Some(theirs.key.clone()))]),
+            discovered: vec![("other-task".to_string(), stacked.key.clone())],
+            merge_methods: BTreeMap::new(),
+        };
+        let groups = vec![vec!["mine".to_string()], vec!["other-task".to_string()]];
+        let mut fresh = SessionLinks::from([("mine".to_string(), Vec::new())]);
+
+        apply(&mut fresh, &groups, &outcome);
+
+        assert_eq!(
+            fresh.keys().collect::<Vec<_>>(),
+            vec!["mine"],
+            "another task's links are not rebuilt from its branch alone, which would erase its manual links"
         );
     }
 
