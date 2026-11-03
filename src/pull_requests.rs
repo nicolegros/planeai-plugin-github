@@ -312,7 +312,7 @@ struct LegacyCheckSummary {
     updated_at: u64,
 }
 
-/// Reads a session's stored links, accepting the legacy single-object shape as a one-element list.
+/// Reads a session's stored links; the legacy single-object shape only exists before migration.
 pub fn parse_session_links(value: &Value) -> Result<Vec<PullRequestLink>, String> {
     match value {
         Value::Null => Ok(Vec::new()),
@@ -327,13 +327,6 @@ pub fn parse_session_links(value: &Value) -> Result<Vec<PullRequestLink>, String
                 }
             }
             Ok(links)
-        }
-        Value::Object(_) => {
-            let legacy = parse_legacy_mapping(value)?;
-            let url = value.get("url").and_then(Value::as_str).unwrap_or_default();
-            Ok(vec![legacy.ok_or_else(|| {
-                format!("legacy pull request url {url} is not supported")
-            })?])
         }
         _ => Err("a session's pull requests must be a list".into()),
     }
@@ -746,29 +739,6 @@ mod tests {
         ] {
             assert!(parse_session_links(&record).is_err(), "{record}");
         }
-    }
-
-    #[test]
-    fn legacy_single_mapping_migrates_to_one_link_idempotently() {
-        let legacy = json!({
-            "session_id": "s1", "url": "https://github.com/o/r/pull/3", "state": "open",
-            "remote": "https://github.com/o/r.git", "branch": "topic", "updated_at": 9,
-            "check_summary": { "state": "pending", "updated_at": 9 },
-        });
-        let links = parse_session_links(&legacy).unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].key, key(3));
-        assert_eq!(links[0].source(), Some(TrackedSource::Manual));
-        let snapshot = links[0].snapshot().unwrap();
-        assert_eq!(snapshot.state, PrState::Open);
-        assert_eq!(snapshot.checks, Some(CheckState::Pending));
-        assert_eq!(snapshot.refreshed_at, 9);
-        let migrated = session_links_value(&links);
-        assert_eq!(parse_session_links(&migrated).unwrap(), links);
-        assert_eq!(
-            session_links_value(&parse_session_links(&migrated).unwrap()),
-            migrated
-        );
     }
 
     #[test]

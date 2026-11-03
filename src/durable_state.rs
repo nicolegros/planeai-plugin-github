@@ -456,6 +456,26 @@ mod tests {
     }
 
     #[test]
+    fn v3_migration_turns_a_legacy_mapping_into_one_manual_link() {
+        let mut v3 = empty_durable_state();
+        v3["version"] = json!(V3_STATE_VERSION);
+        v3["pull_requests"] = json!({ "s1": {
+            "session_id": "s1", "url": "https://github.com/o/r/pull/3", "state": "open",
+            "remote": "https://github.com/o/r.git", "branch": "topic", "updated_at": 9,
+            "check_summary": { "state": "pending", "updated_at": 9 },
+        } });
+        let migrated = migrate_durable_state(&v3).unwrap();
+        assert_eq!(
+            migrated["pull_requests"]["s1"],
+            json!([{
+                "host": "github.com", "repository": "o/r", "number": 3, "url": "https://github.com/o/r/pull/3",
+                "source": "manual", "state": "open", "checks": "pending", "refreshed_at": 9,
+            }])
+        );
+        assert_eq!(migrate_durable_state(&migrated).unwrap(), migrated);
+    }
+
+    #[test]
     fn migration_upgrades_every_version_to_lists_and_is_idempotent() {
         let legacy = json!({ "session_id": "s1", "url": "https://github.com/o/r/pull/1", "state": "open", "remote": "https://github.com/o/r.git", "branch": "topic", "updated_at": 7 });
         let v1 = json!({ "version": LEGACY_STATE_VERSION, "pull_requests": { "s1": legacy }, "reconciliation": empty_durable_state()["reconciliation"] });

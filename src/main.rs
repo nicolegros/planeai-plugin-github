@@ -926,31 +926,24 @@ fn lock_pull_requests(context: &ExecutionContext) -> Result<MutexGuard<'_, ()>, 
         .map_err(|_| invalid_state("pull request persistence lock poisoned"))
 }
 
-fn read_session_links(
-    context: &ExecutionContext,
-    session_id: &str,
-) -> Result<Vec<PullRequestLink>, RequestError> {
-    let response = host_call(
-        context,
-        "github-settings-pr-links",
-        "host.settings.get",
-        json!({ "path": [STATE_NAMESPACE, "pull_requests", session_id] }),
-    )?;
-    parse_session_links(&settings_value_from_host_response(&response)?).map_err(invalid_state)
-}
-
 /// Every session's stored links, unparsed, in one host call.
+/// A namespace that is not migrated yet reads as its migration would write it.
 fn read_stored_links(context: &ExecutionContext) -> Result<Map<String, Value>, RequestError> {
     let response = host_call(
         context,
         "github-settings-pr-links",
         "host.settings.get",
-        json!({ "path": [STATE_NAMESPACE, "pull_requests"] }),
+        json!({ "path": [STATE_NAMESPACE] }),
     )?;
-    match settings_value_from_host_response(&response)? {
-        Value::Null => Ok(Map::new()),
-        Value::Object(stored) => Ok(stored),
-        _ => Err(invalid_state(
+    let mut state = match settings_value_from_host_response(&response)? {
+        Value::Null => return Ok(Map::new()),
+        state if state.get("version").and_then(Value::as_u64) == Some(STATE_VERSION) => state,
+        state => migrate_durable_state(&state)?,
+    };
+    match state.get_mut("pull_requests").map(Value::take) {
+        None | Some(Value::Null) => Ok(Map::new()),
+        Some(Value::Object(stored)) => Ok(stored),
+        Some(_) => Err(invalid_state(
             "GitHub durable state pull_requests must be an object",
         )),
     }
@@ -1513,8 +1506,8 @@ fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<Str
     let reference = match params.get("url").and_then(Value::as_str) {
         Some(_) => target_reference(params, branch),
         None => {
-            let links = read_session_links(context, session_id)?;
-            own_link(&links, repository)
+            let links = read_group_links(context, &[session_id.to_string()])?;
+            own_link(&links[session_id], repository)
                 .map(|link| link.url.clone())
                 .unwrap_or_else(|| branch.clone())
         }
@@ -1942,7 +1935,7 @@ mod tests {
         assert_eq!(callback["method"], "host.settings.get");
         assert_eq!(
             callback["params"],
-            json!({ "path": ["github", "pull_requests"] })
+            json!({ "path": ["github"] })
         );
         input_tx
             .send(
