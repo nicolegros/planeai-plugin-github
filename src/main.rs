@@ -378,33 +378,6 @@ fn handshake(params: &Value) -> Result<Value, String> {
     }))
 }
 
-/// A Unix millisecond time as GitHub writes times, `YYYY-MM-DDTHH:MM:SSZ`, so the two compare as text.
-fn rfc3339_utc(ms: u64) -> String {
-    let seconds = ms / 1000;
-    let (days, time) = ((seconds / 86_400) as i64, seconds % 86_400);
-    // Days to a civil date, after Howard Hinnant's `civil_from_days`.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        time / 3600,
-        time % 3600 / 60,
-        time % 60
-    )
-}
-
 fn unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1455,7 +1428,11 @@ fn create_pull_request(params: &Value, context: &ExecutionContext) -> Result<Val
         head_branch: Some(branch),
         base_branch: Some(base_branch.to_string()),
         updated_at: None,
-        created_at: Some(rfc3339_utc(unix_timestamp_ms())),
+        // The time comes from GitHub, so it compares with GitHub's merge times; without it, the
+        // missing-time rules of task transitions apply.
+        created_at: fetch_pull_request(context, &cwd, &key)
+            .ok()
+            .and_then(|pr| pr.snapshot.created_at),
         merged_at: None,
         refreshed_at: unix_timestamp_ms(),
     };
@@ -1598,6 +1575,11 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
         args.push("--delete-branch");
     }
     gh_output(context, cwd, args)?;
+    // GitHub's merge time compares with its creation times; without it, the missing-time rules
+    // of task transitions apply.
+    let merged_at = fetch_pull_request(context, cwd, &key)
+        .ok()
+        .and_then(|pr| pr.snapshot.merged_at);
     update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
             let merged = links
@@ -1606,7 +1588,7 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
                 .and_then(PullRequestLink::snapshot)
                 .map(|snapshot| PrSnapshot {
                     state: PrState::Merged,
-                    merged_at: Some(rfc3339_utc(unix_timestamp_ms())),
+                    merged_at: merged_at.clone(),
                     refreshed_at: unix_timestamp_ms(),
                     ..snapshot.clone()
                 });
@@ -2206,13 +2188,6 @@ fi
     }
 
     #[test]
-    fn formats_times_as_github_does() {
-        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(951_782_400_000), "2000-02-29T00:00:00Z");
-        assert_eq!(rfc3339_utc(1_793_668_632_983), "2026-11-03T01:17:12Z");
-    }
-
-    #[test]
     fn handshake_identity_matches_manifest() {
         let manifest: Value = serde_json::from_str(include_str!("../planeai-plugin.json")).unwrap();
         let response = handshake(&json!({ "host_api_version": HOST_API_VERSION })).unwrap();
@@ -2328,7 +2303,7 @@ fi
             let gh = directory.script(
                 "gh",
                 &format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{root}/gh-args'\nprintf x >> '{root}/gh-calls'\nif [ -f '{root}/gh-response' ]; then cat '{root}/gh-response'; rm '{root}/gh-response'; else printf '{{\"data\":{{}}}}'; fi\n"
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{root}/gh-args'\nprintf x >> '{root}/gh-calls'\nif [ \"$1\" = api ]; then next=$(ls '{root}'/gh-response-* 2>/dev/null | head -n 1); if [ -n \"$next\" ]; then cat \"$next\"; rm \"$next\"; else printf '{{\"data\":{{}}}}'; fi; elif [ \"$1 $2\" = 'pr create' ]; then cat '{root}/gh-pr-create'; fi\n"
                 ),
             );
             Self {
@@ -2337,8 +2312,24 @@ fi
             }
         }
 
+        /// Queues the answer to the next `gh api graphql` call that has none yet.
         fn respond(&self, body: Value) {
-            fs::write(self.directory.0.join("gh-response"), body.to_string()).unwrap();
+            let queued = fs::read_dir(&self.directory.0)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("gh-response-")
+                })
+                .count();
+            let path = self
+                .directory
+                .0
+                .join(format!("gh-response-{:04}", self.calls() + queued));
+            fs::write(path, body.to_string()).unwrap();
         }
 
         fn calls(&self) -> usize {
@@ -2871,6 +2862,9 @@ fi
             "rebase is disabled for the repository"
         );
         cli.respond(lookup);
+        let mut merged = graphql_pr("o/r", 4, "MERGED", "topic", "main", "SUCCESS");
+        merged["mergedAt"] = json!("2026-10-05T12:00:00Z");
+        cli.respond(json!({ "data": { "r0": { "l0": merged } } }));
         assert_eq!(merge("squash").unwrap(), json!({ "merged": true }));
 
         let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
@@ -2880,22 +2874,21 @@ fi
         );
         assert_eq!(
             args.matches("api\ngraphql\n").count(),
-            2,
-            "one lookup per merge"
+            3,
+            "one lookup per merge attempt, and one for the merge time"
         );
         assert_eq!(args.matches("pr\nmerge\n").count(), 1);
         assert!(
-            args.ends_with("pr\nmerge\nhttps://github.com/o/r/pull/4\n--squash\n--delete-branch\n")
+            args.contains("pr\nmerge\nhttps://github.com/o/r/pull/4\n--squash\n--delete-branch\n")
         );
         assert_eq!(
             host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["state"],
             "merged"
         );
-        assert!(
-            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["merged_at"]
-                .as_str()
-                .is_some_and(|time| time.ends_with('Z')),
-            "the merge time is known before the next refresh"
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["merged_at"],
+            "2026-10-05T12:00:00Z",
+            "GitHub's merge time, not this machine's clock"
         );
     }
 
@@ -3008,8 +3001,42 @@ fi
         .unwrap();
         let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
         assert!(
-            args.ends_with("pr\nmerge\nhttps://github.com/o/r/pull/7\n--squash\n"),
+            args.contains("pr\nmerge\nhttps://github.com/o/r/pull/7\n--squash\napi\n"),
             "{args}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_stores_githubs_creation_time_when_it_can_read_it() {
+        let cli = FakeGithubCli::new();
+        let host = merge_transition_host(&cli, json!([]), "topic");
+        fs::write(
+            cli.directory.0.join("gh-pr-create"),
+            "https://github.com/o/r/pull/7\n",
+        )
+        .unwrap();
+        let create = || {
+            with_host(&cli.runner, &host, |context| {
+                create_pull_request(
+                    &json!({ "session_id": "s1", "title": "Change", "base_branch": "main" }),
+                    context,
+                )
+            })
+        };
+        let mut created = graphql_pr("o/r", 7, "OPEN", "topic", "main", "");
+        created["createdAt"] = json!("2026-10-04T08:00:00Z");
+        cli.respond(json!({ "data": { "r0": { "l0": created } } }));
+        create().unwrap();
+        let stored = || host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0].clone();
+        assert_eq!(stored()["created_at"], "2026-10-04T08:00:00Z");
+
+        host.lock().unwrap().settings["github"]["pull_requests"]["s1"] = json!([]);
+        create().expect("a failed follow-up lookup does not fail the creation");
+        assert_eq!(stored()["number"], 7);
+        assert!(
+            stored().get("created_at").is_none(),
+            "an unknown time stays unknown"
         );
     }
 
@@ -3031,7 +3058,7 @@ fi
         .unwrap();
         let args = fs::read_to_string(cli.directory.0.join("gh-args")).unwrap();
         assert!(
-            args.ends_with("pr\nmerge\nhttps://github.com/x/y/pull/7\n--squash\n"),
+            args.contains("pr\nmerge\nhttps://github.com/x/y/pull/7\n--squash\napi\n"),
             "{args}"
         );
     }
