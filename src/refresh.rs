@@ -843,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_lookups_keep_cached_state_and_an_empty_branch_drops_its_link() {
+    fn unavailable_lookups_keep_cached_state_and_an_empty_branch_keeps_its_pull_request() {
         let pr = fetched(5, PrState::Open, "topic", "main");
         let lists =
             SessionLinks::from([("s1".to_string(), vec![tracked(&pr, TrackedSource::Branch)])]);
@@ -887,7 +887,14 @@ mod tests {
         })
         .unwrap();
         apply(&mut fresh, &groups, &empty);
-        assert!(fresh["s1"].is_empty());
+        assert_eq!(
+            fresh["s1"]
+                .iter()
+                .map(PullRequestLink::source)
+                .collect::<Vec<_>>(),
+            vec![Some(TrackedSource::Manual)],
+            "the pull request stays with the task once the branch no longer resolves to it"
+        );
     }
 
     #[test]

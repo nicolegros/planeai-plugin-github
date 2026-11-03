@@ -2555,7 +2555,7 @@ fi
 
     #[cfg(unix)]
     #[test]
-    fn a_branch_leaving_the_last_open_pull_request_after_a_merge_finishes_the_task() {
+    fn a_branch_moving_away_keeps_its_open_pull_request_and_the_task_open() {
         let cli = FakeGithubCli::new();
         let host = merge_transition_host(
             &cli,
@@ -2577,12 +2577,17 @@ fi
         .unwrap();
         assert_eq!(
             numbers(&result["pull_requests"]),
-            vec![5],
-            "the branch link followed the branch away"
+            vec![4, 5],
+            "the old branch pull request stays with the task"
         );
         assert_eq!(
-            host.lock().unwrap().transitions,
-            vec![("s1".to_string(), "done".to_string())]
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][0]["source"],
+            "manual",
+            "and can be unlinked now that the branch no longer follows it"
+        );
+        assert!(
+            host.lock().unwrap().transitions.is_empty(),
+            "the pull request is still open on GitHub"
         );
     }
 

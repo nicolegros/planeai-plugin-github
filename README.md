@@ -34,6 +34,7 @@ Discovery is bounded to eight stack links per task, and dismissed stack links co
 Sessions linked to the same task in the same project share their pull requests, so every session of a task shows the union of their links.
 **Unlink** and **Dismiss** remove a link from every session of the task and leave a tombstone, so stack discovery never adds it back; linking it again revives it.
 Branch links follow the branch and cannot be unlinked.
+When the session's branch resolves to another pull request or to none, the previous branch pull request stays with the task as a **Linked** pull request with its last known state, so it can be unlinked.
 
 ## Sidebar pill and titlebar
 

@@ -380,15 +380,22 @@ fn position(links: &[PullRequestLink], key: &PrKey) -> Option<usize> {
     links.iter().position(|link| &link.key == key)
 }
 
-/// Replaces the session's branch link with the pull request its branch resolves to now, if any.
+/// Makes the pull request the session's branch resolves to now, if any, its branch link.
+/// A previous branch pull request is still the task's, so it stays as a link the user can unlink.
 pub fn record_branch_pr(
     links: &mut Vec<PullRequestLink>,
     detected: Option<(&PrKey, &str, &PrSnapshot)>,
 ) {
-    links.retain(|link| {
-        link.source() != Some(TrackedSource::Branch)
-            || detected.is_some_and(|(key, ..)| *key == link.key)
-    });
+    for link in links.iter_mut() {
+        if detected.is_some_and(|(key, ..)| *key == link.key) {
+            continue;
+        }
+        if let LinkStatus::Tracked { source, .. } = &mut link.status {
+            if *source == TrackedSource::Branch {
+                *source = TrackedSource::Manual;
+            }
+        }
+    }
     let Some((key, url, snapshot)) = detected else {
         return;
     };
@@ -770,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_detection_replaces_only_the_branch_link() {
+    fn branch_detection_moves_only_the_branch_role() {
         let mut links = vec![
             link(1, TrackedSource::Branch, PrState::Closed),
             link(2, TrackedSource::Manual, PrState::Open),
@@ -780,16 +787,50 @@ mod tests {
             &mut links,
             Some((&key(3), "https://github.com/o/r/pull/3", &fresh)),
         );
+        let sources = |links: &[PullRequestLink]| {
+            links
+                .iter()
+                .map(|l| (l.key.number, l.source().unwrap()))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            links.iter().map(|l| l.key.number).collect::<Vec<_>>(),
-            vec![2, 3]
+            sources(&links),
+            vec![
+                (1, TrackedSource::Manual),
+                (2, TrackedSource::Manual),
+                (3, TrackedSource::Branch)
+            ]
+        );
+        assert_eq!(links[1].snapshot().unwrap().state, PrState::Open);
+    }
+
+    #[test]
+    fn a_branch_moving_away_keeps_its_old_pull_request_as_a_removable_link() {
+        let old = link(1, TrackedSource::Branch, PrState::Open);
+        let old_snapshot = old.snapshot().unwrap().clone();
+        let fresh = snapshot(PrState::Open, 5);
+        let mut links = vec![old];
+        record_branch_pr(
+            &mut links,
+            Some((&key(2), "https://github.com/o/r/pull/2", &fresh)),
+        );
+        assert_eq!(links[0].key, key(1));
+        assert_eq!(links[0].source(), Some(TrackedSource::Manual));
+        assert_eq!(
+            links[0].snapshot(),
+            Some(&old_snapshot),
+            "its last snapshot stays"
         );
         assert_eq!(links[1].source(), Some(TrackedSource::Branch));
 
         record_branch_pr(&mut links, None);
         assert_eq!(
-            links.iter().map(|l| l.key.number).collect::<Vec<_>>(),
-            vec![2]
+            links
+                .iter()
+                .map(|l| (l.key.number, l.source().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![(1, TrackedSource::Manual), (2, TrackedSource::Manual)],
+            "a branch without a pull request keeps the one it had"
         );
     }
 
