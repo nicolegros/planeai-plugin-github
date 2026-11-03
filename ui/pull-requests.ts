@@ -18,6 +18,44 @@ export type PullRequest = {
   updated_at?: string | null;
 };
 
+/** One check of a pull request, in the `gh pr view --json statusCheckRollup` item shape. */
+export type CheckItem = {
+  name?: string | null;
+  workflowName?: string | null;
+  conclusion?: string | null;
+  status?: string | null;
+  detailsUrl?: string | null;
+};
+
+/** The checks and mergeability `github.status` returns for each of the task's pull requests. */
+export type PullRequestDetail = {
+  url: string;
+  number: number;
+  repository: string;
+  title?: string | null;
+  state: PullRequestState;
+  checks: CheckItem[];
+  conflicting: boolean;
+  merge_blocked: boolean;
+  merge_methods: string[];
+  review_decision?: string | null;
+};
+
+export type GithubStatus =
+  | { applicable: false; reason?: string }
+  | {
+      applicable: true;
+      remote: string;
+      repository: string;
+      branch: string;
+      pull_requests: PullRequest[];
+      /** The session's own pull request, which the panel highlights first. */
+      own_url: string | null;
+      details: PullRequestDetail[];
+      /** Whether this refresh changed the stored pull requests. */
+      changed: boolean;
+    };
+
 export type PullRequestSummary = {
   current: PullRequest;
   /** Pull requests besides the current one. */
@@ -133,4 +171,25 @@ export function moveSelection(prs: readonly PullRequest[], selectedUrl: string |
   if (!order.length) return null;
   const index = Math.max(0, order.findIndex((pr) => pr.url === selectedUrl));
   return order[Math.min(order.length - 1, Math.max(0, index + delta))];
+}
+
+/**
+ * Whether the session's branch already has an open pull request, so Create PR has nothing to do.
+ * Branch detection keeps a created pull request's source, so one created from this branch counts too.
+ */
+export function branchHasPullRequest(prs: readonly PullRequest[], branch: string | null | undefined): boolean {
+  return prs.some((pr) => isLive(pr) && (pr.source === "branch" || (pr.source === "created" && !!branch && pr.head_branch === branch)));
+}
+
+/** The panel footer's shortcut hints, in display order. */
+export function panelHints({ prs, selected, mergeable, branch }: { prs: readonly PullRequest[]; selected: PullRequest | null; mergeable: boolean; branch: string | null | undefined }): [string, string][] {
+  const hints: [string, string][] = [];
+  if (prs.length > 1) hints.push(["↑↓", "select"]);
+  if (selected) hints.push(["O", "open"]);
+  if (selected && selected.source !== "branch") hints.push(["U", selected.source === "stack" ? "dismiss" : "unlink"]);
+  if (mergeable) hints.push(["S", "strategy"]);
+  hints.push(["R", "refresh"]);
+  if (!branchHasPullRequest(prs, branch)) hints.push(["C", "create"]);
+  hints.push(["L", "link"]);
+  return hints;
 }

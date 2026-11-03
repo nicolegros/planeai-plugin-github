@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  branchHasPullRequest,
   currentPullRequest,
   displayOrder,
   foreignRepository,
   moveSelection,
+  panelHints,
   resolveSelection,
   stackOrder,
   summarize,
@@ -116,4 +118,25 @@ test("moving the highlight follows display order and stops at the ends", () => {
   assert.equal(from(order[0], -1), order[0], "the first row stays put going up");
   assert.equal(from(order[2], 1), order[2], "the last row stays put going down");
   assert.equal(moveSelection([], null, 1), null);
+});
+
+test("only a live pull request detected from the branch counts as the branch's", () => {
+  assert.equal(branchHasPullRequest([pr(1, { source: "branch" })], "topic"), true);
+  assert.equal(branchHasPullRequest([pr(1, { source: "branch", state: "draft" })], "topic"), true);
+  assert.equal(branchHasPullRequest([pr(1, { source: "branch", state: "merged" })], "topic"), false, "a merged branch pull request leaves room for a new one");
+  assert.equal(branchHasPullRequest([pr(1, { source: "manual", head_branch: "topic" })], "topic"), false, "a linked pull request on the same head is not the branch's");
+  assert.equal(branchHasPullRequest([pr(1, { source: "created", head_branch: "topic" })], "topic"), true, "branch detection keeps a created pull request's source");
+  assert.equal(branchHasPullRequest([pr(1, { source: "created", head_branch: "old" })], "topic"), false, "the session moved to another branch");
+  assert.equal(branchHasPullRequest([], "topic"), false);
+});
+
+test("the footer hints the shortcuts that act on the panel right now", () => {
+  const keys = (hints: [string, string][]) => hints.map(([key, label]) => `${key} ${label}`);
+  assert.deepEqual(keys(panelHints({ prs: [], selected: null, mergeable: false, branch: "topic" })), ["R refresh", "C create", "L link"]);
+  const branch = pr(1, { source: "branch" });
+  assert.deepEqual(keys(panelHints({ prs: [branch], selected: branch, mergeable: true, branch: "topic" })), ["O open", "S strategy", "R refresh", "L link"], "a branch pull request is neither unlinked nor created again");
+  const stacked = pr(2, { source: "stack" });
+  assert.deepEqual(keys(panelHints({ prs: [branch, stacked], selected: stacked, mergeable: false, branch: "topic" })), ["↑↓ select", "O open", "U dismiss", "R refresh", "L link"]);
+  const linked = pr(3);
+  assert.deepEqual(keys(panelHints({ prs: [linked], selected: linked, mergeable: false, branch: "topic" })), ["O open", "U unlink", "R refresh", "C create", "L link"]);
 });

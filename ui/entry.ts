@@ -2,15 +2,20 @@ import {
   CHECK_LABELS,
   SOURCE_LABELS,
   STATE_LABELS,
+  branchHasPullRequest,
   checkTone,
   currentPullRequest,
   displayOrder,
   foreignRepository,
   isLive,
   moveSelection,
+  panelHints,
   resolveSelection,
   stateTone,
+  type CheckItem,
+  type GithubStatus,
   type PullRequest,
+  type PullRequestDetail,
 } from "./pull-requests.js";
 
 type GithubPluginContext = {
@@ -32,7 +37,7 @@ type GithubPluginEntrypoint = {
 const githubEntrypoint: GithubPluginEntrypoint = {
   mount(root, context) {
     const sourceSessionId = context.session?.id;
-    let snapshot = null;
+    let snapshot: GithubStatus | null = null;
     let defaults = null;
     let creating = false;
     let linking = false;
@@ -68,9 +73,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         .refresh:hover:not(:disabled) { background:transparent; color:var(--planeai-text-muted); }
         .passed { margin-left:var(--planeai-space-2); color:var(--tone); font:10px var(--planeai-font-mono); }
         .pr-list { display:grid; margin:0 calc(-1 * var(--planeai-space-2)); }
-        .pr-row { display:grid; grid-template-columns:8px 42px minmax(0, 1fr) 12px 52px 92px; align-items:center; column-gap:var(--planeai-space-2); min-height:32px; padding:4px var(--planeai-space-2); border-radius:6px; }
+        .pr-row { display:grid; grid-template-columns:8px 42px minmax(0, 1fr) 12px 52px 92px; align-items:center; column-gap:var(--planeai-space-2); min-height:32px; padding:4px var(--planeai-space-2); border-radius:6px; cursor:default; }
         .pr-list:focus { outline:none; }
-        .pr-row { cursor:default; }
         .pr-row:hover { background:var(--planeai-accent-subtle); }
         .pr-row[aria-selected="true"] { background:color-mix(in srgb, var(--planeai-accent) 9%, transparent); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--planeai-accent) 22%, transparent); }
         .pr-list:focus-visible .pr-row[aria-selected="true"] { box-shadow:inset 0 0 0 2px var(--planeai-accent); }
@@ -125,24 +129,20 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     const call = (method, params = {}) => context.host.call(method, { session_id: sourceSessionId, ...params });
     const editableTarget = (target) => target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']");
     // Refreshes every sidebar pill; the host also remounts this panel.
-    const dataChanged = () => { void context.host.data.changed?.(); };
+    const dataChanged = () => context.host.data.changed?.();
 
-    const stateName = (pr) => pr?.state || "open";
-    const isMerged = (pr) => stateName(pr) === "merged";
-    const isDraft = (pr) => stateName(pr) === "draft";
-    const canMerge = (pr) => !busy && !pr.conflicting && !pr.merge_blocked && stateName(pr) === "open";
-    const classifyCheck = (check) => {
+    const canMerge = (pr: PullRequestDetail) => !busy && !pr.conflicting && !pr.merge_blocked && pr.state === "open";
+    const classifyCheck = (check: CheckItem) => {
       const value = String(check.conclusion || check.status || "").toUpperCase();
       if (["SUCCESS", "PASSED", "PASS", "NEUTRAL", "SKIPPED"].includes(value)) return "pass";
       if (["FAILURE", "FAILED", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"].includes(value)) return "fail";
       return "pending";
     };
-    const pullRequests = (): PullRequest[] => (Array.isArray(snapshot?.pull_requests) ? snapshot.pull_requests : []);
-    const details = () => (Array.isArray(snapshot?.details) ? snapshot.details : []);
-    const selection = () => resolveSelection(pullRequests(), selectedUrl, snapshot?.own_url ?? null);
+    const status = () => (snapshot?.applicable ? snapshot : null);
+    const pullRequests = (): PullRequest[] => status()?.pull_requests ?? [];
+    const details = (): PullRequestDetail[] => status()?.details ?? [];
+    const selection = () => resolveSelection(pullRequests(), selectedUrl, status()?.own_url ?? null);
     const detailOf = (pr: PullRequest | null) => (pr ? details().find((detail) => detail.url === pr.url) ?? null : null);
-    const branchHasPullRequest = () =>
-      pullRequests().some((pr) => isLive(pr) && pr.head_branch === snapshot?.branch && !foreignRepository(pr, snapshot?.repository));
 
     function button(label, handler, { disabled = false, shortcut = null, className = "" } = {}) {
       const element = document.createElement("button");
@@ -166,7 +166,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         await action();
         busy = false;
         if (success) context.host.data.notify(success, "success");
-        dataChanged();
+        void dataChanged();
         await load();
       } catch (error) { busy = false; render(String(error)); }
     }
@@ -304,7 +304,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const text = document.createElement("span"); text.className = "pr-text";
       const title = document.createElement("span"); title.className = "pr-title"; title.textContent = pr.title || pr.url; title.title = pr.title || pr.url;
       text.append(title);
-      const repository = foreignRepository(pr, snapshot?.repository);
+      const repository = foreignRepository(pr, status()?.repository);
       if (repository) { const repo = document.createElement("span"); repo.className = "pr-repo"; repo.textContent = repository; repo.title = repository; text.append(repo); }
       const ci = document.createElement("span"); ci.className = "pr-ci";
       const ciTone = isLive(pr) ? checkTone(pr.checks) : null;
@@ -355,7 +355,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     function appendActions() {
       const section = document.createElement("section"); section.className = "section";
       const actions = document.createElement("div"); actions.className = "form-actions";
-      if (!branchHasPullRequest()) {
+      if (!branchHasPullRequest(pullRequests(), status()?.branch)) {
         actions.append(button("Create PR", async () => { try { defaults = await call("github.defaults"); creating = true; render(); } catch (loadError) { render(String(loadError)); } }, { shortcut: "c" }));
       }
       actions.append(button("Link pull request", () => { linking = true; render(); }, { shortcut: "l" }));
@@ -363,8 +363,8 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       content.append(section);
     }
 
-    function appendChecks(pr) {
-      const checks = Array.isArray(pr.checks) ? pr.checks : [];
+    function appendChecks(pr: PullRequestDetail) {
+      const checks = pr.checks;
       if (!checks.length) return;
       const section = document.createElement("section"); section.className = "section";
       const heading = document.createElement("div"); heading.className = "checks-heading";
@@ -416,7 +416,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       return true;
     }
 
-    async function mergeSelected(pr) {
+    async function mergeSelected(pr: PullRequestDetail) {
       if (!canMerge(pr)) return;
       await mutate(() => call("github.merge", { strategy: selectedStrategy, url: pr.url }));
     }
@@ -431,22 +431,22 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     }
 
     /** Checks, merge, and CI hand-off for the highlighted pull request. */
-    function appendDetail(pr) {
-      const checks = Array.isArray(pr.checks) ? pr.checks : [];
-      const failed = checks.some((check) => classifyCheck(check) === "fail");
+    function appendDetail(pr: PullRequestDetail) {
+      const failed = pr.checks.some((check) => classifyCheck(check) === "fail");
+      const merged = pr.state === "merged";
       appendChecks(pr);
-      if (pr.conflicting && !isMerged(pr)) appendWarning("", `⚠ #${pr.number} has merge conflicts`, "Resolve conflicts on GitHub or rebase locally before merging.");
-      if (pr.merge_blocked && !isMerged(pr)) appendWarning("error", "⚠ Merge blocked", "Merge is blocked by repository rules, reviews, or checks.");
+      if (pr.conflicting && !merged) appendWarning("", `⚠ #${pr.number} has merge conflicts`, "Resolve conflicts on GitHub or rebase locally before merging.");
+      if (pr.merge_blocked && !merged) appendWarning("error", "⚠ Merge blocked", "Merge is blocked by repository rules, reviews, or checks.");
 
-      if (isDraft(pr)) {
+      if (pr.state === "draft") {
         const section = document.createElement("section"); section.className = "section";
         section.append(button(`Mark #${pr.number} as ready`, () => { void mutate(() => call("github.markReady", { url: pr.url })); }, { shortcut: "shift+r", className: "draft" }));
         content.append(section);
       }
 
-      const mergeMethods = Array.isArray(pr.merge_methods) ? pr.merge_methods.filter((method) => ["squash", "merge", "rebase"].includes(method)) : [];
+      const mergeMethods = pr.merge_methods.filter((method) => ["squash", "merge", "rebase"].includes(method));
       if (!mergeMethods.includes(selectedStrategy)) selectedStrategy = mergeMethods[0] || "squash";
-      if (stateName(pr) === "open" && mergeMethods.length) {
+      if (pr.state === "open" && mergeMethods.length) {
         const section = document.createElement("section"); section.className = "section";
         const label = document.createElement("div"); label.className = "section-title"; label.textContent = "Merge";
         const strategies = document.createElement("div"); strategies.className = "strategies";
@@ -462,7 +462,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         section.append(label, strategies, merge, help); content.append(section);
       }
 
-      if (failed && !isMerged(pr)) {
+      if (failed && !merged) {
         const section = document.createElement("section"); section.className = "section";
         section.append(button("Send failures to agent", async () => { busy = true; render(); try { const recipient = await context.host.recipient.getFocusedAgentSession(); if (!recipient) throw new Error("Focus an agent session before sending CI failures."); await call("github.sendFailureLogs", { recipient_session_id: recipient.id, url: pr.url }); context.host.data.notify("CI failures sent to agent", "success"); } catch (error) { busy = false; render(String(error)); return; } busy = false; render(); }, { shortcut: "f", className: "failure" }));
         content.append(section);
@@ -480,20 +480,14 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       if (detail) appendDetail(detail);
       appendActions();
       if (error) appendStatus("GitHub could not complete that action.", error);
-      const hints = [["R", "refresh"], ["L", "link"]];
-      if (!branchHasPullRequest()) hints.splice(1, 0, ["C", "create"]);
-      if (content.querySelector("button[data-merge-strategy]")) hints.unshift(["S", "strategy"]);
-      if (selected && selected.source !== "branch") hints.unshift(["U", selected.source === "stack" ? "dismiss" : "unlink"]);
-      if (selected) hints.unshift(["O", "open"]);
-      if (prs.length > 1) hints.unshift(["↑↓", "select"]);
-      appendFooter(hints);
+      appendFooter(panelHints({ prs, selected, mergeable: content.querySelector("button[data-merge-strategy]") !== null, branch: status()?.branch }));
     }
 
     function render(error = "") {
       content.replaceChildren();
       if (!sourceSessionId) { renderSetup("Select a PlaneAI session before opening this panel."); return; }
       if (!snapshot) { appendHeader(null); appendStatus("Refreshing GitHub status…", error); return; }
-      if (!snapshot.applicable) { renderSetup(snapshot.reason || "GitHub is not applicable to this session."); return; }
+      if (!snapshot.applicable) { renderSetup(("reason" in snapshot && snapshot.reason) || "GitHub is not applicable to this session."); return; }
       if (creating) { renderCreate(); if (error) appendStatus("The pull request could not be created.", error); return; }
       if (linking) { renderLink(); if (error) appendStatus("The pull request could not be linked.", error); return; }
       renderPullRequests(error);
@@ -526,7 +520,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
         return;
       }
       const delta = SELECTION_KEYS[event.key];
-      if (delta && !event.shiftKey && snapshot?.applicable && !creating && !linking) {
+      if (delta && !event.shiftKey && status() && !creating && !linking) {
         select(moveSelection(pullRequests(), selectedUrl, delta)?.url ?? null);
         event.preventDefault();
         event.stopPropagation();
@@ -543,10 +537,11 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const previous = snapshot;
       snapshot = null; render();
       try {
-        snapshot = await call("github.status");
+        const next: GithubStatus = await call("github.status");
         if (disposed) return;
+        snapshot = next;
         render();
-        if (snapshot.changed) dataChanged();
+        if (next.applicable && next.changed) void dataChanged();
       } catch (error) {
         snapshot = previous?.applicable ? previous : null;
         render(String(error));
