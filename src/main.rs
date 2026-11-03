@@ -2121,6 +2121,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::mpsc::Receiver;
+
+    /// Only bounds a hung test; fake subprocesses can take seconds when the suite runs in parallel.
+    const TEST_WAIT: Duration = Duration::from_secs(10);
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2343,7 +2346,7 @@ fi
             params,
             response,
             ..
-        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        } = events_rx.recv_timeout(TEST_WAIT).unwrap()
         else {
             panic!("expected repository-context callback");
         };
@@ -2360,7 +2363,7 @@ fi
             params,
             response,
             ..
-        } = events_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        } = events_rx.recv_timeout(TEST_WAIT).unwrap()
         else {
             panic!("expected session-prompt callback");
         };
@@ -3015,14 +3018,14 @@ fi
     #[cfg(unix)]
     fn receive_frame(receiver: &Receiver<String>) -> Value {
         let line = receiver
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(TEST_WAIT)
             .expect("expected JSON-RPC frame");
         serde_json::from_str(&line).unwrap()
     }
 
     #[cfg(unix)]
     fn wait_for_file(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + TEST_WAIT;
         while !path.exists() {
             assert!(Instant::now() < deadline, "fake gh did not start");
             thread::sleep(Duration::from_millis(10));
