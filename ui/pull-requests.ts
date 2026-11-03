@@ -18,27 +18,22 @@ export type PullRequest = {
   updated_at?: string | null;
 };
 
-/** One check of a pull request, in the `gh pr view --json statusCheckRollup` item shape. */
+/** One check of a pull request, classified by the plugin backend. */
 export type CheckItem = {
-  name?: string | null;
-  workflowName?: string | null;
-  conclusion?: string | null;
-  status?: string | null;
-  detailsUrl?: string | null;
+  name: string | null;
+  workflowName: string | null;
+  result: "pass" | "fail" | "pending";
 };
 
 /** The checks and mergeability `github.status` returns for each of the task's pull requests. */
 export type PullRequestDetail = {
   url: string;
   number: number;
-  repository: string;
-  title?: string | null;
   state: PullRequestState;
   checks: CheckItem[];
   conflicting: boolean;
   merge_blocked: boolean;
   merge_methods: string[];
-  review_decision?: string | null;
 };
 
 export type GithubStatus =

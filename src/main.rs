@@ -8,7 +8,9 @@ use durable_state::{
     migrate_durable_state, reconciliation_from_settings_value, validate_task_transitions,
     STATE_NAMESPACE, STATE_VERSION,
 };
-use github_graphql::{project_detail, FetchedPr, GraphqlResponse, Lookup, LookupRequest};
+use github_graphql::{
+    project_detail, CheckResult, FetchedPr, GraphqlResponse, Lookup, LookupRequest,
+};
 use pull_requests::{
     aggregate, dismiss, own_link, parse_session_links, parse_sessions, record_created,
     record_manual, refresh_snapshot, session_links_value, task_group, task_transition,
@@ -1452,6 +1454,47 @@ fn required_github_session(
         .ok_or_else(|| invalid_state("The origin remote is not github.com."))
 }
 
+/// The targeted pull request with its checks and mergeability, and its repository's merge methods.
+fn fetch_target_detail(
+    context: &ExecutionContext,
+    session: &GithubSession,
+    target: ActionTarget,
+) -> Result<(FetchedPr, Vec<String>), RequestError> {
+    let request = match target {
+        ActionTarget::PullRequest { key, .. } => LookupRequest::new(
+            &key.repository,
+            Lookup::Number {
+                number: key.number,
+                detail: true,
+            },
+        ),
+        ActionTarget::Branch(branch) => LookupRequest::new(
+            &session.repository,
+            Lookup::Head {
+                branch,
+                detail: true,
+            },
+        ),
+    };
+    let mut response = fetch_graphql(context, &session.cwd, std::slice::from_ref(&request))?;
+    let prs = response
+        .lookups
+        .remove(&request)
+        .flatten()
+        .unwrap_or_default();
+    let pr = match &request.lookup {
+        Lookup::Head { branch, .. } => refresh::branch_pull_request(&prs, branch),
+        _ => prs.first(),
+    }
+    .cloned()
+    .ok_or_else(|| invalid_state("GitHub could not find the pull request"))?;
+    let methods = response
+        .merge_methods
+        .remove(&request.repository)
+        .unwrap_or_default();
+    Ok((pr, methods))
+}
+
 fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
     let strategy = params
@@ -1470,40 +1513,10 @@ fn merge_pull_request(params: &Value, context: &ExecutionContext) -> Result<Valu
     };
     let session = required_github_session(params, context)?;
     let cwd = session.cwd.as_str();
-    // The repository's merge methods come with the pull request's detail lookup.
-    let request = match action_target(params, context, &session)? {
-        ActionTarget::PullRequest { key, .. } => LookupRequest::new(
-            &key.repository,
-            Lookup::Number {
-                number: key.number,
-                detail: true,
-            },
-        ),
-        ActionTarget::Branch(branch) => LookupRequest::new(
-            &session.repository,
-            Lookup::Head {
-                branch,
-                detail: true,
-            },
-        ),
-    };
-    let mut response = fetch_graphql(context, cwd, std::slice::from_ref(&request))?;
-    let prs = response
-        .lookups
-        .remove(&request)
-        .flatten()
-        .unwrap_or_default();
-    let pr = match &request.lookup {
-        Lookup::Head { branch, .. } => refresh::branch_pull_request(&prs, branch),
-        _ => prs.first(),
-    }
-    .ok_or_else(|| invalid_state("GitHub could not find the pull request to merge"))?;
-    let (key, url) = (pr.key.clone(), pr.url.clone());
-    if !response
-        .merge_methods
-        .get(&request.repository)
-        .is_some_and(|methods| methods.iter().any(|method| method == strategy))
-    {
+    let target = action_target(params, context, &session)?;
+    let (pr, methods) = fetch_target_detail(context, &session, target)?;
+    let (key, url) = (pr.key, pr.url);
+    if !methods.iter().any(|method| method == strategy) {
         return Err(invalid_state(format!(
             "{strategy} merge is disabled for this GitHub repository"
         )));
@@ -1544,41 +1557,19 @@ fn mark_ready(params: &Value, context: &ExecutionContext) -> Result<Value, Reque
 
 fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<String, RequestError> {
     let session = required_github_session(params, context)?;
-    let GithubSession {
-        cwd,
-        repository,
-        branch,
-        ..
-    } = &session;
-    let action = action_target(params, context, &session)?;
-    let reference = action.reference().to_string();
+    let target = action_target(params, context, &session)?;
+    let (pr, _) = fetch_target_detail(context, &session, target)?;
     // A linked pull request can live in another repository than the session's checkout.
-    let target = match action {
-        ActionTarget::PullRequest { key, .. } => Some(key),
-        ActionTarget::Branch(_) => None,
-    };
-    let run_repository = target.as_ref().map_or(repository, |key| &key.repository);
-    let raw = gh_output(
-        context,
-        cwd,
-        ["pr", "view", &reference, "--json", "statusCheckRollup"],
-    )?;
-    let status: Value = serde_json::from_str(&raw)
-        .map_err(|error| invalid_state(format!("failed to parse CI status: {error}")))?;
-    let run_id = status
-        .get("statusCheckRollup")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|check| {
-            check
-                .get("conclusion")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value.eq_ignore_ascii_case("failure"))
-        })
-        .filter_map(|check| check.get("detailsUrl").and_then(Value::as_str))
+    let run_repository = &pr.key.repository;
+    let run_id = pr
+        .detail
+        .iter()
+        .flat_map(|detail| &detail.checks)
+        .filter(|check| check.result == CheckResult::Fail)
+        .filter_map(|check| check.details_url.as_deref())
         .find_map(|url| action_run_id(url, run_repository))
         .ok_or_else(|| invalid_state("no failed GitHub Actions run found"))?;
+    let cwd = &session.cwd;
     let logs = gh_output(
         context,
         cwd,
@@ -1593,10 +1584,7 @@ fn failure_log_message(params: &Value, context: &ExecutionContext) -> Result<Str
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
-    let subject = match &target {
-        Some(key) => format!("{}#{}", key.repository, key.number),
-        None => format!("branch `{branch}`"),
-    };
+    let subject = format!("{}#{}", pr.key.repository, pr.key.number);
     Ok(format!(
         "CI failed on {subject}. Here are the failure logs:\n\n{tail}"
     ))
@@ -2005,18 +1993,30 @@ mod tests {
     fn sends_failure_logs_to_the_currently_focused_agent_through_host_callback() {
         let directory = TestDirectory::new();
         let gh_args = directory.0.join("gh-args");
+        let failed = |url: &str| json!({ "__typename": "CheckRun", "name": "fmt", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": url });
+        let mut pr = graphql_pr("o/r", 456, "OPEN", "topic", "main", "");
+        pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = json!({ "state": "FAILURE", "contexts": { "nodes": [
+            failed("https://github.com/x/y/actions/runs/999/job/1"),
+            failed("https://github.com/o/r/actions/runs/123/job/45"),
+        ] } });
+        fs::write(
+            directory.0.join("graphql.json"),
+            json!({ "data": { "r0": { "l0": pr } } }).to_string(),
+        )
+        .unwrap();
         let gh = directory.script(
             "gh",
             &format!(
                 r#"#!/bin/sh
-printf '%s\n' "$@" >> '{}'
-if [ "$1" = "pr" ]; then
-  printf '%s\n' '{{"statusCheckRollup":[{{"conclusion":"FAILURE","detailsUrl":"https://github.com/x/y/actions/runs/999/job/1"}},{{"conclusion":"FAILURE","detailsUrl":"https://github.com/o/r/actions/runs/123/job/45"}}]}}'
+printf '%s\n' "$@" >> '{args}'
+if [ "$1" = "api" ]; then
+  cat '{root}/graphql.json'
 else
   printf 'checkRun cargo fmt --check\nDiff in src-tauri/src/plugins.rs\n'
 fi
 "#,
-                gh_args.display()
+                args = gh_args.display(),
+                root = directory.path(),
             ),
         );
         let git = directory.script("git", "#!/bin/sh\nprintf 'https://github.com/o/r.git\\n'\n");
@@ -2070,9 +2070,13 @@ fi
             panic!("expected session-prompt callback");
         };
         assert_eq!(method, "host.sessions.prompt");
-        assert_eq!(
-            fs::read_to_string(&gh_args).unwrap(),
-            "pr\nview\nhttps://github.com/o/r/pull/456\n--json\nstatusCheckRollup\nrun\nview\n123\n--log-failed\n-R\no/r\n",
+        let args = fs::read_to_string(&gh_args).unwrap();
+        assert!(
+            args.starts_with("api\ngraphql\n"),
+            "the checks come from one detail lookup"
+        );
+        assert!(
+            args.ends_with("run\nview\n123\n--log-failed\n-R\no/r\n"),
             "the run is read from the pull request's repository, which can differ from the checkout, and a run elsewhere is ignored"
         );
         assert!(params["text"]

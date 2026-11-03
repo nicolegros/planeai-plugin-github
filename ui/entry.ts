@@ -12,7 +12,6 @@ import {
   panelHints,
   resolveSelection,
   stateTone,
-  type CheckItem,
   type GithubStatus,
   type PullRequest,
   type PullRequestDetail,
@@ -134,12 +133,6 @@ const githubEntrypoint: GithubPluginEntrypoint = {
     const dataChanged = () => context.host.data.changed?.();
 
     const canMerge = (pr: PullRequestDetail) => !busy && !pr.conflicting && !pr.merge_blocked && pr.state === "open";
-    const classifyCheck = (check: CheckItem) => {
-      const value = String(check.conclusion || check.status || "").toUpperCase();
-      if (["SUCCESS", "PASSED", "PASS", "NEUTRAL", "SKIPPED"].includes(value)) return "pass";
-      if (["FAILURE", "FAILED", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"].includes(value)) return "fail";
-      return "pending";
-    };
     const status = () => (snapshot?.applicable ? snapshot : null);
     const pullRequests = (): PullRequest[] => status()?.pull_requests ?? [];
     const details = (): PullRequestDetail[] => status()?.details ?? [];
@@ -374,14 +367,14 @@ const githubEntrypoint: GithubPluginEntrypoint = {
       const label = document.createElement("span"); label.className = "section-title"; label.textContent = `Checks · #${pr.number}`;
       heading.append(label);
       for (const [result, word, tone] of [["fail", "failed", "danger"], ["pending", "pending", "warning"], ["pass", "passed", "success"]]) {
-        const count = checks.filter((check) => classifyCheck(check) === result).length;
+        const count = checks.filter((check) => check.result === result).length;
         if (!count) continue;
         const summary = document.createElement("span"); summary.className = "passed"; summary.dataset.tone = tone; summary.textContent = `${count} ${word}`;
         heading.append(summary);
       }
       const list = document.createElement("div"); list.className = "check-list";
       for (const [index, check] of checks.entries()) {
-        const result = classifyCheck(check);
+        const result = check.result;
         const row = document.createElement("div"); row.className = "check";
         const number = document.createElement("span"); number.className = "index"; number.textContent = String(index + 1);
         const icon = document.createElement("span"); icon.className = `icon ${result}`; icon.textContent = result === "pass" ? "✓" : result === "fail" ? "✗" : "◌";
@@ -435,7 +428,7 @@ const githubEntrypoint: GithubPluginEntrypoint = {
 
     /** Checks, merge, and CI hand-off for the highlighted pull request. */
     function appendDetail(pr: PullRequestDetail) {
-      const failed = pr.checks.some((check) => classifyCheck(check) === "fail");
+      const failed = pr.checks.some((check) => check.result === "fail");
       const merged = pr.state === "merged";
       appendChecks(pr);
       if (pr.conflicting && !merged) appendWarning("", `⚠ #${pr.number} has merge conflicts`, "Resolve conflicts on GitHub or rebase locally before merging.");

@@ -1,6 +1,7 @@
 //! One batched GitHub GraphQL query for every pull request lookup a refresh needs.
 
 use crate::pull_requests::{CheckState, PrKey, PrSnapshot, PrState};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -43,12 +44,39 @@ impl LookupRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckResult {
+    Pass,
+    Fail,
+    Pending,
+}
+
+impl CheckResult {
+    /// A check's conclusion when it finished, else its status.
+    fn classify(outcome: &str) -> Self {
+        match outcome.to_ascii_uppercase().as_str() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => Self::Pass,
+            "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ERROR" | "ACTION_REQUIRED"
+            | "STARTUP_FAILURE" | "STALE" => Self::Fail,
+            _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckItem {
+    pub name: Option<String>,
+    pub workflow_name: Option<String>,
+    pub result: CheckResult,
+    pub details_url: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrDetail {
-    pub checks: Vec<Value>,
+    pub checks: Vec<CheckItem>,
     pub conflicting: bool,
     pub merge_blocked: bool,
-    pub review_decision: Value,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,17 +91,19 @@ pub struct FetchedPr {
 /// The panel's view of a pull request fetched with details.
 pub fn project_detail(pr: &FetchedPr, merge_methods: Vec<String>) -> Value {
     let detail = pr.detail.as_ref();
+    let checks: Vec<Value> = detail
+        .into_iter()
+        .flat_map(|detail| &detail.checks)
+        .map(|check| json!({ "name": check.name, "workflowName": check.workflow_name, "result": check.result }))
+        .collect();
     json!({
         "url": pr.url,
         "number": pr.key.number,
-        "repository": pr.key.repository,
-        "title": pr.snapshot.title,
         "state": pr.snapshot.state,
-        "checks": detail.map_or_else(Vec::new, |detail| detail.checks.clone()),
+        "checks": checks,
         "conflicting": detail.is_some_and(|detail| detail.conflicting),
         "merge_blocked": detail.is_some_and(|detail| detail.merge_blocked),
         "merge_methods": merge_methods,
-        "review_decision": detail.map_or(Value::Null, |detail| detail.review_decision.clone()),
     })
 }
 
@@ -87,7 +117,7 @@ pub struct GraphqlResponse {
 }
 
 const PR_FIELDS: &str = "number url title state isDraft updatedAt headRefName baseRefName isCrossRepository commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
-const PR_DETAIL_FIELDS: &str = "number url title state isDraft updatedAt headRefName baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } }";
+const PR_DETAIL_FIELDS: &str = "number url title state isDraft updatedAt headRefName baseRefName isCrossRepository mergeable mergeStateStatus commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { workflow { name } } } } ... on StatusContext { context state targetUrl } } } } } } }";
 const LIST_SIZE: u32 = 10;
 
 fn literal(value: &str) -> String {
@@ -174,31 +204,38 @@ fn check_state(node: &Value) -> Option<CheckState> {
     }
 }
 
-/// Projects check contexts onto the `gh pr view --json statusCheckRollup` item shape the panel reads.
-fn check_items(node: &Value) -> Vec<Value> {
+/// Each check run or status context of the pull request's last commit, classified once.
+fn check_items(node: &Value) -> Vec<CheckItem> {
     rollup(node)
         .and_then(|rollup| rollup.pointer("/contexts/nodes"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|context| match context.get("__typename").and_then(Value::as_str) {
-            Some("StatusContext") => {
-                let state = context.get("state").cloned().unwrap_or(Value::Null);
-                let pending = matches!(state.as_str(), Some("PENDING" | "EXPECTED"));
-                json!({
-                    "name": context.get("context").cloned().unwrap_or(Value::Null),
-                    "conclusion": if pending { Value::Null } else { state.clone() },
-                    "status": if pending { state } else { json!("COMPLETED") },
-                    "detailsUrl": context.get("targetUrl").cloned().unwrap_or(Value::Null),
-                })
+        .map(|context| {
+            let text = |pointer: &str| {
+                context
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            match context.get("__typename").and_then(Value::as_str) {
+                Some("StatusContext") => CheckItem {
+                    name: text("/context"),
+                    workflow_name: None,
+                    result: CheckResult::classify(&text("/state").unwrap_or_default()),
+                    details_url: text("/targetUrl"),
+                },
+                _ => CheckItem {
+                    name: text("/name"),
+                    workflow_name: text("/checkSuite/workflowRun/workflow/name"),
+                    result: CheckResult::classify(
+                        &text("/conclusion")
+                            .or_else(|| text("/status"))
+                            .unwrap_or_default(),
+                    ),
+                    details_url: text("/detailsUrl"),
+                },
             }
-            _ => json!({
-                "name": context.get("name").cloned().unwrap_or(Value::Null),
-                "workflowName": context.pointer("/checkSuite/workflowRun/workflow/name").cloned().unwrap_or(Value::Null),
-                "conclusion": context.get("conclusion").cloned().unwrap_or(Value::Null),
-                "status": context.get("status").cloned().unwrap_or(Value::Null),
-                "detailsUrl": context.get("detailsUrl").cloned().unwrap_or(Value::Null),
-            }),
         })
         .collect()
 }
@@ -226,7 +263,6 @@ fn parse_pr(node: &Value, detail: bool, now: u64) -> Option<FetchedPr> {
             checks: check_items(node),
             conflicting: mergeable == "CONFLICTING" || merge_state == "DIRTY",
             merge_blocked: merge_state == "BLOCKED",
-            review_decision: node.get("reviewDecision").cloned().unwrap_or(Value::Null),
         }
     });
     Some(FetchedPr {
@@ -424,11 +460,12 @@ mod tests {
             { "__typename": "CheckRun", "name": "test", "status": "IN_PROGRESS", "conclusion": null, "detailsUrl": "https://github.com/o/r/actions/runs/1/job/2", "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } } },
             { "__typename": "StatusContext", "context": "deploy", "state": "FAILURE", "targetUrl": "https://ci" },
             { "__typename": "StatusContext", "context": "lint", "state": "PENDING", "targetUrl": null },
+            { "__typename": "CheckRun", "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED", "detailsUrl": null },
+            { "__typename": "CheckRun", "name": "flaky", "status": "COMPLETED", "conclusion": "TIMED_OUT", "detailsUrl": null },
         ] } }),
         );
         pr["mergeable"] = json!("MERGEABLE");
         pr["mergeStateStatus"] = json!("BLOCKED");
-        pr["reviewDecision"] = json!("APPROVED");
         let body = json!({ "data": { "r0": {
             "squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": true,
             "l0": { "nodes": [pr] }, "defaultBranchRef": { "name": "trunk" },
@@ -440,14 +477,36 @@ mod tests {
         let detail = fetched.detail.as_ref().unwrap();
         assert!(detail.merge_blocked);
         assert!(!detail.conflicting);
-        assert_eq!(detail.review_decision, "APPROVED");
+        let check = |name: &str, workflow: Option<&str>, result, url: Option<&str>| CheckItem {
+            name: Some(name.into()),
+            workflow_name: workflow.map(str::to_string),
+            result,
+            details_url: url.map(str::to_string),
+        };
         assert_eq!(
             detail.checks,
             vec![
-                json!({ "name": "test", "workflowName": "CI", "conclusion": null, "status": "IN_PROGRESS", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/2" }),
-                json!({ "name": "deploy", "conclusion": "FAILURE", "status": "COMPLETED", "detailsUrl": "https://ci" }),
-                json!({ "name": "lint", "conclusion": null, "status": "PENDING", "detailsUrl": null }),
+                check(
+                    "test",
+                    Some("CI"),
+                    CheckResult::Pending,
+                    Some("https://github.com/o/r/actions/runs/1/job/2")
+                ),
+                check("deploy", None, CheckResult::Fail, Some("https://ci")),
+                check("lint", None, CheckResult::Pending, None),
+                check("docs", None, CheckResult::Pass, None),
+                check("flaky", None, CheckResult::Fail, None),
             ]
+        );
+        assert_eq!(
+            project_detail(fetched, vec!["squash".into()])["checks"],
+            json!([
+                { "name": "test", "workflowName": "CI", "result": "pending" },
+                { "name": "deploy", "workflowName": null, "result": "fail" },
+                { "name": "lint", "workflowName": null, "result": "pending" },
+                { "name": "docs", "workflowName": null, "result": "pass" },
+                { "name": "flaky", "workflowName": null, "result": "fail" },
+            ])
         );
     }
 }
