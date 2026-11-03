@@ -1054,6 +1054,51 @@ fn update_group_links(
     Ok(updates.remove(0))
 }
 
+/// What a change does to a task group's links: the result, the sessions to store, and the task
+/// transition it causes.
+struct GroupChange {
+    update: GroupUpdate,
+    patch: Map<String, Value>,
+    transition: Option<(String, PrStateTransition)>,
+}
+
+fn project_group(
+    before: SessionLinks,
+    task: &TaskGroup,
+    mutate: impl FnOnce(&mut SessionLinks) -> Result<(), RequestError>,
+) -> Result<GroupChange, RequestError> {
+    let group = task.members.as_slice();
+    let mut after = before.clone();
+    mutate(&mut after)?;
+    let mut patch = Map::new();
+    for (session_id, links) in &after {
+        let previous = before
+            .get(session_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if refresh::differs(previous, links) {
+            patch.insert(session_id.clone(), session_links_value(links));
+        }
+    }
+    let prs = group_prs(&after, group);
+    let transition = group
+        .first()
+        .filter(|_| task.resolved)
+        .and_then(|session_id| {
+            task_transition(&group_prs(&before, group), &prs)
+                .map(|transition| (session_id.clone(), transition))
+        });
+    Ok(GroupChange {
+        update: GroupUpdate {
+            changed: !patch.is_empty(),
+            lists: after,
+            prs,
+        },
+        patch,
+        transition,
+    })
+}
+
 /// Like `update_group_links` for several tasks at once, with one read and one write.
 /// With `skip_unreadable`, a task whose stored links cannot be parsed is left out instead of
 /// failing every other task. A task whose other sessions are unknown never transitions.
@@ -1080,30 +1125,12 @@ fn update_groups(
                 }
                 Err(message) => return Err(invalid_state(message)),
             };
-            let mut after = before.clone();
-            mutate(&mut after)?;
-            let mut changed = false;
-            for (session_id, links) in &after {
-                let previous = before
-                    .get(session_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                if refresh::differs(previous, links) {
-                    patch.insert(session_id.clone(), session_links_value(links));
-                    changed = true;
-                }
+            let change = project_group(before, task, &mut mutate)?;
+            patch.extend(change.patch);
+            if let Some(transition) = change.transition {
+                transitions.push(transition);
             }
-            let prs = group_prs(&after, group);
-            if let Some(session_id) = group.first().filter(|_| task.resolved) {
-                if let Some(transition) = task_transition(&group_prs(&before, group), &prs) {
-                    transitions.push((session_id.clone(), transition));
-                }
-            }
-            updates.push(GroupUpdate {
-                lists: after,
-                prs,
-                changed,
-            });
+            updates.push(change.update);
         }
         if !patch.is_empty() {
             patch_durable_state(
@@ -1221,12 +1248,13 @@ fn status(params: &Value, context: &ExecutionContext) -> Result<Value, RequestEr
     } else {
         // Storing it would hide the change from the next refresh that knows the whole task,
         // so that refresh could never apply its task transition.
-        let mut fresh = lists.clone();
-        refresh::apply(&mut fresh, &groups, &outcome);
+        let change = project_group(lists.clone(), &task, |fresh| {
+            refresh::apply(fresh, &groups, &outcome);
+            Ok(())
+        })?;
         GroupUpdate {
-            prs: group_prs(&fresh, group),
-            lists: fresh,
             changed: false,
+            ..change.update
         }
     };
     let own = update
