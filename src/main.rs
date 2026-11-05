@@ -185,7 +185,7 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
             Ok(InputEvent::Invalid(error)) => {
                 eprintln!("{PLUGIN_ID} ignored malformed JSON-RPC frame: {error}")
             }
-            Ok(InputEvent::Closed) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(InputEvent::Closed) | Err(RecvTimeoutError::Disconnected) => break 'serve,
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
@@ -201,7 +201,7 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
             ControllerEvent::HostCall { response, .. } => {
                 let _ = response.send(Err(host_connection_closed()));
             }
-            // The host usually closes stdout with stdin; ignore write errors so cancelled requests can finish.
+            // Output may already be gone; keep draining so cancelled requests finish.
             finished => {
                 let _ = handle_controller_event(
                     finished,
@@ -326,11 +326,9 @@ fn handle_controller_event<W: Write>(
             params,
             response,
         } => {
-            write_frame(
-                output,
-                &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-            )?;
+            let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
             callbacks.insert(id, (request_key, response));
+            write_frame(output, &frame)?;
         }
         ControllerEvent::Finished {
             request_key,
@@ -2217,7 +2215,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn winds_down_cleanly_when_host_output_is_also_gone() {
+    fn winds_down_cleanly_when_host_closes_both_pipes() {
         let (input_tx, output_rx, done_rx) = reconcile_until_sessions_list();
         drop(output_rx);
         drop(input_tx);
