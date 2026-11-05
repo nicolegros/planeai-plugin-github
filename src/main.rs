@@ -158,7 +158,12 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
     let mut stopping = false;
 
     while input_open || !active_requests.is_empty() {
-        while let Ok(event) = event_rx.try_recv() {
+        let first = if input_open {
+            event_rx.try_recv().ok()
+        } else {
+            event_rx.recv().ok()
+        };
+        for event in first.into_iter().chain(event_rx.try_iter()) {
             handle_controller_event(
                 event,
                 input_open,
@@ -172,16 +177,6 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
             break;
         }
         if !input_open {
-            if let Ok(event) = event_rx.recv() {
-                handle_controller_event(
-                    event,
-                    input_open,
-                    &mut output,
-                    &mut active_requests,
-                    &mut callbacks,
-                    &mut stopping,
-                )?;
-            }
             continue;
         }
         match input_rx.recv_timeout(POLL_INTERVAL) {
@@ -199,7 +194,9 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
             }
             Ok(InputEvent::Closed) | Err(RecvTimeoutError::Disconnected) => {
                 input_open = false;
-                callbacks.clear();
+                for (_, (_, response)) in callbacks.drain() {
+                    let _ = response.send(Err(host_connection_closed()));
+                }
                 for cancelled in active_requests.values() {
                     cancelled.store(true, Ordering::SeqCst);
                 }
@@ -322,9 +319,7 @@ fn handle_controller_event<W: Write>(
             response,
         } => {
             if !input_open {
-                let _ = response.send(Err(RequestError::Message(
-                    "host connection closed".to_string(),
-                )));
+                let _ = response.send(Err(host_connection_closed()));
                 return Ok(());
             }
             write_frame(
@@ -357,6 +352,10 @@ fn handle_controller_event<W: Write>(
         }
     }
     Ok(())
+}
+
+fn host_connection_closed() -> RequestError {
+    RequestError::Message("host connection closed".to_string())
 }
 
 fn request_key(id: &Value) -> String {
@@ -2160,14 +2159,7 @@ mod tests {
             let callback = receive_frame(&output_rx);
             let result = match callback["method"].as_str().unwrap() {
                 "host.settings.get" => {
-                    let value = callback["params"]["path"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .try_fold(&settings, |value, key| value.get(key.as_str().unwrap()))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    json!({ "settings": value })
+                    json!({ "settings": settings_at(&settings, &callback["params"]["path"]) })
                 }
                 "host.settings.patch" => {
                     merge_settings_patch(&mut settings, &callback["params"]["patch"]);
@@ -2191,9 +2183,9 @@ mod tests {
             }
         };
         assert_eq!(response["id"], "reconcile-1");
-        assert!(
-            response["error"].is_object(),
-            "reconcile failed: {response}"
+        assert_eq!(
+            response["error"],
+            json!({ "code": -32000, "message": "host connection closed" })
         );
         assert_eq!(
             done_rx.recv_timeout(TEST_WAIT),
@@ -2363,6 +2355,15 @@ fi
         calls: Vec<String>,
     }
 
+    fn settings_at(settings: &Value, path: &Value) -> Value {
+        path.as_array()
+            .unwrap()
+            .iter()
+            .try_fold(settings, |value, key| value.get(key.as_str().unwrap()))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
     fn merge_settings_patch(target: &mut Value, patch: &Value) {
         let target = target.as_object_mut().unwrap();
         for (key, value) in patch.as_object().unwrap() {
@@ -2396,16 +2397,7 @@ fi
                 host.calls.push(method.clone());
                 let result = match method.as_str() {
                     "host.settings.get" => {
-                        let value = params["path"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .try_fold(&host.settings, |value, key| {
-                                value.get(key.as_str().unwrap())
-                            })
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        json!({ "settings": value })
+                        json!({ "settings": settings_at(&host.settings, &params["path"]) })
                     }
                     "host.settings.patch" => {
                         merge_settings_patch(&mut host.settings, &params["patch"]);
