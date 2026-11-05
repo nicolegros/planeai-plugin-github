@@ -160,7 +160,6 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
         for event in event_rx.try_iter() {
             handle_controller_event(
                 event,
-                true,
                 &mut output,
                 &mut active_requests,
                 &mut callbacks,
@@ -195,16 +194,21 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
         cancelled.store(true, Ordering::SeqCst);
     }
     while !active_requests.is_empty() {
-        let event = event_rx.recv().expect("the loop holds event_tx");
-        // The host often closes stdout with stdin; keep draining so cancelled requests stop their subprocesses.
-        let _ = handle_controller_event(
-            event,
-            false,
-            &mut output,
-            &mut active_requests,
-            &mut callbacks,
-            &mut stopping,
-        );
+        match event_rx.recv().expect("the loop holds event_tx") {
+            ControllerEvent::HostCall { response, .. } => {
+                let _ = response.send(Err(host_connection_closed()));
+            }
+            // The host usually closes stdout with stdin; ignore write errors so cancelled requests can finish.
+            finished => {
+                let _ = handle_controller_event(
+                    finished,
+                    &mut output,
+                    &mut active_requests,
+                    &mut callbacks,
+                    &mut stopping,
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -306,7 +310,6 @@ fn handle_input_frame(
 
 fn handle_controller_event<W: Write>(
     event: ControllerEvent,
-    input_open: bool,
     output: &mut W,
     active_requests: &mut HashMap<String, Arc<AtomicBool>>,
     callbacks: &mut CallbackResponses,
@@ -320,10 +323,6 @@ fn handle_controller_event<W: Write>(
             params,
             response,
         } => {
-            if !input_open {
-                let _ = response.send(Err(host_connection_closed()));
-                return Ok(());
-            }
             write_frame(
                 output,
                 &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
