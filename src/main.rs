@@ -2137,9 +2137,10 @@ mod tests {
         thread.join().unwrap().unwrap();
     }
 
+    /// Starts `github.reconcile` against a fake host and stops at its `host.sessions.list` call,
+    /// returning the host's input, the plugin's output, and whether the plugin exited cleanly.
     #[cfg(unix)]
-    #[test]
-    fn fails_reconciliation_and_exits_when_host_input_closes_during_a_host_call() {
+    fn reconcile_until_sessions_list() -> (Sender<String>, Receiver<String>, Receiver<bool>) {
         let (input_tx, input_rx) = mpsc::channel();
         let (output_tx, output_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -2166,7 +2167,7 @@ mod tests {
                     merge_settings_patch(&mut settings, &callback["params"]["patch"]);
                     json!({ "updated": true })
                 }
-                "host.sessions.list" => break,
+                "host.sessions.list" => return (input_tx, output_rx, done_rx),
                 other => panic!("unexpected host call {other}"),
             };
             input_tx
@@ -2175,6 +2176,12 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fails_reconciliation_and_exits_when_host_input_closes_during_a_host_call() {
+        let (input_tx, output_rx, done_rx) = reconcile_until_sessions_list();
         drop(input_tx);
 
         let response = receive_frame(&output_rx);
@@ -2188,6 +2195,16 @@ mod tests {
             Ok(true),
             "plugin kept running after host input closed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn winds_down_cleanly_when_host_output_is_also_gone() {
+        let (input_tx, output_rx, done_rx) = reconcile_until_sessions_list();
+        drop(output_rx);
+        drop(input_tx);
+
+        assert_eq!(done_rx.recv_timeout(TEST_WAIT), Ok(true));
     }
 
     #[cfg(unix)]
