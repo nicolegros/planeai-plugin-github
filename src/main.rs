@@ -33,7 +33,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const PLUGIN_ID: &str = "github";
 const PLUGIN_NAME: &str = "GitHub";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
-const HOST_API_VERSION: &str = "planeai.plugin-host.v5";
+const HOST_API_VERSION: &str = "planeai.plugin-host.v6";
+/// The MCP tool agents in PlaneAI sessions call, served as `github_link_pull_request`.
+const LINK_PULL_REQUEST_TOOL: &str = "link_pull_request";
 const CANCELLATION_ERROR_CODE: i64 = -32800;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -361,6 +363,7 @@ fn dispatch(
         "github.failureLogs" => failure_logs(&params, context),
         "github.sendFailureLogs" => send_failure_logs(&params, context),
         "github.reconcile" => reconcile(context),
+        "tool.call" => tool_call(&params, context),
         _ => Err(RequestError::Message("method not found".to_string())),
     }
 }
@@ -557,7 +560,13 @@ fn finish_reconciliation(
 }
 
 fn repository_context(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let session_id = required_string(params, "session_id")?;
+    session_repository_context(required_string(params, "session_id")?, context)
+}
+
+fn session_repository_context(
+    session_id: &str,
+    context: &ExecutionContext,
+) -> Result<Value, RequestError> {
     host_call(
         context,
         &format!("github-context-{session_id}"),
@@ -1347,11 +1356,21 @@ fn pull_request_key(params: &Value) -> Result<PrKey, RequestError> {
 
 fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
-    let task = changing_task_group(context, session_id)?;
     let key = pull_request_key(params)?;
-    let repository = repository_context(params, context)?;
-    let pr = fetch_pull_request(context, &context_path(&repository)?, &key)?;
-    let update = update_group_links(context, &task, |lists| {
+    let update = link_to_task(context, session_id, &key)?;
+    Ok(json!({ "pull_requests": prs_json(&update.prs) }))
+}
+
+/// Links a pull request to the session, refreshing it wherever the task already tracks it.
+fn link_to_task(
+    context: &ExecutionContext,
+    session_id: &str,
+    key: &PrKey,
+) -> Result<GroupUpdate, RequestError> {
+    let task = changing_task_group(context, session_id)?;
+    let repository = session_repository_context(session_id, context)?;
+    let pr = fetch_pull_request(context, &context_path(&repository)?, key)?;
+    update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
             refresh_snapshot(links, &pr.key, &pr.snapshot);
         }
@@ -1362,8 +1381,55 @@ fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value
             &pr.snapshot,
         );
         Ok(())
-    })?;
-    Ok(json!({ "pull_requests": prs_json(&update.prs) }))
+    })
+}
+
+/// Runs an MCP tool for the agent of `caller.session_id`; failures are results the agent reads.
+fn tool_call(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = params
+        .pointer("/caller/session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_state("tool.call has no caller session"))?;
+    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+    let tool = params
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let outcome = match tool {
+        LINK_PULL_REQUEST_TOOL => pull_request_key(arguments).and_then(|key| {
+            Ok(link_summary(
+                &key,
+                &link_to_task(context, session_id, &key)?.prs,
+            ))
+        }),
+        _ => Err(invalid_state(format!("unknown tool {tool}"))),
+    };
+    match outcome {
+        Ok(text) => Ok(json!({ "text": text })),
+        Err(RequestError::Cancelled) => Err(RequestError::Cancelled),
+        Err(RequestError::Message(message)) => Ok(json!({ "text": message, "is_error": true })),
+    }
+}
+
+/// What the agent reads after linking `key`: that pull request, then all of the task's.
+fn link_summary(key: &PrKey, prs: &[AggregatedPr]) -> String {
+    let name = |key: &PrKey| format!("{}#{}", key.repository, key.number);
+    let linked = match prs.iter().find(|pr| &pr.key == key) {
+        Some(pr) => format!(
+            "{} ({}): {}",
+            name(key),
+            pr.snapshot.state.label(),
+            pr.snapshot.title.as_deref().unwrap_or("untitled")
+        ),
+        None => name(key),
+    };
+    let all: Vec<String> = prs.iter().map(|pr| name(&pr.key)).collect();
+    format!(
+        "Linked {linked}.\nThe session's task has {} pull request{}: {}.",
+        all.len(),
+        if all.len() == 1 { "" } else { "s" },
+        all.join(", ")
+    )
 }
 
 /// Unlinks a pull request, or dismisses a stack pull request, from every session of the task.
@@ -2607,6 +2673,73 @@ fi
             json!({ "host": "github.com", "repository": "o/r", "number": 9, "url": "https://github.com/o/r/pull/9", "source": "stack-dismissed" })
         );
         assert_eq!(cli.calls(), 1, "unlinking never asks GitHub");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_link_tool_links_for_the_calling_session_and_reports_failures_to_the_agent() {
+        let cli = FakeGithubCli::new();
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["pull_requests"] = json!({ "s1": [stored_link(4, "branch", "open")] });
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [{ "id": "s1", "project_id": "p", "task_key": "T-1", "status": "active" }] }),
+            contexts: HashMap::from([(
+                "s1".to_string(),
+                cli.context("s1", "repo", "topic", Some("T-1")),
+            )]),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+        let call = |tool: &str, arguments: Value| {
+            with_host(&cli.runner, &host, |context| {
+                dispatch(
+                    "tool.call",
+                    json!({
+                        "tool": tool,
+                        "arguments": arguments,
+                        "caller": {
+                            "session_id": "s1",
+                            "project": { "id": "p", "name": "Demo" },
+                            "task": null,
+                            "auto_approve": false,
+                        },
+                    }),
+                    context,
+                )
+            })
+            .unwrap()
+        };
+
+        cli.respond(json!({ "data": { "r0": { "l0": graphql_pr("other/repo", 12, "OPEN", "x", "main", "PENDING") } } }));
+        assert_eq!(
+            call(
+                LINK_PULL_REQUEST_TOOL,
+                json!({ "url": "https://github.com/Other/Repo/pull/12" })
+            ),
+            json!({ "text": "Linked other/repo#12 (open): Change 12.\nThe session's task has 2 pull requests: o/r#4, other/repo#12." })
+        );
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][1]["source"],
+            "manual"
+        );
+
+        assert_eq!(
+            call(
+                LINK_PULL_REQUEST_TOOL,
+                json!({ "url": "https://gitlab.com/o/r/-/merge_requests/1" })
+            ),
+            json!({ "text": "Enter a github.com pull request URL, such as https://github.com/owner/repo/pull/123.", "is_error": true })
+        );
+        assert_eq!(
+            call(LINK_PULL_REQUEST_TOOL, json!({})),
+            json!({ "text": "url is required", "is_error": true })
+        );
+        assert_eq!(
+            call("close_everything", json!({})),
+            json!({ "text": "unknown tool close_everything", "is_error": true })
+        );
+        assert_eq!(cli.calls(), 1, "a refused call never asks GitHub");
     }
 
     #[cfg(unix)]

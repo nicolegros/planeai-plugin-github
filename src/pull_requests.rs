@@ -72,6 +72,16 @@ pub enum PrState {
 }
 
 impl PrState {
+    /// The state as stored and shown, such as `open`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        }
+    }
+
     /// Open on GitHub, whether or not it is still a draft.
     pub fn is_live(self) -> bool {
         matches!(self, Self::Draft | Self::Open)
@@ -719,6 +729,18 @@ pub fn task_group(sessions: &[SessionInfo], session_id: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_state_label_is_its_stored_name() {
+        for state in [
+            PrState::Draft,
+            PrState::Open,
+            PrState::Merged,
+            PrState::Closed,
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), state.label());
+        }
+    }
 
     fn key(number: u64) -> PrKey {
         PrKey::new(GITHUB_HOST, "o/r", number).unwrap()
