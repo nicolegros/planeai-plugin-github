@@ -196,14 +196,15 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
     }
     while !active_requests.is_empty() {
         let event = event_rx.recv().expect("the loop holds event_tx");
-        handle_controller_event(
+        // The host often closes stdout with stdin; keep draining so cancelled requests stop their subprocesses.
+        let _ = handle_controller_event(
             event,
             false,
             &mut output,
             &mut active_requests,
             &mut callbacks,
             &mut stopping,
-        )?;
+        );
     }
     Ok(())
 }
