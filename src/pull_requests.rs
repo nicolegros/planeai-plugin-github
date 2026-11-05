@@ -72,6 +72,16 @@ pub enum PrState {
 }
 
 impl PrState {
+    /// The state as stored and shown, such as `open`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        }
+    }
+
     /// Open on GitHub, whether or not it is still a draft.
     pub fn is_live(self) -> bool {
         matches!(self, Self::Draft | Self::Open)

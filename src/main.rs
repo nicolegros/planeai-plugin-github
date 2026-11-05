@@ -560,7 +560,13 @@ fn finish_reconciliation(
 }
 
 fn repository_context(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
-    let session_id = required_string(params, "session_id")?;
+    session_repository_context(required_string(params, "session_id")?, context)
+}
+
+fn session_repository_context(
+    session_id: &str,
+    context: &ExecutionContext,
+) -> Result<Value, RequestError> {
     host_call(
         context,
         &format!("github-context-{session_id}"),
@@ -1350,11 +1356,21 @@ fn pull_request_key(params: &Value) -> Result<PrKey, RequestError> {
 
 fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
     let session_id = required_string(params, "session_id")?;
-    let task = changing_task_group(context, session_id)?;
     let key = pull_request_key(params)?;
-    let repository = repository_context(params, context)?;
-    let pr = fetch_pull_request(context, &context_path(&repository)?, &key)?;
-    let update = update_group_links(context, &task, |lists| {
+    let update = link_to_task(context, session_id, &key)?;
+    Ok(json!({ "pull_requests": prs_json(&update.prs) }))
+}
+
+/// Links a pull request to the session, refreshing it wherever the task already tracks it.
+fn link_to_task(
+    context: &ExecutionContext,
+    session_id: &str,
+    key: &PrKey,
+) -> Result<GroupUpdate, RequestError> {
+    let task = changing_task_group(context, session_id)?;
+    let repository = session_repository_context(session_id, context)?;
+    let pr = fetch_pull_request(context, &context_path(&repository)?, key)?;
+    update_group_links(context, &task, |lists| {
         for links in lists.values_mut() {
             refresh_snapshot(links, &pr.key, &pr.snapshot);
         }
@@ -1365,8 +1381,7 @@ fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value
             &pr.snapshot,
         );
         Ok(())
-    })?;
-    Ok(json!({ "pull_requests": prs_json(&update.prs) }))
+    })
 }
 
 /// Runs an MCP tool for the agent of `caller.session_id`; failures are results the agent reads.
@@ -1375,12 +1390,18 @@ fn tool_call(params: &Value, context: &ExecutionContext) -> Result<Value, Reques
         .pointer("/caller/session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_state("tool.call has no caller session"))?;
+    let arguments = params.get("arguments").unwrap_or(&Value::Null);
     let tool = params
         .get("tool")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let outcome = match tool {
-        LINK_PULL_REQUEST_TOOL => link_pull_request_tool(session_id, params, context),
+        LINK_PULL_REQUEST_TOOL => pull_request_key(arguments).and_then(|key| {
+            Ok(link_summary(
+                &key,
+                &link_to_task(context, session_id, &key)?.prs,
+            ))
+        }),
         _ => Err(invalid_state(format!("unknown tool {tool}"))),
     };
     match outcome {
@@ -1390,48 +1411,25 @@ fn tool_call(params: &Value, context: &ExecutionContext) -> Result<Value, Reques
     }
 }
 
-fn link_pull_request_tool(
-    session_id: &str,
-    params: &Value,
-    context: &ExecutionContext,
-) -> Result<String, RequestError> {
-    let url = params
-        .pointer("/arguments/url")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let key = pull_request_key(&json!({ "url": url }))?;
-    let linked = link_pull_request(&json!({ "session_id": session_id, "url": url }), context)?;
-    let prs = linked["pull_requests"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let name = |pr: &Value| {
-        format!(
-            "{}#{}",
-            pr["repository"].as_str().unwrap_or_default(),
-            pr["number"]
-        )
-    };
-    let summary = |pr: &Value| {
-        format!(
+/// What the agent reads after linking `key`: that pull request, then all of the task's.
+fn link_summary(key: &PrKey, prs: &[AggregatedPr]) -> String {
+    let name = |key: &PrKey| format!("{}#{}", key.repository, key.number);
+    let linked = match prs.iter().find(|pr| &pr.key == key) {
+        Some(pr) => format!(
             "{} ({}): {}",
-            name(pr),
-            pr["state"].as_str().unwrap_or("unknown"),
-            pr["title"].as_str().unwrap_or("untitled")
-        )
+            name(key),
+            pr.snapshot.state.label(),
+            pr.snapshot.title.as_deref().unwrap_or("untitled")
+        ),
+        None => name(key),
     };
-    let this = prs
-        .iter()
-        .find(|pr| pr["repository"] == key.repository.as_str() && pr["number"] == key.number)
-        .map(summary)
-        .unwrap_or_else(|| format!("{}#{}", key.repository, key.number));
-    let all: Vec<String> = prs.iter().map(name).collect();
-    Ok(format!(
-        "Linked {this}.\nThe session's task has {} pull request{}: {}.",
+    let all: Vec<String> = prs.iter().map(|pr| name(&pr.key)).collect();
+    format!(
+        "Linked {linked}.\nThe session's task has {} pull request{}: {}.",
         all.len(),
         if all.len() == 1 { "" } else { "s" },
         all.join(", ")
-    ))
+    )
 }
 
 /// Unlinks a pull request, or dismisses a stack pull request, from every session of the task.
