@@ -205,12 +205,12 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
         cancelled.store(true, Ordering::SeqCst);
     }
     while !active_requests.is_empty() {
-        match event_rx.recv().expect("the loop holds event_tx") {
+        match event_rx.recv().expect("run_with_runner holds event_tx") {
             ControllerEvent::HostCall { response, .. } => {
                 let _ = response.send(Err(host_connection_closed()));
             }
             // Output may already be gone; keep draining so cancelled requests finish.
-            finished => {
+            finished @ ControllerEvent::Finished { .. } => {
                 let _ = handle_controller_event(
                     finished,
                     &mut output,

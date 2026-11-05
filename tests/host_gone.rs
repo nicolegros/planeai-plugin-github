@@ -13,6 +13,7 @@ fn exits_cleanly_when_host_stdout_and_stderr_are_gone() {
         .unwrap();
     drop(plugin.stdout.take());
     drop(plugin.stderr.take());
+    // Keep stdin open so only the broken output can end the plugin.
     let mut stdin = plugin.stdin.take().unwrap();
     writeln!(
         stdin,
