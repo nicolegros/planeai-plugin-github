@@ -1,3 +1,11 @@
+// `eprintln!` panics once the host has closed stderr, which happens whenever the host goes away.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod durable_state;
 mod github_graphql;
 mod pull_requests;
@@ -131,9 +139,9 @@ enum ControllerEvent {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("{PLUGIN_ID} plugin starting");
+    log!("{PLUGIN_ID} plugin starting");
     run_with_runner(io::stdin(), io::stdout().lock(), CommandRunner::default())?;
-    eprintln!("{PLUGIN_ID} plugin stopping");
+    log!("{PLUGIN_ID} plugin stopping");
     Ok(())
 }
 
@@ -165,7 +173,7 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
                 &mut callbacks,
                 &mut stopping,
             ) {
-                eprintln!("{PLUGIN_ID} lost host output: {error}");
+                log!("{PLUGIN_ID} lost host output: {error}");
                 break 'serve;
             }
         }
@@ -183,7 +191,7 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
                 &mut callbacks,
             ),
             Ok(InputEvent::Invalid(error)) => {
-                eprintln!("{PLUGIN_ID} ignored malformed JSON-RPC frame: {error}")
+                log!("{PLUGIN_ID} ignored malformed JSON-RPC frame: {error}")
             }
             Ok(InputEvent::Closed) | Err(RecvTimeoutError::Disconnected) => break 'serve,
             Err(RecvTimeoutError::Timeout) => {}
@@ -233,7 +241,7 @@ fn read_input<R: Read>(input: R, sender: Sender<InputEvent>) {
                 }
             },
             Err(error) => {
-                eprintln!("{PLUGIN_ID} failed reading stdin: {error}");
+                log!("{PLUGIN_ID} failed reading stdin: {error}");
                 break;
             }
         }
@@ -522,7 +530,7 @@ fn apply_task_transition(
     let transitions = match read_task_transitions(context, false) {
         Ok(transitions) => transitions,
         Err(error) => {
-            eprintln!("{PLUGIN_ID} skipped the {field} task transition: {error:?}");
+            log!("{PLUGIN_ID} skipped the {field} task transition: {error:?}");
             return;
         }
     };
@@ -539,7 +547,7 @@ fn apply_task_transition(
             RequestError::Cancelled => "request cancelled".to_string(),
             RequestError::Message(message) => message,
         };
-        eprintln!("{PLUGIN_ID} failed configured {field} task transition: {message}");
+        log!("{PLUGIN_ID} failed configured {field} task transition: {message}");
     }
 }
 
@@ -1029,7 +1037,7 @@ fn session_task_group(
         }),
         Err(RequestError::Cancelled) => Err(RequestError::Cancelled),
         Err(RequestError::Message(message)) => {
-            eprintln!("{PLUGIN_ID} could not list sessions for {session_id}: {message}");
+            log!("{PLUGIN_ID} could not list sessions for {session_id}: {message}");
             Ok(TaskGroup {
                 members: vec![session_id.to_string()],
                 resolved: false,
@@ -1152,7 +1160,7 @@ fn update_groups(
             let before = match group_links(&stored, group) {
                 Ok(before) => before,
                 Err(message) if skip_unreadable => {
-                    eprintln!("{PLUGIN_ID} skipped updating sessions {group:?}: {message}");
+                    log!("{PLUGIN_ID} skipped updating sessions {group:?}: {message}");
                     continue;
                 }
                 Err(message) => return Err(invalid_state(message)),
@@ -1201,7 +1209,7 @@ fn fetch_graphql(
         }));
     };
     if let Some(errors) = body.get("errors") {
-        eprintln!("{PLUGIN_ID} GitHub answered some lookups with errors: {errors}");
+        log!("{PLUGIN_ID} GitHub answered some lookups with errors: {errors}");
     }
     Ok(github_graphql::parse_response(
         requests,
@@ -1794,7 +1802,7 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<boo
             Ok(None) => {}
             Err(RequestError::Cancelled) => return Err(RequestError::Cancelled),
             Err(RequestError::Message(message)) => {
-                eprintln!(
+                log!(
                     "{PLUGIN_ID} skipped branch detection for {}: {message}",
                     session.id
                 );
@@ -1810,7 +1818,7 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<boo
             true
         }
         Err(message) => {
-            eprintln!("{PLUGIN_ID} skipped refreshing sessions {group:?}: {message}");
+            log!("{PLUGIN_ID} skipped refreshing sessions {group:?}: {message}");
             false
         }
     });
