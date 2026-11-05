@@ -8,7 +8,7 @@ The plugin is intentionally GitHub-specific. PlaneAI core supplies generic plugi
 
 ## Requirements
 
-- PlaneAI with `planeai.plugin-host.v5` (the `session.meta` placement), `sessions.read`, `sessions.repository-context`, and `session.panel` plugin-platform support.
+- PlaneAI with `planeai.plugin-host.v6` (MCP tools, PlaneAI 1.115 or later), `sessions.read`, `sessions.repository-context`, and `session.panel` plugin-platform support.
 - A PlaneAI build that sends `data.onChanged` to an open `session.panel` instead of remounting it, so the panel refreshes in place.
 - `git` and `gh` on `PATH`.
 - `gh auth login` completed for `github.com`.
@@ -36,6 +36,14 @@ Sessions linked to the same task in the same project share their pull requests, 
 **Unlink** and **Dismiss** remove a link from every session of the task and leave a tombstone, so stack discovery never adds it back; linking it again revives it.
 Branch links follow the branch and cannot be unlinked.
 When the session's branch resolves to another pull request or to none, the previous branch pull request stays with the task as a **Linked** pull request with its last known state, so it can be unlinked.
+
+## Agent tool
+
+Agents in PlaneAI sessions get the `github_link_pull_request` MCP tool (`mcp__planeai__github_link_pull_request` in Claude Code).
+It takes a pull request's github.com `url` and links it to the calling session's task, exactly as **Link pull request** in the panel does, so it shows in the pill, the titlebar, and the panel.
+Agents use it for a pull request the session's branch does not resolve to, such as one in another repository or another branch of a stack.
+It declares itself a non-destructive, idempotent write, so PlaneAI's Claude Code and Codex templates run it without asking.
+A refused link, such as a URL that is not a github.com pull request, comes back to the agent as an error result.
 
 ## Sidebar pill and titlebar
 

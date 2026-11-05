@@ -3,7 +3,7 @@
   "id": "github",
   "name": "GitHub",
   "version": "0.0.0",
-  "host_api_version": "planeai.plugin-host.v5",
+  "host_api_version": "planeai.plugin-host.v6",
   "source_kind": "local",
   "backend_entrypoints": {
     "macos-arm64": "bin/macos-arm64/planeai-plugin-github",
@@ -17,7 +17,8 @@
     "sessions.repository-context",
     "sessions.prompt",
     "tasks.read",
-    "tasks.transition"
+    "tasks.transition",
+    "tools"
   ],
   "background_service": {
     "method": "github.reconcile",
@@ -49,6 +50,31 @@
       "label": "Pull requests",
       "placement": "session.meta",
       "entrypoint": "ui/meta.js"
+    }
+  ],
+  "tools": [
+    {
+      "name": "link_pull_request",
+      "description": "Link a GitHub pull request to your PlaneAI session's task, so it shows in the task's pull requests with its state and checks. Call it after you open a pull request that is not on this session's branch, such as one in another repository or another branch of a stack; the session branch's own pull request is tracked without it.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The pull request's github.com URL, such as https://github.com/owner/repo/pull/123."
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
     }
   ]
 }

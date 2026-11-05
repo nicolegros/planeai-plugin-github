@@ -6,7 +6,7 @@ const manifest = JSON.parse(fs.readFileSync(new URL("../planeai-plugin.json", im
 const hostCapabilities = new Set([
   "settings", "projects.read", "sessions.read", "sessions.repository-context", "sessions.prompt",
   "session-events", "sessions.actions", "sessions.advisories", "sessions.complete", "tasks.read",
-  "tasks.create", "tasks.transition", "task-events",
+  "tasks.create", "tasks.transition", "task-events", "tools",
 ]);
 const backgroundFields = ["method", "interval_setting", "default_interval_ms"];
 
@@ -21,8 +21,7 @@ test("manifest uses PlaneAI PluginBackgroundService schema and documented capabi
   assert.ok(manifest.capabilities.includes("tasks.read"));
 });
 
-test("manifest declares host API v5 and the session.meta pull-request pill", () => {
-  assert.equal(manifest.host_api_version, "planeai.plugin-host.v5");
+test("manifest declares the session.meta pull-request pill", () => {
   assert.deepEqual(
     manifest.ui_contributions.find((contribution) => contribution.placement === "session.meta"),
     { id: "pull-request-meta", label: "Pull requests", placement: "session.meta", entrypoint: "ui/meta.js" },
@@ -48,4 +47,16 @@ test("manifest exposes the GitHub transition preferences UI", () => {
     manifest.ui_contributions.find((contribution) => contribution.id === "github-settings"),
     { id: "github-settings", label: "GitHub", placement: "preferences", entrypoint: "ui/settings.js" },
   );
+});
+
+test("manifest declares host API v6 and the link_pull_request tool as a non-destructive write", () => {
+  assert.equal(manifest.host_api_version, "planeai.plugin-host.v6");
+  assert.ok(manifest.capabilities.includes("tools"));
+  assert.deepEqual(manifest.tools.map((tool) => tool.name), ["link_pull_request"]);
+  const [tool] = manifest.tools;
+  assert.deepEqual(Object.keys(tool).sort(), ["annotations", "description", "inputSchema", "name"]);
+  assert.deepEqual(tool.inputSchema.required, ["url"]);
+  assert.equal(tool.annotations.readOnlyHint, false);
+  assert.equal(tool.annotations.destructiveHint, false, "PlaneAI pre-approves only tools that say they are not destructive");
+  assert.equal(tool.annotations.idempotentHint, true);
 });

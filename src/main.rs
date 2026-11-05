@@ -33,7 +33,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const PLUGIN_ID: &str = "github";
 const PLUGIN_NAME: &str = "GitHub";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
-const HOST_API_VERSION: &str = "planeai.plugin-host.v5";
+const HOST_API_VERSION: &str = "planeai.plugin-host.v6";
+/// The MCP tool agents in PlaneAI sessions call, served as `github_link_pull_request`.
+const LINK_PULL_REQUEST_TOOL: &str = "link_pull_request";
 const CANCELLATION_ERROR_CODE: i64 = -32800;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -361,6 +363,7 @@ fn dispatch(
         "github.failureLogs" => failure_logs(&params, context),
         "github.sendFailureLogs" => send_failure_logs(&params, context),
         "github.reconcile" => reconcile(context),
+        "tool.call" => tool_call(&params, context),
         _ => Err(RequestError::Message("method not found".to_string())),
     }
 }
@@ -1364,6 +1367,71 @@ fn link_pull_request(params: &Value, context: &ExecutionContext) -> Result<Value
         Ok(())
     })?;
     Ok(json!({ "pull_requests": prs_json(&update.prs) }))
+}
+
+/// Runs an MCP tool for the agent of `caller.session_id`; failures are results the agent reads.
+fn tool_call(params: &Value, context: &ExecutionContext) -> Result<Value, RequestError> {
+    let session_id = params
+        .pointer("/caller/session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_state("tool.call has no caller session"))?;
+    let tool = params
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let outcome = match tool {
+        LINK_PULL_REQUEST_TOOL => link_pull_request_tool(session_id, params, context),
+        _ => Err(invalid_state(format!("unknown tool {tool}"))),
+    };
+    match outcome {
+        Ok(text) => Ok(json!({ "text": text })),
+        Err(RequestError::Cancelled) => Err(RequestError::Cancelled),
+        Err(RequestError::Message(message)) => Ok(json!({ "text": message, "is_error": true })),
+    }
+}
+
+fn link_pull_request_tool(
+    session_id: &str,
+    params: &Value,
+    context: &ExecutionContext,
+) -> Result<String, RequestError> {
+    let url = params
+        .pointer("/arguments/url")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let key = pull_request_key(&json!({ "url": url }))?;
+    let linked = link_pull_request(&json!({ "session_id": session_id, "url": url }), context)?;
+    let prs = linked["pull_requests"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let name = |pr: &Value| {
+        format!(
+            "{}#{}",
+            pr["repository"].as_str().unwrap_or_default(),
+            pr["number"]
+        )
+    };
+    let summary = |pr: &Value| {
+        format!(
+            "{} ({}): {}",
+            name(pr),
+            pr["state"].as_str().unwrap_or("unknown"),
+            pr["title"].as_str().unwrap_or("untitled")
+        )
+    };
+    let this = prs
+        .iter()
+        .find(|pr| pr["repository"] == key.repository.as_str() && pr["number"] == key.number)
+        .map(summary)
+        .unwrap_or_else(|| format!("{}#{}", key.repository, key.number));
+    let all: Vec<String> = prs.iter().map(name).collect();
+    Ok(format!(
+        "Linked {this}.\nThe session's task has {} pull request{}: {}.",
+        all.len(),
+        if all.len() == 1 { "" } else { "s" },
+        all.join(", ")
+    ))
 }
 
 /// Unlinks a pull request, or dismisses a stack pull request, from every session of the task.
@@ -2607,6 +2675,73 @@ fi
             json!({ "host": "github.com", "repository": "o/r", "number": 9, "url": "https://github.com/o/r/pull/9", "source": "stack-dismissed" })
         );
         assert_eq!(cli.calls(), 1, "unlinking never asks GitHub");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_link_tool_links_for_the_calling_session_and_reports_failures_to_the_agent() {
+        let cli = FakeGithubCli::new();
+        let mut settings = json!({ "github": empty_durable_state() });
+        settings["github"]["pull_requests"] = json!({ "s1": [stored_link(4, "branch", "open")] });
+        let host = Arc::new(Mutex::new(FakeHost {
+            settings,
+            sessions: json!({ "sessions": [{ "id": "s1", "project_id": "p", "task_key": "T-1", "status": "active" }] }),
+            contexts: HashMap::from([(
+                "s1".to_string(),
+                cli.context("s1", "repo", "topic", Some("T-1")),
+            )]),
+            transitions: Vec::new(),
+            calls: Vec::new(),
+        }));
+        let call = |tool: &str, arguments: Value| {
+            with_host(&cli.runner, &host, |context| {
+                dispatch(
+                    "tool.call",
+                    json!({
+                        "tool": tool,
+                        "arguments": arguments,
+                        "caller": {
+                            "session_id": "s1",
+                            "project": { "id": "p", "name": "Demo" },
+                            "task": null,
+                            "auto_approve": false,
+                        },
+                    }),
+                    context,
+                )
+            })
+            .unwrap()
+        };
+
+        cli.respond(json!({ "data": { "r0": { "l0": graphql_pr("other/repo", 12, "OPEN", "x", "main", "PENDING") } } }));
+        assert_eq!(
+            call(
+                LINK_PULL_REQUEST_TOOL,
+                json!({ "url": "https://github.com/Other/Repo/pull/12" })
+            ),
+            json!({ "text": "Linked other/repo#12 (open): Change 12.\nThe session's task has 2 pull requests: o/r#4, other/repo#12." })
+        );
+        assert_eq!(
+            host.lock().unwrap().settings["github"]["pull_requests"]["s1"][1]["source"],
+            "manual"
+        );
+
+        assert_eq!(
+            call(
+                LINK_PULL_REQUEST_TOOL,
+                json!({ "url": "https://gitlab.com/o/r/-/merge_requests/1" })
+            ),
+            json!({ "text": "Enter a github.com pull request URL, such as https://github.com/owner/repo/pull/123.", "is_error": true })
+        );
+        assert_eq!(
+            call(LINK_PULL_REQUEST_TOOL, json!({})),
+            json!({ "text": "url is required", "is_error": true })
+        );
+        assert_eq!(
+            call("close_everything", json!({})),
+            json!({ "text": "unknown tool close_everything", "is_error": true })
+        );
+        assert_eq!(cli.calls(), 1, "a refused call never asks GitHub");
     }
 
     #[cfg(unix)]
