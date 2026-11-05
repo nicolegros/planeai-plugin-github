@@ -2199,6 +2199,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn winds_down_cleanly_when_host_output_breaks_before_input_closes() {
+        let (input_tx, output_rx, done_rx) = reconcile_until_sessions_list();
+        drop(output_rx);
+        input_tx
+            .send(
+                json!({ "jsonrpc": "2.0", "id": "shutdown-1", "method": "plugin.shutdown" })
+                    .to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(done_rx.recv_timeout(TEST_WAIT), Ok(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn winds_down_cleanly_when_host_output_is_also_gone() {
         let (input_tx, output_rx, done_rx) = reconcile_until_sessions_list();
         drop(output_rx);
