@@ -41,6 +41,7 @@ When the session's branch resolves to another pull request or to none, the previ
 
 Agents in PlaneAI sessions get the `github_link_pull_request` MCP tool (`mcp__planeai__github_link_pull_request` in Claude Code).
 It takes a pull request's github.com `url` and links it to the calling session's task, exactly as **Link pull request** in the panel does, so it shows in the pill, the titlebar, and the panel.
+PlaneAI releases after 1.116 refresh those views right after the call; 1.115 and 1.116 show the link at their next refresh.
 Agents use it for a pull request the session's branch does not resolve to, such as one in another repository or another branch of a stack.
 It declares itself a non-destructive, idempotent write, so PlaneAI's Claude Code and Codex templates run it without asking.
 A refused link, such as a URL that is not a github.com pull request, comes back to the agent as an error result.
