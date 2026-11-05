@@ -156,15 +156,18 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
     };
     let mut stopping = false;
 
-    loop {
+    'serve: loop {
         for event in event_rx.try_iter() {
-            handle_controller_event(
+            if let Err(error) = handle_controller_event(
                 event,
                 &mut output,
                 &mut active_requests,
                 &mut callbacks,
                 &mut stopping,
-            )?;
+            ) {
+                eprintln!("{PLUGIN_ID} lost host output: {error}");
+                break 'serve;
+            }
         }
         if stopping && active_requests.is_empty() {
             return Ok(());
