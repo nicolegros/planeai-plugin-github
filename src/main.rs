@@ -161,6 +161,7 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
         while let Ok(event) = event_rx.try_recv() {
             handle_controller_event(
                 event,
+                input_open,
                 &mut output,
                 &mut active_requests,
                 &mut callbacks,
@@ -169,6 +170,19 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
         }
         if stopping && active_requests.is_empty() {
             break;
+        }
+        if !input_open {
+            if let Ok(event) = event_rx.recv() {
+                handle_controller_event(
+                    event,
+                    input_open,
+                    &mut output,
+                    &mut active_requests,
+                    &mut callbacks,
+                    &mut stopping,
+                )?;
+            }
+            continue;
         }
         match input_rx.recv_timeout(POLL_INTERVAL) {
             Ok(InputEvent::Frame(frame)) => handle_input_frame(
@@ -185,6 +199,7 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
             }
             Ok(InputEvent::Closed) | Err(RecvTimeoutError::Disconnected) => {
                 input_open = false;
+                callbacks.clear();
                 for cancelled in active_requests.values() {
                     cancelled.store(true, Ordering::SeqCst);
                 }
@@ -292,6 +307,7 @@ fn handle_input_frame(
 
 fn handle_controller_event<W: Write>(
     event: ControllerEvent,
+    input_open: bool,
     output: &mut W,
     active_requests: &mut HashMap<String, Arc<AtomicBool>>,
     callbacks: &mut CallbackResponses,
@@ -305,6 +321,12 @@ fn handle_controller_event<W: Write>(
             params,
             response,
         } => {
+            if !input_open {
+                let _ = response.send(Err(RequestError::Message(
+                    "host connection closed".to_string(),
+                )));
+                return Ok(());
+            }
             write_frame(
                 output,
                 &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
@@ -2155,7 +2177,9 @@ mod tests {
                 other => panic!("unexpected host call {other}"),
             };
             input_tx
-                .send(json!({ "jsonrpc": "2.0", "id": callback["id"], "result": result }).to_string())
+                .send(
+                    json!({ "jsonrpc": "2.0", "id": callback["id"], "result": result }).to_string(),
+                )
                 .unwrap();
         }
         drop(input_tx);
@@ -2167,7 +2191,10 @@ mod tests {
             }
         };
         assert_eq!(response["id"], "reconcile-1");
-        assert!(response["error"].is_object(), "reconcile failed: {response}");
+        assert!(
+            response["error"].is_object(),
+            "reconcile failed: {response}"
+        );
         assert_eq!(
             done_rx.recv_timeout(TEST_WAIT),
             Ok(true),
