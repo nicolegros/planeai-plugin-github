@@ -2117,6 +2117,66 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn exits_when_host_input_closes_during_reconciliation_cleanup() {
+        let (input_tx, input_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_with_runner(
+                ChannelInput::new(input_rx),
+                LineOutput::new(output_tx),
+                CommandRunner::default(),
+            );
+            let _ = done_tx.send(result.is_ok());
+        });
+
+        input_tx
+            .send(json!({ "jsonrpc": "2.0", "id": "reconcile-1", "method": "github.reconcile", "params": {} }).to_string())
+            .unwrap();
+        let mut settings = json!({});
+        loop {
+            let callback = receive_frame(&output_rx);
+            let result = match callback["method"].as_str().unwrap() {
+                "host.settings.get" => {
+                    let value = callback["params"]["path"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .try_fold(&settings, |value, key| value.get(key.as_str().unwrap()))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    json!({ "settings": value })
+                }
+                "host.settings.patch" => {
+                    merge_settings_patch(&mut settings, &callback["params"]["patch"]);
+                    json!({ "updated": true })
+                }
+                "host.sessions.list" => break,
+                other => panic!("unexpected host call {other}"),
+            };
+            input_tx
+                .send(json!({ "jsonrpc": "2.0", "id": callback["id"], "result": result }).to_string())
+                .unwrap();
+        }
+        drop(input_tx);
+
+        let response = loop {
+            let frame = receive_frame(&output_rx);
+            if frame.get("method").is_none() {
+                break frame;
+            }
+        };
+        assert_eq!(response["id"], "reconcile-1");
+        assert!(response["error"].is_object(), "reconcile failed: {response}");
+        assert_eq!(
+            done_rx.recv_timeout(TEST_WAIT),
+            Ok(true),
+            "plugin kept running after host input closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn sends_failure_logs_to_the_currently_focused_agent_through_host_callback() {
         let directory = TestDirectory::new();
         let gh_args = directory.0.join("gh-args");
