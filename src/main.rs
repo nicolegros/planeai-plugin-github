@@ -154,19 +154,13 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
         reconciliation: Arc::new(Mutex::new(())),
         pull_requests: Arc::new(Mutex::new(())),
     };
-    let mut input_open = true;
     let mut stopping = false;
 
-    while input_open || !active_requests.is_empty() {
-        let first = if input_open {
-            event_rx.try_recv().ok()
-        } else {
-            event_rx.recv().ok()
-        };
-        for event in first.into_iter().chain(event_rx.try_iter()) {
+    loop {
+        for event in event_rx.try_iter() {
             handle_controller_event(
                 event,
-                input_open,
+                true,
                 &mut output,
                 &mut active_requests,
                 &mut callbacks,
@@ -174,10 +168,7 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
             )?;
         }
         if stopping && active_requests.is_empty() {
-            break;
-        }
-        if !input_open {
-            continue;
+            return Ok(());
         }
         match input_rx.recv_timeout(POLL_INTERVAL) {
             Ok(InputEvent::Frame(frame)) => handle_input_frame(
@@ -192,17 +183,27 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
             Ok(InputEvent::Invalid(error)) => {
                 eprintln!("{PLUGIN_ID} ignored malformed JSON-RPC frame: {error}")
             }
-            Ok(InputEvent::Closed) | Err(RecvTimeoutError::Disconnected) => {
-                input_open = false;
-                for (_, (_, response)) in callbacks.drain() {
-                    let _ = response.send(Err(host_connection_closed()));
-                }
-                for cancelled in active_requests.values() {
-                    cancelled.store(true, Ordering::SeqCst);
-                }
-            }
+            Ok(InputEvent::Closed) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
+    }
+
+    for (_, (_, response)) in callbacks.drain() {
+        let _ = response.send(Err(host_connection_closed()));
+    }
+    for cancelled in active_requests.values() {
+        cancelled.store(true, Ordering::SeqCst);
+    }
+    while !active_requests.is_empty() {
+        let event = event_rx.recv().expect("the loop holds event_tx");
+        handle_controller_event(
+            event,
+            false,
+            &mut output,
+            &mut active_requests,
+            &mut callbacks,
+            &mut stopping,
+        )?;
     }
     Ok(())
 }
@@ -2138,7 +2139,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn exits_when_host_input_closes_during_reconciliation_cleanup() {
+    fn fails_reconciliation_and_exits_when_host_input_closes_during_a_host_call() {
         let (input_tx, input_rx) = mpsc::channel();
         let (output_tx, output_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -2176,12 +2177,7 @@ mod tests {
         }
         drop(input_tx);
 
-        let response = loop {
-            let frame = receive_frame(&output_rx);
-            if frame.get("method").is_none() {
-                break frame;
-            }
-        };
+        let response = receive_frame(&output_rx);
         assert_eq!(response["id"], "reconcile-1");
         assert_eq!(
             response["error"],
