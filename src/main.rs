@@ -41,7 +41,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const PLUGIN_ID: &str = "github";
 const PLUGIN_NAME: &str = "GitHub";
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
-const HOST_API_VERSION: &str = "planeai.plugin-host.v6";
+const HOST_API_VERSION: &str = "planeai.plugin-host.v8";
 /// The MCP tool agents in PlaneAI sessions call, served as `github_link_pull_request`.
 const LINK_PULL_REQUEST_TOOL: &str = "link_pull_request";
 const CANCELLATION_ERROR_CODE: i64 = -32800;

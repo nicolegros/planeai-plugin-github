@@ -8,7 +8,7 @@ The plugin is intentionally GitHub-specific. PlaneAI core supplies generic plugi
 
 ## Requirements
 
-- PlaneAI with `planeai.plugin-host.v6` (MCP tools, PlaneAI 1.115 or later), `sessions.read`, `sessions.repository-context`, and `session.panel` plugin-platform support.
+- PlaneAI with `planeai.plugin-host.v8` (MCP tools and a background service `timeout_ms`), `sessions.read`, `sessions.repository-context`, and `session.panel` plugin-platform support.
 - A PlaneAI build that sends `data.onChanged` to an open `session.panel` instead of remounting it, so the panel refreshes in place.
 - `git` and `gh` on `PATH`.
 - `gh auth login` completed for `github.com`.

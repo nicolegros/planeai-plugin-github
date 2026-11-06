@@ -3,7 +3,7 @@
   "id": "github",
   "name": "GitHub",
   "version": "0.0.0",
-  "host_api_version": "planeai.plugin-host.v6",
+  "host_api_version": "planeai.plugin-host.v8",
   "source_kind": "local",
   "backend_entrypoints": {
     "macos-arm64": "bin/macos-arm64/planeai-plugin-github",
@@ -23,7 +23,8 @@
   "background_service": {
     "method": "github.reconcile",
     "interval_setting": "github_reconciliation_interval_ms",
-    "default_interval_ms": 120000
+    "default_interval_ms": 120000,
+    "timeout_ms": 120000
   },
   "ui_contributions": [
     {
