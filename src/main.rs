@@ -1,3 +1,11 @@
+// `eprintln!` panics once the host has closed stderr, which happens whenever the host goes away.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod durable_state;
 mod github_graphql;
 mod pull_requests;
@@ -131,9 +139,9 @@ enum ControllerEvent {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("{PLUGIN_ID} plugin starting");
+    log!("{PLUGIN_ID} plugin starting");
     run_with_runner(io::stdin(), io::stdout().lock(), CommandRunner::default())?;
-    eprintln!("{PLUGIN_ID} plugin stopping");
+    log!("{PLUGIN_ID} plugin stopping");
     Ok(())
 }
 
@@ -154,21 +162,23 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
         reconciliation: Arc::new(Mutex::new(())),
         pull_requests: Arc::new(Mutex::new(())),
     };
-    let mut input_open = true;
     let mut stopping = false;
 
-    while input_open || !active_requests.is_empty() {
-        while let Ok(event) = event_rx.try_recv() {
-            handle_controller_event(
+    'serve: loop {
+        for event in event_rx.try_iter() {
+            if let Err(error) = handle_controller_event(
                 event,
                 &mut output,
                 &mut active_requests,
                 &mut callbacks,
                 &mut stopping,
-            )?;
+            ) {
+                log!("{PLUGIN_ID} lost host output: {error}");
+                break 'serve;
+            }
         }
         if stopping && active_requests.is_empty() {
-            break;
+            return Ok(());
         }
         match input_rx.recv_timeout(POLL_INTERVAL) {
             Ok(InputEvent::Frame(frame)) => handle_input_frame(
@@ -181,15 +191,34 @@ fn run_with_runner<R: Read + Send + 'static, W: Write>(
                 &mut callbacks,
             ),
             Ok(InputEvent::Invalid(error)) => {
-                eprintln!("{PLUGIN_ID} ignored malformed JSON-RPC frame: {error}")
+                log!("{PLUGIN_ID} ignored malformed JSON-RPC frame: {error}")
             }
-            Ok(InputEvent::Closed) | Err(RecvTimeoutError::Disconnected) => {
-                input_open = false;
-                for cancelled in active_requests.values() {
-                    cancelled.store(true, Ordering::SeqCst);
-                }
-            }
+            Ok(InputEvent::Closed) | Err(RecvTimeoutError::Disconnected) => break 'serve,
             Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+
+    for (_, (_, response)) in callbacks.drain() {
+        let _ = response.send(Err(host_connection_closed()));
+    }
+    for cancelled in active_requests.values() {
+        cancelled.store(true, Ordering::SeqCst);
+    }
+    while !active_requests.is_empty() {
+        match event_rx.recv().expect("run_with_runner holds event_tx") {
+            ControllerEvent::HostCall { response, .. } => {
+                let _ = response.send(Err(host_connection_closed()));
+            }
+            // Output may already be gone; keep draining so cancelled requests finish.
+            finished @ ControllerEvent::Finished { .. } => {
+                let _ = handle_controller_event(
+                    finished,
+                    &mut output,
+                    &mut active_requests,
+                    &mut callbacks,
+                    &mut stopping,
+                );
+            }
         }
     }
     Ok(())
@@ -212,7 +241,7 @@ fn read_input<R: Read>(input: R, sender: Sender<InputEvent>) {
                 }
             },
             Err(error) => {
-                eprintln!("{PLUGIN_ID} failed reading stdin: {error}");
+                log!("{PLUGIN_ID} failed reading stdin: {error}");
                 break;
             }
         }
@@ -305,11 +334,9 @@ fn handle_controller_event<W: Write>(
             params,
             response,
         } => {
-            write_frame(
-                output,
-                &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-            )?;
+            let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
             callbacks.insert(id, (request_key, response));
+            write_frame(output, &frame)?;
         }
         ControllerEvent::Finished {
             request_key,
@@ -335,6 +362,10 @@ fn handle_controller_event<W: Write>(
         }
     }
     Ok(())
+}
+
+fn host_connection_closed() -> RequestError {
+    RequestError::Message("host connection closed".to_string())
 }
 
 fn request_key(id: &Value) -> String {
@@ -499,7 +530,7 @@ fn apply_task_transition(
     let transitions = match read_task_transitions(context, false) {
         Ok(transitions) => transitions,
         Err(error) => {
-            eprintln!("{PLUGIN_ID} skipped the {field} task transition: {error:?}");
+            log!("{PLUGIN_ID} skipped the {field} task transition: {error:?}");
             return;
         }
     };
@@ -516,7 +547,7 @@ fn apply_task_transition(
             RequestError::Cancelled => "request cancelled".to_string(),
             RequestError::Message(message) => message,
         };
-        eprintln!("{PLUGIN_ID} failed configured {field} task transition: {message}");
+        log!("{PLUGIN_ID} failed configured {field} task transition: {message}");
     }
 }
 
@@ -1006,7 +1037,7 @@ fn session_task_group(
         }),
         Err(RequestError::Cancelled) => Err(RequestError::Cancelled),
         Err(RequestError::Message(message)) => {
-            eprintln!("{PLUGIN_ID} could not list sessions for {session_id}: {message}");
+            log!("{PLUGIN_ID} could not list sessions for {session_id}: {message}");
             Ok(TaskGroup {
                 members: vec![session_id.to_string()],
                 resolved: false,
@@ -1129,7 +1160,7 @@ fn update_groups(
             let before = match group_links(&stored, group) {
                 Ok(before) => before,
                 Err(message) if skip_unreadable => {
-                    eprintln!("{PLUGIN_ID} skipped updating sessions {group:?}: {message}");
+                    log!("{PLUGIN_ID} skipped updating sessions {group:?}: {message}");
                     continue;
                 }
                 Err(message) => return Err(invalid_state(message)),
@@ -1178,7 +1209,7 @@ fn fetch_graphql(
         }));
     };
     if let Some(errors) = body.get("errors") {
-        eprintln!("{PLUGIN_ID} GitHub answered some lookups with errors: {errors}");
+        log!("{PLUGIN_ID} GitHub answered some lookups with errors: {errors}");
     }
     Ok(github_graphql::parse_response(
         requests,
@@ -1771,7 +1802,7 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<boo
             Ok(None) => {}
             Err(RequestError::Cancelled) => return Err(RequestError::Cancelled),
             Err(RequestError::Message(message)) => {
-                eprintln!(
+                log!(
                     "{PLUGIN_ID} skipped branch detection for {}: {message}",
                     session.id
                 );
@@ -1787,7 +1818,7 @@ fn reconcile_groups(context: &ExecutionContext, checked: &mut u64) -> Result<boo
             true
         }
         Err(message) => {
-            eprintln!("{PLUGIN_ID} skipped refreshing sessions {group:?}: {message}");
+            log!("{PLUGIN_ID} skipped refreshing sessions {group:?}: {message}");
             false
         }
     });
@@ -2115,6 +2146,91 @@ mod tests {
         thread.join().unwrap().unwrap();
     }
 
+    /// Starts `github.reconcile` against a fake host and stops at its `host.sessions.list` call,
+    /// returning the host's input, the plugin's output, and whether the plugin exited cleanly.
+    #[cfg(unix)]
+    fn reconcile_until_sessions_list() -> (Sender<String>, Receiver<String>, Receiver<bool>) {
+        let (input_tx, input_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_with_runner(
+                ChannelInput::new(input_rx),
+                LineOutput::new(output_tx),
+                CommandRunner::default(),
+            );
+            let _ = done_tx.send(result.is_ok());
+        });
+
+        input_tx
+            .send(json!({ "jsonrpc": "2.0", "id": "reconcile-1", "method": "github.reconcile", "params": {} }).to_string())
+            .unwrap();
+        let mut settings = json!({});
+        loop {
+            let callback = receive_frame(&output_rx);
+            let result = match callback["method"].as_str().unwrap() {
+                "host.settings.get" => {
+                    json!({ "settings": settings_at(&settings, &callback["params"]["path"]) })
+                }
+                "host.settings.patch" => {
+                    merge_settings_patch(&mut settings, &callback["params"]["patch"]);
+                    json!({ "updated": true })
+                }
+                "host.sessions.list" => return (input_tx, output_rx, done_rx),
+                other => panic!("unexpected host call {other}"),
+            };
+            input_tx
+                .send(
+                    json!({ "jsonrpc": "2.0", "id": callback["id"], "result": result }).to_string(),
+                )
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fails_reconciliation_and_exits_when_host_input_closes_during_a_host_call() {
+        let (input_tx, output_rx, done_rx) = reconcile_until_sessions_list();
+        drop(input_tx);
+
+        let response = receive_frame(&output_rx);
+        assert_eq!(response["id"], "reconcile-1");
+        assert_eq!(
+            response["error"],
+            json!({ "code": -32000, "message": "host connection closed" })
+        );
+        assert_eq!(
+            done_rx.recv_timeout(TEST_WAIT),
+            Ok(true),
+            "plugin kept running after host input closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn winds_down_cleanly_when_host_output_breaks_before_input_closes() {
+        let (input_tx, output_rx, done_rx) = reconcile_until_sessions_list();
+        drop(output_rx);
+        input_tx
+            .send(
+                json!({ "jsonrpc": "2.0", "id": "shutdown-1", "method": "plugin.shutdown" })
+                    .to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(done_rx.recv_timeout(TEST_WAIT), Ok(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn winds_down_cleanly_when_host_closes_both_pipes() {
+        let (input_tx, output_rx, done_rx) = reconcile_until_sessions_list();
+        drop(output_rx);
+        drop(input_tx);
+
+        assert_eq!(done_rx.recv_timeout(TEST_WAIT), Ok(true));
+    }
+
     #[cfg(unix)]
     #[test]
     fn sends_failure_logs_to_the_currently_focused_agent_through_host_callback() {
@@ -2276,6 +2392,15 @@ fi
         calls: Vec<String>,
     }
 
+    fn settings_at(settings: &Value, path: &Value) -> Value {
+        path.as_array()
+            .unwrap()
+            .iter()
+            .try_fold(settings, |value, key| value.get(key.as_str().unwrap()))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
     fn merge_settings_patch(target: &mut Value, patch: &Value) {
         let target = target.as_object_mut().unwrap();
         for (key, value) in patch.as_object().unwrap() {
@@ -2309,16 +2434,7 @@ fi
                 host.calls.push(method.clone());
                 let result = match method.as_str() {
                     "host.settings.get" => {
-                        let value = params["path"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .try_fold(&host.settings, |value, key| {
-                                value.get(key.as_str().unwrap())
-                            })
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        json!({ "settings": value })
+                        json!({ "settings": settings_at(&host.settings, &params["path"]) })
                     }
                     "host.settings.patch" => {
                         merge_settings_patch(&mut host.settings, &params["patch"]);

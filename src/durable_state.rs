@@ -247,7 +247,7 @@ fn migrate_v3_durable_state(state: &mut Value) -> Result<(), String> {
         } else if let Some(link) = parse_legacy_mapping(links)? {
             vec![link]
         } else {
-            eprintln!("github dropped the unsupported legacy pull request of session {session_id}: {links}");
+            log!("github dropped the unsupported legacy pull request of session {session_id}: {links}");
             Vec::new()
         };
         *links = session_links_value(&parsed);
