@@ -8,7 +8,7 @@ const hostCapabilities = new Set([
   "session-events", "sessions.actions", "sessions.advisories", "sessions.complete", "tasks.read",
   "tasks.create", "tasks.transition", "task-events", "tools",
 ]);
-const backgroundFields = ["method", "interval_setting", "default_interval_ms"];
+const backgroundFields = ["method", "interval_setting", "default_interval_ms", "timeout_ms"];
 
 test("manifest uses PlaneAI PluginBackgroundService schema and documented capability names", () => {
   assert.deepEqual(Object.keys(manifest.background_service).sort(), backgroundFields.sort());
@@ -16,6 +16,8 @@ test("manifest uses PlaneAI PluginBackgroundService schema and documented capabi
   assert.equal(manifest.background_service.interval_setting, "github_reconciliation_interval_ms");
   assert.ok(Number.isInteger(manifest.background_service.default_interval_ms));
   assert.ok(manifest.background_service.default_interval_ms > 0);
+  // A hung reconcile is cancelled, and its runtime restarted, after this long instead of PlaneAI's 40 minutes.
+  assert.equal(manifest.background_service.timeout_ms, 120000);
   assert.ok(manifest.capabilities.every((capability) => hostCapabilities.has(capability)));
   assert.ok(manifest.capabilities.includes("tasks.transition"));
   assert.ok(manifest.capabilities.includes("tasks.read"));
@@ -49,8 +51,8 @@ test("manifest exposes the GitHub transition preferences UI", () => {
   );
 });
 
-test("manifest declares host API v6 and the link_pull_request tool as a non-destructive write", () => {
-  assert.equal(manifest.host_api_version, "planeai.plugin-host.v6");
+test("manifest declares host API v8 and the link_pull_request tool as a non-destructive write", () => {
+  assert.equal(manifest.host_api_version, "planeai.plugin-host.v8", "v8 allows background_service.timeout_ms");
   assert.ok(manifest.capabilities.includes("tools"));
   assert.deepEqual(manifest.tools.map((tool) => tool.name), ["link_pull_request"]);
   const [tool] = manifest.tools;
